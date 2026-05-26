@@ -1,0 +1,282 @@
+LogosAdaptive Sort Ethical Source License, Version 1.1
+Copyright (c) 2026
+
+PREAMBLE
+
+This license grants broad rights to use, modify, and distribute the Software,
+subject to two categories of restriction:
+
+  1. Explicit Prohibited Uses — categories of use the author does not consent
+     to under any terms, paid or unpaid (Section 2).
+
+  2. A commercial license requirement for Commercial Use, with explicit
+     carve-outs for research, education, non-profit, personal, and
+     evaluation use (Sections 3 and 4).
+
+The author chooses to forgo unconditional "open source" status in exchange
+for these restrictions. This license is NOT OSI-approved. It is a source-
+available license with ethical-use restrictions and a dual-licensing model.
+If you require an OSI-approved license for your use, you should choose a
+different library.
+
+================================================================================
+
+1. GRANT OF RIGHTS
+
+Permission is hereby granted, free of charge, to any person or entity (the
+"Licensee") obtaining a copy of this software and associated documentation
+files (the "Software"), to use, copy, modify, merge, publish, distribute,
+sublicense, and sell copies of the Software, and to permit persons to whom
+the Software is furnished to do so, subject to the conditions set forth in
+Sections 2, 3, 4, and 5 below.
+
+================================================================================
+
+2. PROHIBITED USES
+
+The Software, in whole or in part, in original or modified form, may NOT be
+used, deployed, integrated into, or relied upon by any system, product,
+service, research program, or organizational activity falling into any of
+the following categories. This prohibition is ABSOLUTE: it applies even
+under a paid commercial license, and any commercial license issued is
+implicitly conditioned on continued compliance with this section.
+
+  (a) MILITARY APPLICATIONS. Any system, component, infrastructure, or
+      research program directly supporting:
+        - the design, manufacture, deployment, targeting, guidance, command-
+          and-control, or operational use of weapons or weapons systems;
+        - armed forces operations, including logistics, intelligence,
+          reconnaissance, simulation, or training that materially supports
+          combat operations;
+        - defense procurement, defense contracting, or arms exports;
+        - autonomous or semi-autonomous lethal systems of any kind.
+
+  (b) SURVEILLANCE AND POLICING. Any system whose purpose, design, or
+      foreseeable application includes:
+        - mass surveillance of populations or geographic areas;
+        - tracking, identification, profiling, or behavioral analysis of
+          individuals without their freely-given, specific, informed, and
+          revocable consent;
+        - facial recognition, gait recognition, voiceprint identification,
+          or other biometric identification of non-consenting subjects;
+        - predictive policing, social-credit scoring, or pre-crime systems;
+        - automated immigration enforcement;
+        - monitoring of journalists, activists, political dissidents,
+          religious or ethnic minorities, or labor organizers.
+
+  (c) HUMAN GENETIC RESEARCH AND MODIFICATION. Any system or research
+      program involving:
+        - non-consensual collection, analysis, or storage of human genetic
+          material or genetic data;
+        - cataloging or classifying human populations by genetic ancestry
+          for purposes other than medical care of the individuals sampled;
+        - eugenics, including selective reproduction, genetic ranking of
+          populations, or "genetic enhancement" research;
+        - heritable human genome editing for non-therapeutic purposes;
+        - genetic discrimination by insurers, employers, or governments;
+        - forensic DNA databases that include individuals not convicted of
+          a relevant crime, or family-tree DNA searches conducted without a
+          judicial warrant supported by probable cause.
+
+  (d) SYSTEMS THAT VIOLATE HUMAN RIGHTS. Any system whose primary purpose,
+      foreseeable use, or deployment pattern is to:
+        - cause physical or psychological harm to humans;
+        - deprive humans of liberty, due process, or rights enumerated in
+          the Universal Declaration of Human Rights (UN, 1948);
+        - facilitate human trafficking, forced labor, child labor, or
+          modern slavery;
+        - discriminate against individuals or groups on the basis of race,
+          ethnicity, national origin, religion, gender identity, sexual
+          orientation, disability, age, or political belief;
+        - manufacture or distribute disinformation at scale, including
+          synthetic media intended to deceive about real persons or events.
+
+The Prohibited Uses listed above are illustrative of categories of use the
+author does not consent to, and are not intended as a numerus clausus. A use
+that is materially equivalent to one of the above categories falls within
+the prohibition, even if not explicitly enumerated.
+
+Note that the research-use carve-out in Section 4(b) does NOT override this
+section. Research that itself falls into any Prohibited Use category — for
+example, research designed to develop a weapons-guidance system, or human
+genetic research without consent — is prohibited under Section 2 regardless
+of whether its findings are published.
+
+================================================================================
+
+3. COMMERCIAL USE AND COMMERCIAL LICENSE
+
+3.1. Commercial Use Defined
+
+"Commercial Use" means use of the Software, in whole or in part, in any of
+the following contexts:
+  (a) incorporation into a product, service, or system that is sold,
+      licensed, or made available for a fee or other consideration to
+      third parties;
+  (b) use by a for-profit entity in the production, delivery, or operation
+      of revenue-generating products or services;
+  (c) use by a government entity in connection with services for which
+      fees are charged to citizens, businesses, or other governments;
+  (d) use in any context where the Software materially contributes to the
+      generation of revenue.
+
+3.2. Commercial License Required
+
+Commercial Use of the Software requires a separate written commercial
+license from the author, EXCEPT where the use qualifies as a Permitted
+Free Use under Section 4. Commercial Use without such a license, and
+outside the scope of Section 4, constitutes a material breach of this
+License.
+
+3.3. Obtaining a Commercial License
+
+Commercial licenses are available from the author on terms to be
+negotiated, typically varying with organization size, scope of use,
+number of deployments, and duration. To inquire, contact:
+
+    <commercial-licensing contact to be provided by the author>
+
+The author retains sole discretion over the terms offered, subject to
+non-discrimination principles consistent with Section 2(d).
+
+3.4. Effect on Distribution Chain
+
+A commercial license issued to one entity does NOT confer commercial
+rights on its customers, contractors, or affiliates. Each entity making
+Commercial Use of the Software must hold its own commercial license,
+unless the use qualifies as a Permitted Free Use.
+
+================================================================================
+
+4. PERMITTED FREE USES
+
+The following categories of use do NOT require a commercial license. They
+are permitted under the grant in Section 1, subject only to the Prohibited
+Uses in Section 2 and the Redistribution Conditions in Section 5.
+
+  (a) PERSONAL AND HOBBYIST USE. Use by individuals for personal,
+      educational, recreational, or hobbyist purposes that do not
+      generate revenue.
+
+  (b) RESEARCH USE. Use in academic, scientific, or industrial research
+      whose primary aim is the generation of knowledge, where:
+        (i)  the research findings, methodologies, datasets, or
+             conclusions are intended to be made publicly available
+             (through peer-reviewed publication, preprint, conference
+             presentation, thesis, technical report, open-source release,
+             or substantially similar means) within a reasonable time
+             after the research concludes; AND
+        (ii) the Software is not directly incorporated into a commercial
+             product, service, or system offered to third parties as a
+             consequence of the research.
+
+      This carve-out applies regardless of the organizational form of
+      the researcher: universities, non-profit research institutes,
+      government agencies, corporate research and development laboratories,
+      and independent researchers all qualify. A commercial entity does not
+      lose access to this exemption merely because it also conducts
+      commercial activities, provided the specific use of the Software is
+      in research as defined.
+
+      Research use INCLUDES preliminary experimentation, prototyping, and
+      proof-of-concept work conducted prior to a decision to commercialize.
+      If a research effort later transitions to product development with
+      intent to commercialize, the commercial license requirement in
+      Section 3 applies from the point of that transition.
+
+  (c) EDUCATIONAL USE. Use by accredited educational institutions in the
+      course of instruction, including coursework, student projects,
+      thesis work, and faculty-developed teaching materials. This
+      includes the use of the Software in MOOCs, textbooks, and
+      educational software, provided the educational content itself is
+      not principally a commercial offering.
+
+  (d) NON-PROFIT ORGANIZATIONAL USE. Use by registered non-profit or
+      charitable organizations in furtherance of their charitable
+      mission, provided the Software is not incorporated into products
+      or services sold or licensed to third parties for fees that
+      materially exceed cost-recovery.
+
+  (e) INTERNAL EVALUATION. Use for the purpose of evaluating the
+      Software's suitability for potential future Commercial Use, for a
+      period not exceeding ninety (90) days from first acquisition.
+      Continued Commercial Use beyond this period requires a commercial
+      license.
+
+  (f) GOVERNMENT USE FOR OPEN PUBLIC BENEFIT. Use by government entities
+      in the provision of services that are made freely available to the
+      public, provided the use does not fall within any Prohibited Use
+      under Section 2.
+
+  (g) OPEN-SOURCE PROJECT DEPENDENCY. Use as a dependency by other
+      software projects that are themselves distributed under an
+      OSI-approved open-source license, provided that any downstream
+      Commercial Use of the combined work still requires a commercial
+      license per Section 3.
+
+================================================================================
+
+5. REDISTRIBUTION CONDITIONS
+
+  (a) The above copyright notice, this entire license text (including
+      Sections 2, 3, and 4), and the disclaimer in Section 7 shall be
+      included in all copies, derivative works, or substantial portions
+      of the Software.
+
+  (b) The terms in Section 2 (Prohibited Uses) and Section 3 (Commercial
+      Use) MAY NOT BE REMOVED, WEAKENED, OR OVERRIDDEN by sublicensing,
+      additional terms, or contractual arrangements between Licensee and
+      third parties.
+
+  (c) Any derivative work, fork, or modification distributed under a
+      different name must clearly state that it derives from "LogosAdaptive
+      Sort" and is subject to this license.
+
+================================================================================
+
+6. TERMINATION
+
+Any breach of Section 2 (Prohibited Uses) or Section 3 (Commercial Use
+without license) by Licensee automatically and immediately terminates all
+rights granted under this license. Upon termination, Licensee must cease
+all use, distribution, and reliance on the Software, and destroy all
+copies in their possession or control.
+
+Termination does not extinguish the author's rights to seek injunctive
+relief, damages, fees, costs, or other remedies available at law or in
+equity.
+
+================================================================================
+
+7. DISCLAIMER OF WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+
+8. SEVERABILITY
+
+If any provision of this license is held to be unenforceable in any
+jurisdiction, the remaining provisions shall continue in full force and
+effect. The Prohibited Uses provisions and the Commercial License
+requirement are intended to be enforceable to the maximum extent permitted
+by applicable law; if any specific provision is unenforceable, courts are
+directed to construe the provision as narrowly as necessary to render it
+enforceable, rather than striking it entirely.
+
+================================================================================
+
+9. GOOD FAITH
+
+This license is offered in good faith. Licensees are expected to interpret
+the Prohibited Uses, Commercial Use, and Permitted Free Uses sections in
+good faith, with attention to the obvious intent of the terms rather than
+narrow legalistic readings. When in doubt about whether a use is permitted
+or whether a commercial license is required, Licensee SHOULD contact the
+author in advance rather than acting on a self-serving interpretation.

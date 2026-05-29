@@ -1,5 +1,6 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "name": "logos-sort",
   "author": "Claude Opus 4.6, 4.7, Mark Ciubal",
   "homepage": "http://www.codecookbook.org/",
   "description": "In the beginning was the Word. Adaptive sort for JavaScript: dispatches across counting, radix, flash, introsort, multikey-QS, and MSD-at-depth based on input shape. Includes argSort, anomaly detection, and a property-based test harness.",
@@ -10,11 +11,11 @@
     "index.d.ts",
     "lib/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "benchmark.js"
   ],
   "scripts": {
-    "test": "node test/run.js",
-    "bench": "node test/bench.js"
+    "bench": "node benchmark.js"
   },
   "keywords": [
     "sort",
@@ -34,9 +35,9 @@
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "https://github.com/example/logos-sort"
+    "url": "git+https://github.com/markciubal/logos-sort.git"
   },
   "bugs": {
-    "url": "https://github.com/example/logos-sort/issues"
+    "url": "https://github.com/markciubal/logos-sort/issues"
   }
 }

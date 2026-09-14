@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sortbench"
+version = "0.1.0"
+description = "Benchmark in-memory sort engines against database ORDER BY, fairly and distribution-aware."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "sortbench contributors" }]
+keywords = ["sort", "benchmark", "duckdb", "sqlite", "numpy", "database", "order-by"]
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=0.9"]
+all = ["duckdb>=0.9"]
+
+[tool.setuptools.packages.find]
+include = ["sortbench*"]

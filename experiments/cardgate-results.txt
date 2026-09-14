@@ -1,0 +1,498 @@
+######## 2026-09-12, make cardgate round one: hash-count route on vs LOGOS_MC_OFF=1, 8.4M, 20 pairs; routes from a trace build ########
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== trace: which route does each shape take, and does the hash map abort? (trace build: WHETHER, not how fast) ===
+user_ids_zipf T=1 :: sodo: m=384 distinct=280 chao1=1590 | modcard: map phase done, 1 threads, aborted=1, 65536 entries across the tables
+user_ids_zipf T=14 :: sodo: m=2048 distinct=1203 chao1=7354 | modcard: map phase done, 14 threads, aborted=1, 917504 entries across the tables
+hash_5k T=1 :: sodo: m=384 distinct=372 chao1=5343 | modcard: map phase done, 1 threads, aborted=0, 5000 entries across the tables
+hash_5k T=14 :: sodo: m=2048 distinct=1698 chao1=5362 | modcard: map phase done, 14 threads, aborted=0, 70000 entries across the tables
+hash_30k T=1 :: sodo: m=384 distinct=379 chao1=12004
+hash_30k T=14 :: sodo: m=2048 distinct=1979 chao1=28817 | modcard: map phase done, 14 threads, aborted=0, 420000 entries across the tables
+hash_60k T=1 :: sodo: m=384 distinct=383 chao1=36768
+hash_60k T=14 :: sodo: m=2048 distinct=2012 chao1=54750 | modcard: map phase done, 14 threads, aborted=0, 839959 entries across the tables
+zipf_pareto T=1 :: sodo: m=384 distinct=27 chao1=50 | lowcard: sample 384 values, 27 distinct, perfect hash built | lowcard: map done, 0 entries the hash did not cover, ABORTED | modcard: map phase done, 1 threads, aborted=0, 2440 entries across the tables
+zipf_pareto T=14 :: sodo: m=2048 distinct=58 chao1=136 | modcard: map phase done, 14 threads, aborted=0, 10394 entries across the tables
+prices_cents T=1 :: sodo: m=384 distinct=376 chao1=7879 | modcard: map phase done, 1 threads, aborted=1, 65536 entries across the tables
+prices_cents T=14 :: sodo: m=2048 distinct=1845 chao1=10323 | modcard: map phase done, 14 threads, aborted=0, 693140 entries across the tables
+yyyymmdd T=1 :: sodo: m=384 distinct=374 chao1=6380
+yyyymmdd T=14 :: sodo: m=2048 distinct=1801 chao1=7247
+mantissa16 T=1 :: sodo: m=384 distinct=384 chao1=73920
+mantissa16 T=14 :: sodo: m=2048 distinct=2014 chao1=57991
+uniform T=1 :: sodo: m=384 distinct=384 chao1=73920
+uniform T=14 :: sodo: m=2048 distinct=2048 chao1=2098176
+few_5 T=1 :: sodo: m=384 distinct=5 chao1=5 | lowcard: sample 384 values, 5 distinct, perfect hash built | lowcard: map done, 0 entries the hash did not cover
+few_5 T=14 :: sodo: m=2048 distinct=5 chao1=5 | lowcard: sample 2048 values, 5 distinct, perfect hash built | lowcard: map done, 0 entries the hash did not cover
+=== floor ===
+  1000000        1.003     0.950     1.125        2.5%
+  8000000        0.968     0.887     1.138        2.7%
+=== cardgate ===
+hash-count route: default dispatcher vs LOGOS_MC_OFF=1, n=8388608, 20 pairs, threads 1 and 14, one binary
+ratio = default / route off: > 1.000 means the route COSTS that much, < 1.000 means it earns it.
+
+  sample profile, 2048 random positions:
+  shape             d/m   f1/m     f2     f3     chao1 f1f3/f2^2  today's gate (1T / MT)
+  user_ids_zipf   0.586  0.504     84     30      7460    4.39    try    / try   
+  hash_5k         0.821  0.665    279     35      4986    0.61    try    / try   
+  hash_30k        0.966  0.933     69      0     28023    0.00    try    / try   
+  hash_60k        0.985  0.970     31      0     63614    0.00    skip   / try   
+  zipf_pareto     0.028  0.014      7      5       109    2.96    try    / try   
+  prices_cents    0.907  0.820    163     14     10457    0.89    try    / try   
+  yyyymmdd        0.863  0.739    229     24      6748    0.69    try    / try   
+  mantissa16      0.984  0.968     31      1     63426    2.06    skip   / try   
+  uniform         1.000  1.000      0      0   2098176   -1.00    skip   / skip  
+  few_5           0.002  0.000      0      0         5   -1.00    try    / try   
+
+  shape           T     ratio       p10       p90  what it is                       verify
+  user_ids_zipf   1     1.112     0.894     2.473  200k sparse ids, Zipf activity   ok
+  user_ids_zipf  14     1.898     1.778     2.169                                   ok
+  hash_5k         1     1.156     1.106     1.367  5k random doubles, equal odds    ok
+  hash_5k        14     1.102     0.957     2.095                                   ok
+  hash_30k        1     1.047     0.809     1.629  30k random doubles, equal odds   ok
+  hash_30k       14     2.452     2.177     3.092                                   ok
+  hash_60k        1     0.997     0.888     1.670  60k random doubles, equal odds   ok
+  hash_60k       14     5.303     4.373     6.462                                   ok
+  zipf_pareto     1     0.334     0.317     0.369  floor of a Pareto(1.2)           ok
+  zipf_pareto    14     0.280     0.249     0.353                                   ok
+  prices_cents    1     1.134     0.946     2.044  lognormal prices in cents        ok
+  prices_cents   14     3.811     3.413     5.978                                   ok
+  yyyymmdd        1     0.490     0.397     0.564  dates as integers, 20 years      ok
+  yyyymmdd       14     1.175     0.986     1.610                                   ok
+  mantissa16      1     0.900     0.777     1.107  65536-value lattice              ok
+  mantissa16     14     1.617     1.200     2.345                                   ok
+  uniform         1     1.027     0.951     1.161  guard: never gated in            ok
+  uniform        14     1.003     0.954     1.092                                   ok
+  few_5           1     1.003     0.955     1.101  guard: low-cardinality route     ok
+  few_5          14     0.934     0.879     1.109                                   ok
+
+######## make cardgate LADDER, 8.4M, 20 pairs. CONTAMINATED: floor 1M p90 6.19 (102.6%), 8M 5.1%; 1-thread rows unusable, 14-thread trends kept ########
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== floor ===
+  1000000        0.911     0.413     6.192      102.6%
+  8000000        1.008     0.867     1.258        5.1%
+=== cardgate ladder ===
+cardinality ladder, n=8388608, 20 pairs, threads 1 and 14, one binary
+ratio > 1.000 means the switched-off part COSTS that much when on; < 1.000 means it earns it.
+
+  hash map only: default vs LOGOS_MC_HASH_OFF=1 (lattice attempt still runs), d random doubles, equal odds
+  shape        chao1@384  chao1@2k  T     ratio       p10       p90  verify
+  hash_300           307       300  1     0.975     0.726     1.067  ok
+                                   14     0.514     0.365     0.833
+  hash_600           483       611  1     1.160     0.571     1.891  ok
+                                   14     0.645     0.542     1.225
+  hash_1200         1352      1203  1     1.353     1.103     1.723  ok
+                                   14     0.782     0.634     1.506
+  hash_2500         1911      2385  1     1.294     0.872     2.052  ok
+                                   14     0.977     0.758     3.192
+  hash_5000         3700      4827  1     1.081     0.778     1.713  ok
+                                   14     1.267     0.855     2.495
+  hash_10000        7879     10111  1     1.339     0.804     3.353  ok
+                                   14     1.396     0.795     3.163
+
+  whole route: default vs LOGOS_MC_OFF=1, integer lattice 0..d-1, equal odds
+  shape        chao1@384  chao1@2k  T     ratio       p10       p90  verify
+  lat_1000          1156      1042  1     0.410     0.295     0.633  ok
+                                   14     0.591     0.429     0.938
+  lat_4000          3349      4021  1     0.420     0.228     0.635  ok
+                                   14     0.688     0.505     0.899
+  lat_16000        12004     16180  1     0.864     0.667     1.091  ok
+                                   14     0.987     0.446     2.029
+  lat_65536        36768     54588  1     1.036     0.706     1.501  ok
+                                   14     1.637     1.523     2.581
+  lat_200000       73920    207982  1     1.051     0.635     1.581  ok
+                                   14     0.999     0.844     1.090
+
+######## make cardgate LADDER rerun, 8.4M, 40 pairs; floor before 1M 20.7% / 8M 4.1%, after 1M 14.2% / 8M 5.5% ########
+=== floor before ===
+  1000000        1.014     0.657     2.045       20.7%
+  8000000        1.001     0.862     1.206        4.1%
+=== cardgate ladder, 40 pairs ===
+cardinality ladder, n=8388608, 40 pairs, threads 1 and 14, one binary
+ratio > 1.000 means the switched-off part COSTS that much when on; < 1.000 means it earns it.
+
+  hash map only: default vs LOGOS_MC_HASH_OFF=1 (lattice attempt still runs), d random doubles, equal odds
+  shape        chao1@384  chao1@2k  T     ratio       p10       p90  verify
+  hash_300           307       300  1     1.088     0.877     2.244  ok
+                                   14     0.599     0.342     3.230
+  hash_600           483       611  1     1.130     1.041     1.416  ok
+                                   14     0.817     0.519     4.474
+  hash_1200         1352      1203  1     1.300     0.767     2.282  ok
+                                   14     0.873     0.701     1.994
+  hash_2500         1911      2385  1     1.180     0.924     2.045  ok
+                                   14     0.992     0.713     1.274
+  hash_5000         3700      4827  1     1.142     1.069     1.242  ok
+                                   14     1.207     1.020     1.450
+  hash_10000        7879     10111  1     1.145     0.871     1.703  ok
+                                   14     1.638     1.403     1.921
+
+  whole route: default vs LOGOS_MC_OFF=1, integer lattice 0..d-1, equal odds
+  shape        chao1@384  chao1@2k  T     ratio       p10       p90  verify
+  lat_1000          1156      1042  1     0.437     0.311     0.537  ok
+                                   14     0.798     0.653     0.902
+  lat_4000          3349      4021  1     0.441     0.373     0.517  ok
+                                   14     0.830     0.642     1.215
+  lat_16000        12004     16180  1     0.980     0.833     1.324  ok
+                                   14     0.914     0.768     1.316
+  lat_65536        36768     54588  1     1.023     0.939     1.229  ok
+                                   14     1.900     1.572     3.133
+  lat_200000       73920    207982  1     1.004     0.882     1.145  ok
+                                   14     1.009     0.913     1.174
+=== floor after ===
+  1000000        1.006     0.717     1.717       14.2%
+  8000000        0.979     0.922     1.280        5.5%
+
+######## make cardgate SKEW, 8.4M, 40 pairs; floor before 1M 9.2% / 8M 8.1%, after 1M 18.7% / 8M 7.8% ########
+=== floor before ===
+  1000000        0.991     0.729     1.467        9.2%
+  8000000        1.013     0.723     1.411        8.1%
+=== cardgate skew, 40 pairs ===
+skew ladder, n=8388608, 40 pairs, threads 1 and 14, one binary
+ratio > 1.000 means the switched-off part COSTS that much when on; < 1.000 means it earns it.
+
+  shape        switched  chao1@384  chao1@2k  het@2k  T     ratio       p10       p90  verify
+  zipf_1k      hash map        400       832    1.21  1     1.149     1.069     1.351  ok
+                                                     14     0.219     0.168     0.281
+  zipf_4k      hash map        522      1607    2.04  1     1.139     1.007     1.283  ok
+                                                     14     0.324     0.272     0.415
+  zipf_16k     hash map        886      2734    3.01  1     1.034     0.924     1.119  ok
+                                                     14     0.530     0.423     0.644
+  zipf_64k     hash map       1465      3979    4.49  1     1.243     1.159     1.466  ok
+                                                     14     1.124     1.006     1.317
+  zipf_pareto  hash map         31        81    1.28  1     0.338     0.325     0.375  ok
+                                                     14     0.352     0.287     0.490
+  lat_32000    route         24385     35510    0.55  1     1.020     0.937     1.233  ok
+                                                     14     0.985     0.832     1.412
+=== floor after ===
+  1000000        1.001     0.910     1.948       18.7%
+  8000000        1.024     0.880     1.392        7.8%
+
+######## make cardgate GATE + HELDOUT, new rule (Chao1 <= 128 below 8 threads, <= 3300 at 8+; lattice <= 65536 slots at 8+), 30 pairs; floor before 1M 18.9% / 8M 7.4%, after 1M 6.5% / 8M 6.9%. temp_tenths and ages FAILED the memcmp check: under investigation ########
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== floor before ===
+  1000000        1.016     0.846     1.955       18.9%
+  8000000        1.012     0.903     1.372        7.4%
+=== cardgate gate (training shapes, old gate over new) ===
+training shapes: old gate (LOGOS_MCGATE_OLD=1) over the new gate, n=8388608, 30 pairs, threads 1 and 14, one binary
+ratio > 1.000 means the new gate is that much faster.
+
+  shape           T   old/new       p10       p90  verify
+  user_ids_zipf   1     1.073     0.966     1.263  ok
+  user_ids_zipf  14     1.883     1.699     2.222  ok
+  hash_5k         1     1.193     1.061     1.329  ok
+  hash_5k        14     1.234     1.035     1.365  ok
+  hash_30k        1     1.023     0.941     1.115  ok
+  hash_30k       14     2.453     2.035     2.932  ok
+  hash_60k        1     0.953     0.729     1.253  ok
+  hash_60k       14     4.459     3.347     8.734  ok
+  zipf_pareto     1     1.072     0.778     1.466  ok
+  zipf_pareto    14     1.009     0.715     1.366  ok
+  prices_cents    1     1.195     0.840     1.791  ok
+  prices_cents   14     2.695     2.133     3.537  ok
+  yyyymmdd        1     1.022     0.754     1.528  ok
+  yyyymmdd       14     1.100     0.830     2.460  ok
+  mantissa16      1     0.994     0.929     1.413  ok
+  mantissa16     14     1.402     1.197     1.749  ok
+  uniform         1     0.996     0.930     1.065  ok
+  uniform        14     1.019     0.953     1.150  ok
+  few_5           1     1.007     0.899     1.116  ok
+  few_5          14     1.012     0.835     1.223  ok
+=== cardgate heldout ===
+held-out shapes (never used to design the gate), n=8388608, 30 pairs, threads 1 and 14, one binary
+old/new = old gate (LOGOS_MCGATE_OLD=1) over the new gate: > 1.000 means the new gate is that much faster.
+new/off = new gate over the route switched off: > 1.000 means what the new gate still lets in COSTS that much.
+
+  shape           chao1@384  chao1@2k  het@2k  d/m2k  T  old/new       p10-p90  new/off       p10-p90  verify
+  product_ids          2784      6348    2.23  0.709  1    1.138  0.946-1.405     1.007  0.831-1.254   ok
+                                                     14    1.193  1.020-1.454     0.993  0.933-1.165 
+  gdp_3sig             2378      2912    1.21  0.667  1    1.073  0.955-1.156     0.991  0.917-1.104   ok
+                                                     14    0.943  0.776-1.453     0.747  0.658-0.927 
+  temp_tenths           531       496    1.03  0.222  1    1.016  0.957-1.092     0.990  0.815-1.132   FAILED
+                                                     14    1.018  0.839-1.207     0.563  0.465-0.791 
+  session_sec           669      1071    1.61  0.364  1    0.505  0.473-0.557     0.985  0.917-1.109   ok
+                                                     14    1.009  0.901-1.099     0.638  0.579-0.728 
+  latency_2dp          3544      5615    0.80  0.825  1    1.390  1.011-1.662     1.022  0.918-1.184   ok
+                                                     14    1.195  0.977-1.980     1.287  1.115-1.755 
+  words_100k           1499      7107    7.42  0.565  1    1.161  0.994-1.384     1.018  0.821-1.600   ok
+                                                     14    2.101  1.730-3.930     0.984  0.775-1.306 
+  hash_2k              2240      1945    0.69  0.628  1    1.594  1.384-1.896     0.993  0.852-1.094   ok
+                                                     14    0.987  0.622-1.527     1.157  0.791-1.751 
+  mixed_lat_hash       3875      3465    0.75  0.737  1    1.660  1.308-1.816     1.004  0.892-1.196   ok
+                                                     14    1.007  0.737-1.367     0.637  0.069-0.738 
+  status_codes           62        58    0.96  0.028  1    1.041  0.804-1.252     1.001  0.901-1.260   ok
+                                                     14    1.013  0.915-1.457     0.985  0.732-1.124 
+  ages                   91        98    0.28  0.045  1    0.978  0.887-1.188     0.242  0.162-0.373   FAILED
+                                                     14    0.992  0.815-1.276     0.467  0.378-0.692 
+=== floor after ===
+  1000000        1.006     0.796     1.329        6.5%
+  8000000        0.948     0.650     1.079        6.9%
+
+######## make cardgate VERIFY + HROUTES (trace build): the FAILED rows are signed-zero oracle artifacts; session_sec 1T is the one real gate miss ########
+=== verify: is the FAILED check a wrong sort or a signed-zero oracle artifact? ===
+temp_tenths: 5483 of 8388608 values are -0.0
+  default(new gate)  T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 5476 positions (first 554649), 0 of them NOT a signed-zero swap
+  default(new gate)  T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 5436 positions (first 554649), 0 of them NOT a signed-zero swap
+  route off          T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 5476 positions (first 554649), 0 of them NOT a signed-zero swap
+  route off          T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 5360 positions (first 554715), 0 of them NOT a signed-zero swap
+  old gate           T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 5436 positions (first 554649), 0 of them NOT a signed-zero swap
+  old gate           T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 5436 positions (first 554649), 0 of them NOT a signed-zero swap
+session_sec: 0 of 8388608 values are -0.0
+  default(new gate)  T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 0 positions (first 8388608), 0 of them NOT a signed-zero swap
+  default(new gate)  T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 0 positions (first 8388608), 0 of them NOT a signed-zero swap
+  route off          T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 0 positions (first 8388608), 0 of them NOT a signed-zero swap
+  route off          T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 0 positions (first 8388608), 0 of them NOT a signed-zero swap
+  old gate           T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 0 positions (first 8388608), 0 of them NOT a signed-zero swap
+  old gate           T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 0 positions (first 8388608), 0 of them NOT a signed-zero swap
+ages: 7507 of 8388608 values are -0.0
+  default(new gate)  T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 14066 positions (first 0), 0 of them NOT a signed-zero swap
+  default(new gate)  T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 14066 positions (first 0), 0 of them NOT a signed-zero swap
+  route off          T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 14066 positions (first 0), 0 of them NOT a signed-zero swap
+  route off          T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 14066 positions (first 0), 0 of them NOT a signed-zero swap
+  old gate           T=1  ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 14066 positions (first 0), 0 of them NOT a signed-zero swap
+  old gate           T=14 ascending:yes (0 descents, first at 8388608)  multiset:same  bytes differ from qsort at 14066 positions (first 0), 0 of them NOT a signed-zero swap
+=== held-out routes under the new and old gate (trace build: WHETHER, not how fast) ===
+product_ids new T=1 :: sodo: m=384 distinct=333 chao1=2322
+product_ids new T=14 :: sodo: m=2048 distinct=1446 chao1=7286
+product_ids old T=1 :: sodo: m=384 distinct=333 chao1=2322 | modcard: map phase done, 1 threads, aborted=0, 20000 entries across the tables
+product_ids old T=14 :: sodo: m=2048 distinct=1446 chao1=7286 | modcard: map phase done, 14 threads, aborted=0, 279962 entries across the tables
+gdp_3sig new T=1 :: sodo: m=384 distinct=349 chao1=1904
+gdp_3sig new T=14 :: sodo: m=2048 distinct=1346 chao1=2834 | modcard: map phase done, 14 threads, aborted=0, 76913 entries across the tables
+gdp_3sig old T=1 :: sodo: m=384 distinct=349 chao1=1904 | modcard: map phase done, 1 threads, aborted=0, 6452 entries across the tables
+gdp_3sig old T=14 :: sodo: m=2048 distinct=1346 chao1=2834 | modcard: map phase done, 14 threads, aborted=0, 76913 entries across the tables
+temp_tenths new T=1 :: sodo: m=384 distinct=231 chao1=392
+temp_tenths new T=14 :: sodo: m=2048 distinct=454 chao1=502 | modcard: map phase done, 14 threads, aborted=0, 11419 entries across the tables
+temp_tenths old T=1 :: sodo: m=384 distinct=231 chao1=392 | modcard: map phase done, 1 threads, aborted=0, 940 entries across the tables
+temp_tenths old T=14 :: sodo: m=2048 distinct=454 chao1=502 | modcard: map phase done, 14 threads, aborted=0, 11419 entries across the tables
+session_sec new T=1 :: sodo: m=384 distinct=292 chao1=711
+session_sec new T=14 :: sodo: m=2048 distinct=738 chao1=1029 | modcard: map phase done, 14 threads, aborted=0, 34343 entries across the tables
+session_sec old T=1 :: sodo: m=384 distinct=292 chao1=711 | modcard: map phase done, 1 threads, aborted=0, 3255 entries across the tables
+session_sec old T=14 :: sodo: m=2048 distinct=738 chao1=1029 | modcard: map phase done, 14 threads, aborted=0, 34343 entries across the tables
+latency_2dp new T=1 :: sodo: m=384 distinct=371 chao1=4936
+latency_2dp new T=14 :: sodo: m=2048 distinct=1692 chao1=5317
+latency_2dp old T=1 :: sodo: m=384 distinct=371 chao1=4936 | modcard: map phase done, 1 threads, aborted=0, 29523 entries across the tables
+latency_2dp old T=14 :: sodo: m=2048 distinct=1692 chao1=5317 | modcard: map phase done, 14 threads, aborted=0, 237618 entries across the tables
+words_100k new T=1 :: sodo: m=384 distinct=269 chao1=1589
+words_100k new T=14 :: sodo: m=2048 distinct=1166 chao1=7270
+words_100k old T=1 :: sodo: m=384 distinct=269 chao1=1589 | modcard: thread gave up 569010 of 8388608 elements in (7% scanned), 65536 distinct so far | modcard: map phase done, 1 threads, aborted=1, 65536 entries across the tables
+words_100k old T=14 :: sodo: m=2048 distinct=1166 chao1=7270 | modcard: thread gave up 568662 of 599187 elements in (95% scanned), 65536 distinct so far | modcard: thread gave up 569093 of 599187 elements in (95% scanned), 65536 distinct so far | modcard: thread gave up 568769 of 599187 elements in (95% scanned), 65536 distinct so far | modcard: thread gave 
+hash_2k new T=1 :: sodo: m=384 distinct=351 chao1=1936
+hash_2k new T=14 :: sodo: m=2048 distinct=1264 chao1=1898 | modcard: map phase done, 14 threads, aborted=0, 28000 entries across the tables
+hash_2k old T=1 :: sodo: m=384 distinct=351 chao1=1936 | modcard: map phase done, 1 threads, aborted=0, 2000 entries across the tables
+hash_2k old T=14 :: sodo: m=2048 distinct=1264 chao1=1898 | modcard: map phase done, 14 threads, aborted=0, 28000 entries across the tables
+mixed_lat_hash new T=1 :: sodo: m=384 distinct=369 chao1=4857
+mixed_lat_hash new T=14 :: sodo: m=2048 distinct=1518 chao1=3276 | modcard: map phase done, 14 threads, aborted=0, 56000 entries across the tables
+mixed_lat_hash old T=1 :: sodo: m=384 distinct=369 chao1=4857 | modcard: map phase done, 1 threads, aborted=0, 4000 entries across the tables
+mixed_lat_hash old T=14 :: sodo: m=2048 distinct=1518 chao1=3276 | modcard: map phase done, 14 threads, aborted=0, 56000 entries across the tables
+status_codes new T=1 :: sodo: m=384 distinct=38 chao1=47 | lowcard: sample 384 values, 38 distinct, perfect hash built | lowcard: map done, 22 entries the hash did not cover
+status_codes new T=14 :: sodo: m=2048 distinct=57 chao1=58 | lowcard: sample 2048 values, 57 distinct, perfect hash built | lowcard: map done, 42 entries the hash did not cover
+status_codes old T=1 :: sodo: m=384 distinct=38 chao1=47 | lowcard: sample 384 values, 38 distinct, perfect hash built | lowcard: map done, 22 entries the hash did not cover
+status_codes old T=14 :: sodo: m=2048 distinct=57 chao1=58 | lowcard: sample 2048 values, 57 distinct, perfect hash built | lowcard: map done, 42 entries the hash did not cover
+ages new T=1 :: sodo: m=384 distinct=83 chao1=91 | modcard: map phase done, 1 threads, aborted=0, 102 entries across the tables
+ages new T=14 :: sodo: m=2048 distinct=94 chao1=95 | modcard: map phase done, 14 threads, aborted=0, 1428 entries across the tables
+ages old T=1 :: sodo: m=384 distinct=83 chao1=91 | modcard: map phase done, 1 threads, aborted=0, 102 entries across the tables
+ages old T=14 :: sodo: m=2048 distinct=94 chao1=95 | modcard: map phase done, 14 threads, aborted=0, 1428 entries across the tables
+--- every distinct trace message kind seen (to catch route lines the filter missed) ---
+     41 hist trial: value N key N model N modes N ms -> mode N, root-resolved N, style N
+     40 sodo: m=N distinct=N chaoN=N inv=N ks=N nan=N
+     40 psort_fN n=N P=N
+     40 prescan done
+     25 modcard: map phase done, N threads, aborted=N, N entries across the tables
+     14 modcard: thread gave up N of N elements in (N% scanned), N distinct so far
+     13 reloc: detect_runs_parallel -> bail, R=N
+     13 gate [N) R=N seen=N chains=N merged=N
+      9 seq: relocation declined
+      9 seq: leaf done (result in a)
+      9 seq: copyback done
+      9 seq: buffers ready (pooled=N)
+      4 par: relocation declined
+      4 par: nearsorted declined
+      4 par: exponent map over N binades, largest single value N% of the sample
+      4 par: KS distance in key space N -> not log-uniform
+      4 par: KS distance N (limit N) -> not uniform
+      4 lowcard: sample N values, N distinct, perfect hash built
+      4 lowcard: map done, N entries the hash did not cover
+      3 par: scatter done
+      3 par: histogram done
+      3 par: histfree declined, histogram path
+      3 par: buckets done
+      3 hf: declined up front, one value is N% of the data
+      2 
+      1 par: mode N is not uniform inside (KS N)
+      1 par: leaf sizes max N mean N -> imbalance Nx
+      1 par: histfree spills N (ok)
+      1 par: histfree scatter done
+      1 par: histfree done
+      1 hf: trial mode N style N, cap N per bucket
+
+######## PREDICTION RECORDED BEFORE THE INTNESS RESULTS WERE READ (run in progress) ########
+Integrality hypothesis (in cardgate.c before the run): 1T eq2k_int and zipf4k_int earn 0.5-0.8, session_half costs 1.0-1.3.
+Fallback hypothesis (written now): the hash map beats leaf_f64's float radix (taken when <= 4 of 8 key bytes vary) and
+loses to the AVX2 quicksort. session_sec (3 bytes) and session_half (4 bytes) earn 0.4-0.7; eq2k_int and zipf4k_int
+(integers below 2^30, 5 varying bytes) cost 1.05-1.4 like their real twins. The two hypotheses disagree on those three rows.
+
+######## make cardgate INTNESS, 30 pairs; floor before 1M 5.0% / 8M 4.0%, after 1M 33.9% / 8M 7.7%. The FALLBACK hypothesis won all three discriminating rows. ALSO: the new harness signed-zero checks FAILED at n=1000 (modes 0,1,2), a real correctness defect, under investigation ########
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  FAIL  signed zeros mode=0 n=1000 threads=1
+  FAIL  signed zeros mode=0 n=1000 threads=4
+  FAIL  signed zeros mode=1 n=1000 threads=1
+  FAIL  signed zeros mode=1 n=1000 threads=4
+  FAIL  signed zeros mode=2 n=1000 threads=1
+  FAIL  signed zeros mode=2 n=1000 threads=4
+  signed zeros: 24 checks, 6 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: CORRECTNESS FAILURES — do not ship
+=== floor before ===
+  1000000        1.026     0.838     1.254        5.0%
+  8000000        1.003     0.816     1.202        4.0%
+=== cardgate intness ===
+integer vs non-integer values at equal cardinality and skew: hash map allowed (old gate) over hash map off,
+n=8388608, 30 pairs, threads 1 and 14, one binary. ratio > 1.000 means the hash map COSTS that much.
+
+  shape          chao1@384  chao1@2k  het@2k  int  T     ratio       p10       p90  verify
+  eq2k_real           2166      1942    0.78   no  1     1.601     1.435     1.870  ok
+                                                  14     0.952     0.866     1.068
+  eq2k_int            2166      1942    0.78  yes  1     1.169     0.785     2.053  ok
+                                                  14     0.914     0.715     1.406
+  zipf4k_real          793      1824    2.04   no  1     1.058     0.795     1.630  ok
+                                                  14     0.338     0.268     0.574
+  zipf4k_int           793      1824    2.04  yes  1     1.252     1.066     1.559  ok
+                                                  14     0.308     0.233     0.598
+  session_sec          713       947    1.22  yes  1     0.543     0.375     1.031  ok
+                                                  14     0.701     0.624     0.839
+  session_half         713       947    1.22   no  1     0.420     0.399     0.541  ok
+                                                  14     0.734     0.644     0.950
+=== floor after ===
+  1000000        0.984     0.524     2.716       33.9%
+  8000000        1.037     0.938     1.388        7.7%
+
+######## signed-zero fix, first version (NaN scan + second compare/AND/OR per block): tools/ledger_rerun.py, 24 pairs, layout cancelled ########
+(after repairing RENAME, which lacked the four view symbols so every two-copy bench failed to link)
+ledger re-run: 1 features, 24 pairs, n=8000000, two orientations each
+speedup = sqrt(A/B) with the layout bias cancelled; >1.000 means the FEATURE is faster
+
+==============================================================================
+signed-zero fix-up in the AVX2 leaf (a -0.0 test riding the NaN scan)
+  -DLOGOS_ZERO_SIGN_UNSAFE (this flag DISABLES it)
+  previously: new 2026-09-12, a correctness fix: what does keeping -0.0 cost on data that has none?
+
+  shape         T   orient A   orient B    speedup   layout L0/L1
+  bimodal       1      0.974      0.993      0.990   0.984
+  clustered     1      0.965      0.989      0.988   0.977
+  heavy_tail    1      0.853      0.996      0.926   0.922
+  int_wide      1      1.013      0.993      1.010   1.003
+  uniform       1      0.860      0.989      0.932   0.922
+  bimodal      14      0.985      1.036      0.975   1.010
+  clustered    14      0.994      1.021      0.987   1.008
+  heavy_tail   14      1.075      1.055      1.010   1.065
+  int_wide     14      1.005      1.014      0.996   1.010
+  uniform      14      0.985      1.050      0.968   1.017
+
+  largest effect: 0.926
+==============================================================================
+
+SUMMARY (only rows outside +/-5%, which is about this box's floor at 24 pairs)
+  signed-zero fix-up in the AVX2 leaf (a -0.0 test riding the NaN scan) heavy_tail    1T  0.926  feature slower
+  signed-zero fix-up in the AVX2 leaf (a -0.0 test riding the NaN scan) uniform       1T  0.932  feature slower
+
+######## FINAL CHAIN: one-compare signed-zero scan + gate v2 (fallback test), harness 1536, zerodiag 66/66; floor 8M 3.3% before / 2.7% after ########
+ok C:\Users\markc\Coding\logos-sort-repo\logos-sort-repo\engines\c\logos_psort.c
+ok C:\Users\markc\Coding\logos-sort-repo\logos-sort-repo\tools\ledger_rerun.py
+done
+ok logos_psort.c
+ok logos_psort.c
+ok logos_psort.c
+ok cardgate.c
+ok cardgate.c
+ok cardgate.c
+ok cardgate.c
+done
+bench_common.h:74:20: warning: ‘bench_threads_source’ defined but not used [-Wunused-function]
+bench_common.h:74:20: warning: ‘bench_threads_source’ defined but not used [-Wunused-function]
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  signed zeros: 36 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== zerodiag (every row must read ok) ===
+66
+=== floor before ===
+  1000000        1.068     0.478     2.861       36.8%
+  8000000        1.001     0.856     1.168        3.3%
+=== cardgate v2 (fresh shapes, 1 thread) ===
+gate version 1 over version 2 at ONE thread, and version 2 over the route off, on fresh shapes, n=8388608, 30 pairs
+v1/v2 > 1.000: version 2 faster.  v2/off < 1.000: what version 2 lets in earns.
+
+  shape         chao1@384  het@2k    v1/v2       p10-p90   v2/off       p10-p90  verify
+  counts_exp20        103    3.06    1.021  0.954-1.064     1.004  0.961-1.074   ok
+  int_skew_2k         567    2.34    1.758  1.568-1.917     0.568  0.479-0.710   ok
+  int_skew_20k        857    2.95    1.841  1.458-2.135     0.600  0.534-1.046   ok
+  int_eq_8k          5343    0.73    0.990  0.781-1.499     0.971  0.857-1.367   ok
+  halves_skew         499    1.79    2.020  1.773-2.397     0.517  0.443-0.608   ok
+  cents_2dp          4857    1.11    0.984  0.914-1.072     1.006  0.920-1.164   ok
+  ratings_half          9   -1.00    0.990  0.915-1.051     0.981  0.794-1.062   ok
+=== floor after ===
+  1000000        1.021     0.940     1.093        1.8%
+  8000000        0.987     0.896     1.136        2.7%
+=== ledger re-run: one-compare signed-zero scan ===
+ledger re-run: 1 features, 24 pairs, n=8000000, two orientations each
+speedup = sqrt(A/B) with the layout bias cancelled; >1.000 means the FEATURE is faster
+
+==============================================================================
+signed-zero fix-up in the AVX2 leaf (a -0.0 test riding the NaN scan)
+  -DLOGOS_ZERO_SIGN_UNSAFE (this flag DISABLES it)
+  previously: first version (second compare + AND + OR per block) cost 7% at 1T on uniform and heavy_tail; now one compare
+
+  shape         T   orient A   orient B    speedup   layout L0/L1
+  bimodal       1      1.026      1.036      0.995   1.031
+  clustered     1      1.132      0.971      1.080   1.048
+  heavy_tail    1      0.953      0.971      0.991   0.962
+  int_wide      1      1.013      0.998      1.008   1.005
+  uniform       1      1.004      1.002      1.001   1.003
+  bimodal      14      1.048      1.009      1.019   1.028
+  clustered    14      1.050      1.036      1.007   1.043
+  heavy_tail   14      0.990      1.021      0.985   1.005
+  int_wide     14      1.049      0.973      1.038   1.010
+  uniform      14      1.015      1.008      1.003   1.011
+
+  largest effect: 1.080
+==============================================================================
+
+SUMMARY (only rows outside +/-5%, which is about this box's floor at 24 pairs)
+  signed-zero fix-up in the AVX2 leaf (a -0.0 test riding the NaN scan) clustered     1T  1.080  FEATURE FASTER

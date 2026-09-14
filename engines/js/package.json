@@ -1,0 +1,50 @@
+{
+  "name": "logos-sort",
+  "version": "0.3.0",
+  "author": "Claude Opus 4.6, 4.7, 4.8, Mark Ciubal",
+  "homepage": "http://www.codecookbook.org/",
+  "description": "In the beginning was the Word. Adaptive, distribution-aware sort for JavaScript: routes across counting, radix, flash, coarse/bits-coarse, introsort, run-merge with galloping, MSD-with-LCP-skip and packed-prefix string radix based on a sampled profile of the data. Includes argSort, typed-array fast paths, and anomaly detection. Optional native C acceleration.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "logos-sort-bench": "bin/logos-sort-bench.js",
+    "logos-sort-proxy-demo": "bin/logos-sort-proxy-demo.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib/",
+    "binding/",
+    "bin/",
+    "c/sort.h",
+    "c/sort.c",
+    "binding.gyp",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/run.js",
+    "test:proxy": "node test/run-proxy.js",
+    "test:native": "node test/run-native.js",
+    "build": "node-gyp configure && node-gyp build",
+    "rebuild": "node-gyp rebuild",
+    "bench:native": "node test/bench-native.js"
+  },
+  "keywords": [
+    "sort", "sorting", "argsort", "radix", "flashsort", "introsort",
+    "multikey-quicksort", "string-sort", "adaptive", "in-place",
+    "outliers", "anomaly-detection", "native", "n-api"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/markciubal/logos-sort.git"
+  },
+  "bugs": {
+    "url": "https://github.com/markciubal/logos-sort/issues"
+  }
+}

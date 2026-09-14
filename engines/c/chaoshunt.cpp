@@ -1,0 +1,305 @@
+/* chaoshunt.cpp — order hidden in chaos (experiments/team/chaos-explorer.md).
+ *
+ * Twenty shapes that occur in real systems and look random to the engine's probes, each with the
+ * order that is actually hidden in it. For every shape and thread count (1 and P) this measures:
+ *   logos      the shipped engine, untouched;
+ *   informed   a hand-routed sort that is TOLD the structure (bitmap for a dense permutation, block
+ *              sort + 3-block merge for bounded displacement, stable scatter by allocator, k-way
+ *              merge for known runs, tail sort + backward merge, reverse + engine, narrow LSD radix,
+ *              direct counting, hash counting), so its time is the ceiling a probe could reach;
+ *   x86simd    x86-simd-sort's AVX2 quicksort (OpenMP at P) when built with -DHAVE_XSS;
+ * and a -DLOGOS_PROFILE copy of the engine (cp_*) reports which route and leaf path logos took.
+ * Every output is checked bit-exact against std::sort of the same input. Contenders are interleaved
+ * per rep inside one row, so only ratios within a row mean anything (CLAUDE.md rules 2 and 3).
+ * No engine code is changed by this file.
+ * Run: make chaoshunt && flock /tmp/logos-bench.lock ./chaoshunt [reps] [shape-index] */
+#include "logos_psort.h"
+#include "bench_common.h"
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#ifdef HAVE_XSS
+#define XSS_USE_OPENMP 1
+#include "x86simdsort-static-incl.h"
+#include <omp.h>
+#endif
+extern "C" {
+void cp_sort_f64(double *, size_t, int); void cp_profile_reset(void); const logos_profile_t *cp_profile_get(void);
+extern const char *const cp_profile_route_names[LOGOS_ROUTE_N]; extern const char *const cp_profile_path_names[LOGOS_PATH_N];
+}
+static uint64_t RS = 7; static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
+static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
+static double gauss(void) { double u = fr(), v = fr(); if (u < 1e-300) u = 1e-300; return sqrt(-2.0 * log(u)) * cos(6.283185307179586 * v); }
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+template <class F> static void par_for(int P, F f) {
+    if (P <= 1) { f(0, 1); return; }
+    std::vector<std::thread> th; for (int t = 1; t < P; t++) th.emplace_back([&f, t, P] { f(t, P); });
+    f(0, P); for (auto &x : th) x.join();
+}
+static void par_copy(double *dst, const double *src, size_t n, int P) { par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; memcpy(dst + lo, src + lo, (hi - lo) * 8); }); }
+
+/* ---- the informed sorts (what a route that knew the structure would cost) ---- */
+enum { C_NONE, C_PERM, C_WSORTED, C_SCATTER, C_KWAY, C_TAIL, C_REVERSE, C_RADIX, C_COUNT, C_HASH };
+static const char *CN[] = { "-", "bitmap", "blocks+3merge", "stable scatter", "k-way merge", "tail+merge", "reverse+logos", "narrow radix", "counting", "hash count" };
+struct params_t { int kind; double mn, step; size_t nbk, w, k, nsorted; } CP;
+static double *g_buf; static uint64_t *g_k0, *g_k1;
+
+/* dense permutation of mn..mn+n-1: one bitmap pass proves it, one pass writes the answer */
+static int inf_perm(double *a, size_t n, int P) {
+    /* private bitmap per thread (a shared one measured 2x slower than the engine at 14T from line contention), OR-reduced */
+    size_t words = (n + 63) / 64; std::vector<uint64_t> bits((size_t)P * words, 0); std::atomic<int> bad{0};
+    par_for(P, [&](int t, int PP) {
+        size_t lo = n * t / PP, hi = n * (t + 1) / PP; uint64_t *b = &bits[(size_t)t * words];
+        for (size_t i = lo; i < hi; i++) {
+            double d = a[i] - CP.mn; if (!(d >= 0 && d < (double)n) || d != floor(d)) { bad = 1; return; }
+            size_t k = (size_t)d; uint64_t m = 1ULL << (k & 63);
+            if (b[k >> 6] & m) { bad = 1; return; } b[k >> 6] |= m;
+        }
+    });
+    if (bad) return 0;
+    if (P > 1) par_for(P, [&](int t, int PP) { size_t lo = words * t / PP, hi = words * (t + 1) / PP;
+        for (size_t w = lo; w < hi; w++) { uint64_t acc = 0, dup = 0; for (int q = 0; q < P; q++) { uint64_t x = bits[(size_t)q * words + w]; dup |= acc & x; acc |= x; } if (dup) bad = 1; } });
+    if (bad) return 0;   /* n elements, n distinct bits inside [0, n): every bit is set, the output is mn..mn+n-1 */
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; for (size_t i = lo; i < hi; i++) a[i] = CP.mn + (double)i; });
+    return 1;
+}
+/* every element within w of its final place: sort w-blocks in cache, then block k's final content is
+ * ranks [w, 2w) of the union of blocks k-1, k, k+1 (proof in the findings file) */
+static void inf_wsorted(double *a, size_t n, int P) {
+    size_t w = CP.w, K = (n + w - 1) / w; double *buf = g_buf;
+    /* the block sort stands in for an in-cache vectorized leaf: x86-simd-sort's AVX2 quicksort when built with it
+     * (sequential below 100k elements, so safe from worker threads), else std::sort (3x slower per level) */
+    par_for(P, [&](int t, int PP) { for (size_t k = t; k < K; k += PP) { size_t lo = k * w, len = std::min(w, n - lo);
+#ifdef HAVE_XSS
+        x86simdsortStatic::qsort(a + lo, len, false, false);
+#else
+        std::sort(a + lo, a + lo + len);
+#endif
+    } });
+    par_for(P, [&](int t, int PP) { for (size_t k = t; k < K; k += PP) {
+        size_t lo = k * w, len = std::min(w, n - lo); const double *p[3], *e[3]; int m = 0;
+        for (long j = (long)k - 1; j <= (long)k + 1; j++) if (j >= 0 && (size_t)j < K) { size_t l = (size_t)j * w; p[m] = a + l; e[m] = a + l + std::min(w, n - l); m++; }
+        size_t skip = k > 0 ? w : 0; double *out = buf + lo;
+        for (size_t q = 0; q < skip + len; q++) {
+            int best = -1; for (int j = 0; j < m; j++) if (p[j] < e[j] && (best < 0 || *p[j] < *p[best])) best = j;
+            double v = *p[best]++; if (q >= skip) out[q - skip] = v;
+        }
+    } });
+    par_copy(a, buf, n, P);
+}
+/* stable scatter into nbk buckets of width step: two passes, and each bucket comes out sorted because
+ * the input order inside a bucket was already ascending */
+static void inf_scatter(double *a, size_t n, int P) {
+    size_t nbk = CP.nbk; double inv = 1.0 / CP.step; double *buf = g_buf;
+    std::vector<size_t> cnt((size_t)P * nbk, 0);
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; size_t *c = &cnt[(size_t)t * nbk];
+        for (size_t i = lo; i < hi; i++) { size_t b = (size_t)((a[i] - CP.mn) * inv); if (b >= nbk) b = nbk - 1; c[b]++; } });
+    size_t sum = 0; for (size_t b = 0; b < nbk; b++) for (int t = 0; t < P; t++) { size_t &c = cnt[(size_t)t * nbk + b]; size_t x = c; c = sum; sum += x; }
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; size_t *c = &cnt[(size_t)t * nbk];
+        for (size_t i = lo; i < hi; i++) { size_t b = (size_t)((a[i] - CP.mn) * inv); if (b >= nbk) b = nbk - 1; buf[c[b]++] = a[i]; } });
+    par_copy(a, buf, n, P);
+}
+/* k known sorted runs of n/k: P-1 splitters from a sample, binary search in every run, P independent heap merges */
+static void inf_kway(double *a, size_t n, int P) {
+    size_t k = CP.k, rl = n / k; double *buf = g_buf;
+    auto rs = [&](size_t r) { return r * rl; }; auto re = [&](size_t r) { return r + 1 == k ? n : (r + 1) * rl; };
+    std::vector<double> smp(4096); for (auto &s : smp) s = a[(size_t)(fr() * (double)n)]; std::sort(smp.begin(), smp.end());
+    std::vector<size_t> seg((size_t)(P + 1) * k), off((size_t)P + 1, 0);
+    for (int t = 0; t <= P; t++) for (size_t r = 0; r < k; r++) {
+        size_t s = t == 0 ? rs(r) : t == P ? re(r) : (size_t)(std::lower_bound(a + rs(r), a + re(r), smp[(size_t)4096 * t / P]) - a);
+        seg[(size_t)t * k + r] = s; }
+    for (int t = 0; t < P; t++) { size_t c = 0; for (size_t r = 0; r < k; r++) c += seg[(size_t)(t + 1) * k + r] - seg[(size_t)t * k + r]; off[t + 1] = off[t] + c; }
+    par_for(P, [&](int t, int PP) { (void)PP;
+        struct H { double v; size_t r; }; std::vector<H> h; std::vector<size_t> pos(k), end(k);
+        for (size_t r = 0; r < k; r++) { pos[r] = seg[(size_t)t * k + r]; end[r] = seg[(size_t)(t + 1) * k + r]; if (pos[r] < end[r]) h.push_back({a[pos[r]], r}); }
+        auto sift = [&](size_t i) { size_t m = h.size(); for (;;) { size_t l = 2 * i + 1, s = i; if (l < m && h[l].v < h[s].v) s = l; if (l + 1 < m && h[l + 1].v < h[s].v) s = l + 1; if (s == i) return; std::swap(h[i], h[s]); i = s; } };
+        for (size_t i = h.size(); i-- > 0;) sift(i);
+        double *out = buf + off[t];
+        while (!h.empty()) { *out++ = h[0].v; size_t r = h[0].r; if (++pos[r] < end[r]) h[0].v = a[pos[r]]; else { h[0] = h.back(); h.pop_back(); } if (!h.empty()) sift(0); }
+    });
+    par_copy(a, buf, n, P);
+}
+/* sorted prefix + unsorted tail: sort the tail with the engine, merge it in from the back */
+static void inf_tail(double *a, size_t n, int P) {
+    size_t ns = CP.nsorted, tl = n - ns; double *buf = g_buf;
+    logos_sort_f64(a + ns, tl, P); memcpy(buf, a + ns, tl * 8);
+    long i = (long)ns - 1, j = (long)tl - 1, w = (long)n - 1;
+    while (j >= 0) { if (i >= 0 && a[i] > buf[j]) a[w--] = a[i--]; else a[w--] = buf[j--]; }
+}
+static void inf_reverse(double *a, size_t n, int P) { std::reverse(a, a + n); logos_sort_f64(a, n, P); }
+/* integers on a step lattice: keys of the fewest bits, 11-bit LSD digits, stable parallel scatter per pass */
+static void inf_radix(double *a, size_t n, int P) {
+    double inv = 1.0 / CP.step; uint64_t *src = g_k0, *dst = g_k1; std::vector<uint64_t> mx((size_t)P, 0);
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; uint64_t m = 0; for (size_t i = lo; i < hi; i++) { uint64_t k = (uint64_t)llround((a[i] - CP.mn) * inv); src[i] = k; if (k > m) m = k; } mx[t] = m; });
+    uint64_t maxk = 0; for (auto m : mx) if (m > maxk) maxk = m; int bits = 0; while ((maxk >> bits) > 0) bits++;
+    const int D = 11, NC = 1 << D; int passes = (bits + D - 1) / D; if (passes == 0) passes = 1;
+    for (int p = 0; p < passes; p++) {
+        int sh = p * D; std::vector<size_t> cnt((size_t)P * NC, 0);
+        par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; size_t *c = &cnt[(size_t)t * NC]; for (size_t i = lo; i < hi; i++) c[(src[i] >> sh) & (NC - 1)]++; });
+        size_t sum = 0; for (int d = 0; d < NC; d++) for (int t = 0; t < P; t++) { size_t &c = cnt[(size_t)t * NC + d]; size_t x = c; c = sum; sum += x; }
+        par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; size_t *c = &cnt[(size_t)t * NC]; for (size_t i = lo; i < hi; i++) dst[c[(src[i] >> sh) & (NC - 1)]++] = src[i]; });
+        std::swap(src, dst);
+    }
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; for (size_t i = lo; i < hi; i++) a[i] = CP.mn + (double)src[i] * CP.step; });
+}
+/* small lattice: count per value, emit runs; P threads each own a value range with a known output offset */
+static void inf_count(double *a, size_t n, int P) {
+    size_t nv = CP.nbk; double inv = 1.0 / CP.step; std::vector<uint32_t> cnt((size_t)P * nv, 0);
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP; uint32_t *c = &cnt[(size_t)t * nv]; for (size_t i = lo; i < hi; i++) { size_t v = (size_t)llround((a[i] - CP.mn) * inv); if (v >= nv) v = nv - 1; c[v]++; } });
+    std::vector<size_t> start(nv + 1, 0); for (size_t v = 0; v < nv; v++) { size_t s = 0; for (int t = 0; t < P; t++) s += cnt[(size_t)t * nv + v]; start[v + 1] = start[v] + s; }
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP;   /* value range whose output covers [lo,hi) */
+        size_t v0 = (size_t)(std::upper_bound(start.begin(), start.end(), lo) - start.begin()) - 1, v1 = (size_t)(std::lower_bound(start.begin(), start.end(), hi) - start.begin());
+        for (size_t v = v0; v < v1 && v < nv; v++) { size_t s = std::max(start[v], lo), e = std::min(start[v + 1], hi); double val = CP.mn + (double)v * CP.step; for (size_t i = s; i < e; i++) a[i] = val; } });
+}
+/* moderate cardinality with no lattice: one shared open-addressing table (CAS insert, atomic count), sort the
+ * distinct values with the engine, emit runs */
+static inline uint64_t hbits(double v) { uint64_t u; memcpy(&u, &v, 8); return u; }
+static inline uint64_t mix(uint64_t k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33; return k; }
+static void inf_hash(double *a, size_t n, int P) {
+    const size_t S = (size_t)1 << 21, M = S - 1; static std::vector<uint64_t> keys; static std::vector<uint32_t> cnt;
+    keys.assign(S, ~0ULL); cnt.assign(S, 0);
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP;
+        for (size_t i = lo; i < hi; i++) { uint64_t k = hbits(a[i]); size_t h = mix(k) & M;
+            for (;;) { uint64_t cur = __atomic_load_n(&keys[h], __ATOMIC_RELAXED);
+                if (cur == k) { __atomic_fetch_add(&cnt[h], 1u, __ATOMIC_RELAXED); break; }
+                if (cur == ~0ULL) { uint64_t exp = ~0ULL; if (__atomic_compare_exchange_n(&keys[h], &exp, k, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) || exp == k) { __atomic_fetch_add(&cnt[h], 1u, __ATOMIC_RELAXED); break; } }
+                h = (h + 1) & M; } } });
+    std::vector<double> dv; dv.reserve(1 << 18); for (size_t h = 0; h < S; h++) if (keys[h] != ~0ULL) { double v; memcpy(&v, &keys[h], 8); dv.push_back(v); }
+    logos_sort_f64(dv.data(), dv.size(), P);
+    std::vector<size_t> start(dv.size() + 1, 0);
+    for (size_t j = 0; j < dv.size(); j++) { uint64_t k = hbits(dv[j]); size_t h = mix(k) & M; while (keys[h] != k) h = (h + 1) & M; start[j + 1] = start[j] + cnt[h]; }
+    par_for(P, [&](int t, int PP) { size_t lo = n * t / PP, hi = n * (t + 1) / PP;
+        size_t v0 = (size_t)(std::upper_bound(start.begin(), start.end(), lo) - start.begin()) - 1, v1 = (size_t)(std::lower_bound(start.begin(), start.end(), hi) - start.begin());
+        for (size_t v = v0; v < v1 && v < dv.size(); v++) { size_t s = std::max(start[v], lo), e = std::min(start[v + 1], hi); for (size_t i = s; i < e; i++) a[i] = dv[v]; } });
+}
+static void informed(double *a, size_t n, int P) {
+    switch (CP.kind) {
+    case C_PERM: if (!inf_perm(a, n, P)) logos_sort_f64(a, n, P); break;
+    case C_WSORTED: inf_wsorted(a, n, P); break;   case C_SCATTER: inf_scatter(a, n, P); break;
+    case C_KWAY: inf_kway(a, n, P); break;         case C_TAIL: inf_tail(a, n, P); break;
+    case C_REVERSE: inf_reverse(a, n, P); break;   case C_RADIX: inf_radix(a, n, P); break;
+    case C_COUNT: inf_count(a, n, P); break;       case C_HASH: inf_hash(a, n, P); break;
+    default: logos_sort_f64(a, n, P); }
+}
+
+/* ---- the shapes ---- */
+enum { S_UNIFORM, S_HASH, S_GRAY, S_LATENCY, S_WSHUF, S_SHARD_D, S_SHARD_B, S_RUNS16, S_RUNS256, S_TAIL, S_REVNS, S_CENTS, S_EPOCH,
+       S_ADC, S_SENSOR, S_GEO, S_USERIDS, S_DATES, S_MANT16, S_RATIOS, S_N };
+static const char *NM[S_N] = { "uniform", "hash_order", "gray_code", "event_ts_latency", "window_shuffle", "shard_ids_disjoint", "shard_ids_blocks",
+    "sorted_runs_16", "sorted_runs_256", "sorted_plus_tail", "reverse_near_sort", "prices_cents", "epoch_ms", "sensor_adc", "sensor_f64", "geo_lat",
+    "user_ids_zipf", "yyyymmdd", "mantissa16", "small_ratios" };
+static const char *HID[S_N] = { "none (reference row)", "dense permutation of 0..n-1", "dense permutation of 0..n-1", "displacement <= 4096",
+    "displacement <= 2048", "8 ascending streams, disjoint ranges", "ascending inside each 1024-id block", "16 sorted runs", "256 sorted runs",
+    "95% sorted + 5% random tail", "descending + 1% swaps", "24-bit integers, lognormal", "27 bits vary of 41", "4096-value lattice",
+    "smooth drift + noise", "200 clusters", "200k distinct sparse ids", "7305-value lattice with holes", "65536-value lattice in [1,2)", "~6k distinct rationals" };
+static void gen(double *a, size_t n, int d) {
+    size_t i; CP = params_t{ C_NONE, 0, 1, 0, 0, 0, 0 };
+    switch (d) {
+    case S_UNIFORM: for (i = 0; i < n; i++) a[i] = fr() * 2e9 - 1e9; break;
+    case S_HASH:    for (i = 0; i < n; i++) a[i] = (double)((i * 2654435761ULL) & (n - 1)); CP.kind = C_PERM; CP.mn = 0; break;   /* n is a power of two: odd multiplier = bijection (Fibonacci hashing) */
+    case S_GRAY:    for (i = 0; i < n; i++) a[i] = (double)(i ^ (i >> 1)); CP.kind = C_PERM; CP.mn = 0; break;
+    case S_LATENCY: { const size_t L = 4096; std::vector<std::pair<double, double>> ev(n);   /* (arrival, send): one event per ms, latency uniform in [0, L) ms */
+                      for (i = 0; i < n; i++) { double s = (double)i + fr(); ev[i] = { s + fr() * (double)L, s }; }
+                      std::sort(ev.begin(), ev.end()); for (i = 0; i < n; i++) a[i] = ev[i].second; CP.kind = C_WSORTED; CP.w = L; break; }
+    case S_WSHUF:   { const size_t W = 2048; for (i = 0; i < n; i++) a[i] = (double)i + fr();
+                      for (size_t b = 0; b < n; b += W) { size_t m = std::min(W, n - b); for (size_t j = m - 1; j > 0; j--) { size_t r = nr() % (j + 1); std::swap(a[b + j], a[b + r]); } }
+                      CP.kind = C_WSORTED; CP.w = W; break; }
+    case S_SHARD_D: { size_t ctr[8] = { 0 }; for (i = 0; i < n; i++) { int s = 0; double u = fr() * 2.7178; double acc = 0; for (s = 0; s < 7; s++) { acc += 1.0 / (s + 1); if (u < acc) break; }   /* rates 1/(s+1): shard 0 is the busiest */
+                      a[i] = (double)s * 1073741824.0 + (double)ctr[s]++; } CP.kind = C_SCATTER; CP.mn = 0; CP.step = 1073741824.0; CP.nbk = 8; break; }
+    case S_SHARD_B: { size_t next = 0, cur[8], left[8]; for (int s = 0; s < 8; s++) { left[s] = 0; cur[s] = 0; }
+                      for (i = 0; i < n; i++) { int s = 0; double u = fr() * 2.7178; double acc = 0; for (s = 0; s < 7; s++) { acc += 1.0 / (s + 1); if (u < acc) break; }
+                        if (left[s] == 0) { cur[s] = next; next += 1024; left[s] = 1024; }
+                        a[i] = (double)cur[s]++; left[s]--; }
+                      CP.kind = C_SCATTER; CP.mn = 0; CP.step = 1024; CP.nbk = (next + 1023) / 1024; break; }
+    case S_RUNS16: case S_RUNS256: { size_t k = d == S_RUNS16 ? 16 : 256, rl = n / k; for (i = 0; i < n; i++) a[i] = fr() * 2e9 - 1e9;
+                      for (size_t r = 0; r < k; r++) std::sort(a + r * rl, a + (r + 1 == k ? n : (r + 1) * rl)); CP.kind = C_KWAY; CP.k = k; break; }
+    case S_TAIL:    { size_t ns = n / 100 * 95; for (i = 0; i < n; i++) a[i] = fr() * 2e9 - 1e9; std::sort(a, a + ns); CP.kind = C_TAIL; CP.nsorted = ns; break; }
+    case S_REVNS:   { for (i = 0; i < n; i++) a[i] = (double)(n - i) + fr() * 0.5;
+                      for (i = 0; i < n / 100; i++) { size_t x = nr() % n, y = nr() % n; std::swap(a[x], a[y]); } CP.kind = C_REVERSE; break; }
+    case S_CENTS:   for (i = 0; i < n; i++) { double v = floor(exp(3.5 + 1.3 * gauss()) * 100.0 + 0.5); if (v > 1e7) v = 1e7; a[i] = v; } CP.kind = C_RADIX; CP.mn = 0; CP.step = 1; break;
+    case S_EPOCH:   for (i = 0; i < n; i++) a[i] = 1.7e12 + floor(fr() * 86400e3); CP.kind = C_RADIX; CP.mn = 1.7e12; CP.step = 1; break;
+    case S_ADC:     for (i = 0; i < n; i++) { double v = floor(2048 + 1500 * sin(6.283185307179586 * 3.0 * (double)i / (double)n) + 100 * gauss() + 0.5); if (v < 0) v = 0; if (v > 4095) v = 4095; a[i] = v; } CP.kind = C_COUNT; CP.mn = 0; CP.step = 1; CP.nbk = 4096; break;
+    case S_SENSOR:  for (i = 0; i < n; i++) a[i] = 20 + 5 * sin(6.283185307179586 * 3.0 * (double)i / (double)n) + 0.5 * gauss(); break;
+    case S_GEO:     { double cx[200], cw[200]; for (int c = 0; c < 200; c++) { cx[c] = -60 + 130 * fr(); cw[c] = 0.05 + 2.0 * fr() * fr(); }
+                      for (i = 0; i < n; i++) { if (fr() < 0.05) { a[i] = -60 + 130 * fr(); continue; } double u = fr() * 5.878; double acc = 0; int c = 0; for (c = 0; c < 199; c++) { acc += 1.0 / (c + 1); if (u < acc) break; } a[i] = cx[c] + cw[c] * gauss(); } break; }
+    case S_USERIDS: { std::vector<double> ids(200000); for (auto &v : ids) v = floor(fr() * 2147483648.0);
+                      for (i = 0; i < n; i++) { double u = fr() * 12.79; double r = exp(u) - 1; size_t k = (size_t)r; if (k >= 200000) k = 199999; a[i] = ids[k]; }   /* rank ~ Zipf(1): log-uniform rank */
+                      CP.kind = C_HASH; break; }
+    case S_DATES:   { static const int dm[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+                      for (i = 0; i < n; i++) { int y = 2006 + (int)(fr() * 20), m = (int)(fr() * 12), dd = 1 + (int)(fr() * dm[m]); a[i] = (double)(y * 10000 + (m + 1) * 100 + dd); }
+                      CP.kind = C_COUNT; CP.mn = 20060101; CP.step = 1; CP.nbk = 20251231 - 20060101 + 1; break; }
+    case S_MANT16:  for (i = 0; i < n; i++) a[i] = 1.0 + floor(fr() * 65536) / 65536.0; CP.kind = C_COUNT; CP.mn = 1.0; CP.step = 1.0 / 65536; CP.nbk = 65536; break;
+    case S_RATIOS:  for (i = 0; i < n; i++) a[i] = (double)(1 + (int)(fr() * 100)) / (double)(1 + (int)(fr() * 100)); CP.kind = C_HASH; break;
+    }
+}
+static int g_dump;   /* CHAOS_PROF=1: print the profiled copy's phase and per-thread breakdown for every row */
+static const char *route_of(double *a, const double *base, size_t n, int t, char *out, size_t cap) {
+    memcpy(a, base, n * 8); cp_profile_reset(); cp_sort_f64(a, n, t); const logos_profile_t *p = cp_profile_get();
+    size_t best = 0, tot = 0; int bp = 0;
+    for (int k = 1; k < LOGOS_PATH_N; k++) { size_t s = 0; for (int th = 0; th < p->nthreads && th < LOGOS_PROF_MAX_THREADS; th++) s += p->path_elems[th][k]; tot += s; if (s > best) { best = s; bp = k; } }
+    if (tot) snprintf(out, cap, "%s/%s", cp_profile_route_names[p->route], cp_profile_path_names[bp]); else snprintf(out, cap, "%s", cp_profile_route_names[p->route]);
+    if (g_dump) {
+        printf("    profile (%d threads, %.1f ms): ", p->nthreads, p->total_ms);
+        for (int ph = 0; ph < LOGOS_PH_N; ph++) if (p->phase_ms[ph] >= 0.05 * p->total_ms) printf("%s %.1f  ", logos_profile_phase_names[ph], p->phase_ms[ph]);
+        printf("\n    per-thread busy/cpu ms in leaf, elems by path:");
+        for (int th = 0; th < p->nthreads && th < LOGOS_PROF_MAX_THREADS; th++) {
+            double b = 0, c = 0; for (int ph = 0; ph < LOGOS_PH_N; ph++) { b += p->busy_ms[th][ph]; c += p->cpu_ms[th][ph]; }
+            printf("\n      t%-2d busy %6.1f cpu %6.1f  ", th, b, c);
+            for (int k = 1; k < LOGOS_PATH_N; k++) if (p->path_elems[th][k]) printf("%s %zu (%.1f ms)  ", cp_profile_path_names[k], p->path_elems[th][k], p->path_ms[th][k]);
+        }
+        printf("\n");
+    }
+    return out;
+}
+int main(int argc, char **argv) {
+    int P = bench_threads(logos_num_cpus()); const size_t N = (size_t)1 << 23; int R = argc > 1 ? atoi(argv[1]) : 5;
+    int want[S_N]; for (int d = 0; d < S_N; d++) want[d] = argc <= 2;   /* argv[2]: comma-separated shape indices */
+    if (argc > 2) for (const char *s = argv[2]; *s; ) { int v = atoi(s); if (v >= 0 && v < S_N) want[v] = 1; while (*s && *s != ',') s++; if (*s) s++; }
+    g_dump = getenv("CHAOS_PROF") != NULL;
+    std::vector<double> base(N), a(N), ref(N), bufv(N); std::vector<uint64_t> k0(N), k1(N); g_buf = bufv.data(); g_k0 = k0.data(); g_k1 = k1.data();
+    printf("chaoshunt: order hidden in chaos. n=2^23, best of %d, threads 1 and %d; ratios within a row only\n", R, P);
+    { double bm = 1e300, bs = 1e300; for (size_t i = 0; i < N; i++) base[i] = fr();
+      for (int r = 0; r < 5; r++) { double s = now(); memcpy(a.data(), base.data(), N * 8); double x = now() - s; if (x < bm) bm = x; }
+      for (int r = 0; r < 5; r++) { memcpy(a.data(), base.data(), 1000000 * 8); double s = now(); logos_sort_f64(a.data(), 1000000, 1); double x = now() - s; if (x < bs) bs = x; }
+      printf("calibration: memcpy 64MB %.2f ms, logos 1M uniform 1T %.1f ms (idle reference ~2.9 / ~30; loaded 4-7 / 40-60)\n\n", bm, bs); }
+#ifdef HAVE_XSS
+    const int HX = 1;
+#else
+    const int HX = 0;
+#endif
+    printf("  %-18s %3s %9s %9s %9s %6s  %-36s %s\n", "shape", "thr", "logos", "informed", HX ? "x86simd" : "", "gap", "engine route/leaf path", "informed method");
+    for (int d = 0; d < S_N; d++) {
+        if (!want[d]) continue;
+        RS = 7 + (uint64_t)d; gen(base.data(), N, d); params_t sp = CP; ref = base; std::sort(ref.begin(), ref.end());
+        int tset[2] = { 1, P };
+        for (int ti = 0; ti < 2; ti++) {
+            int t = tset[ti]; double tl = 1e300, tc = 1e300, tx = 1e300; int okl = 1, okc = 1, okx = 1; char rt[96];
+#ifdef HAVE_XSS
+            omp_set_num_threads(t);
+#endif
+            route_of(a.data(), base.data(), N, t, rt, sizeof rt);
+            for (int r = 0; r < R; r++) {
+                memcpy(a.data(), base.data(), N * 8); double s = now(); logos_sort_f64(a.data(), N, t); double x = now() - s; if (x < tl) tl = x; if (memcmp(a.data(), ref.data(), N * 8)) okl = 0;
+                if (sp.kind != C_NONE) { CP = sp; memcpy(a.data(), base.data(), N * 8); s = now(); informed(a.data(), N, t); x = now() - s; if (x < tc) tc = x; if (memcmp(a.data(), ref.data(), N * 8)) okc = 0; }
+#ifdef HAVE_XSS
+                memcpy(a.data(), base.data(), N * 8); s = now(); x86simdsortStatic::qsort(a.data(), N, false, false); x = now() - s; if (x < tx) tx = x; if (memcmp(a.data(), ref.data(), N * 8)) okx = 0;
+#endif
+            }
+            char cs[64], xs[64], gs[64];
+            if (sp.kind != C_NONE) snprintf(cs, sizeof cs, "%7.1fms", tc); else snprintf(cs, sizeof cs, "%9s", "-");
+            if (HX) snprintf(xs, sizeof xs, "%7.1fms", tx); else xs[0] = 0;
+            if (sp.kind != C_NONE) snprintf(gs, sizeof gs, "%5.2fx", tl / tc); else snprintf(gs, sizeof gs, "%6s", "-");
+            printf("  %-18s %3d %7.1fms %9s %9s %6s  %-36s %s%s%s%s\n", NM[d], t, tl, cs, xs, gs, rt, sp.kind != C_NONE ? CN[sp.kind] : HID[d],
+                   okl ? "" : "  LOGOS MISMATCH", okc ? "" : "  INFORMED MISMATCH", okx ? "" : "  XSS MISMATCH");
+            fflush(stdout);
+        }
+    }
+    printf("\nhidden order per shape:\n"); for (int d = 0; d < S_N; d++) printf("  %-18s %s\n", NM[d], HID[d]);
+    return 0;
+}

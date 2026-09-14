@@ -1,0 +1,769 @@
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x cqbench -x cqtrace -x scalebench pristine/engines/c/Makefile work/engines/c/Makefile
+--- pristine/engines/c/Makefile	2026-09-12 03:46:38.310626052 -0700
++++ work/engines/c/Makefile	2026-09-12 04:04:13.596254500 -0700
+@@ -355,4 +355,13 @@
+ 	rm -rf logos-sort-c-$(VERSION)
+ 
+ clean:
+-	rm -f $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o logos-sort-c-*.tar.gz
++	rm -f $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o cqbench cqtrace cq_trace.o logos-sort-c-*.tar.gz
++
++# count-queue: static per-thread ranges vs an atomic chunk queue (and parallel merges) in the f64
++# counting routes. One binary, switched by LOGOS_CQ at runtime, paired harness. `make cqtrace` is the
++# same driver on a -DLOGOS_TRACE engine: `./cqtrace trace` prints per-thread busy time per pass.
++cqbench: cqbench.c $(LIB).a $(HDR)
++	$(CC) $(CFLAGS) $(BENCHFLAGS) cqbench.c $(LIB).a -o $@ $(LDLIBS) -lm
++cqtrace: cqbench.c $(SRC) $(HDR)
++	$(CC) $(CFLAGS) -DLOGOS_TRACE -c $(SRC) -o cq_trace.o
++	$(CC) $(CFLAGS) $(BENCHFLAGS) cqbench.c cq_trace.o $(OBJ2) $(OBJ3) -o $@ $(LDLIBS) -lm
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x cqbench -x cqtrace -x scalebench pristine/engines/c/cqbench.c work/engines/c/cqbench.c
+--- pristine/engines/c/cqbench.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/cqbench.c	2026-09-12 04:31:57.054820716 -0700
+@@ -0,0 +1,102 @@
++/* cqbench.c — do dynamic chunk queues (and parallel merges) help the f64 counting routes?
++ *
++ * The lowcard, lattice and modcard routes carved static per-thread index ranges for their map and
++ * emit passes and merged serially (FINDINGS 3j measured 3.0-5.8 ms of busy time across the threads
++ * of one lattice map). count-queue ports count_try_i32's atomic chunk queue to them, splits the
++ * lattice slot merge and the modcard hash merge across threads, and spawns once per route.
++ *
++ * Both variants are the SAME compiled code, switched by LOGOS_CQ in the environment (read once per
++ * route call), so this A/B carries no code-layout bias (methodology rule 3) and is measured with the
++ * paired harness. Run `make pairprobe` first to see what this box can resolve today.
++ *
++ * Usage: ./cqbench [pairs] [n] [shape] [threads]      ./cqbench trace [n] [shape] [threads]: one
++ * sort per variant with the -DLOGOS_TRACE engine (make cqtrace) printing per-thread busy time. */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++static uint64_t RS = 88172645463325252ULL;
++static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
++
++/* A is the baseline (static ranges, serial merges), B is the chunk queue. bench_paired returns tA/tB,
++ * so a number above 1.000 means the queue is that much faster. */
++static void sort_static(double *a, size_t n, int t) { setenv("LOGOS_CQ", "0", 1); logos_sort_f64(a, n, t); }
++static void sort_queue (double *a, size_t n, int t) { setenv("LOGOS_CQ", "1", 1); logos_sort_f64(a, n, t); }
++/* granularity sweep (./cqbench chunks N): A = queue at the default chunks per thread, B = queue at N */
++static char CHUNKS_B[16] = "8";
++static void sort_q_default(double *a, size_t n, int t) { setenv("LOGOS_CQ", "1", 1); unsetenv("LOGOS_CQ_CHUNKS"); logos_sort_f64(a, n, t); }
++static void sort_q_chunks (double *a, size_t n, int t) { setenv("LOGOS_CQ", "1", 1); setenv("LOGOS_CQ_CHUNKS", CHUNKS_B, 1); logos_sort_f64(a, n, t); }
++
++typedef void (*gen_fn)(double *, size_t);
++static void g_few5(double *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (double)(nr() % 5) * 1e6; }                 /* parbench few_distinct: lowcard hash */
++static void g_quantized(double *a, size_t n) { for (size_t i = 0; i < n; i++) a[i] = (double)(nr() % 4096) / 64.0; }             /* parbench quantized: lattice, 4096 values */
++static void g_lat30k(double *a, size_t n)    { for (size_t i = 0; i < n; i++) a[i] = (double)(nr() % 30000); }                    /* lattice, 30k values, 65k-slot merge */
++static double POOL[20000];
++static void g_dist20k(double *a, size_t n)   { for (size_t i = 0; i < 20000; i++) POOL[i] = fr() * 2e9 - 1e9; for (size_t i = 0; i < n; i++) a[i] = POOL[nr() % 20000]; }   /* modcard hash: 20k random doubles, not a lattice */
++static void g_low64(double *a, size_t n)     { for (size_t i = 0; i < 64; i++) POOL[i] = fr() * 2e9 - 1e9; for (size_t i = 0; i < n; i++) a[i] = POOL[nr() % 64]; }         /* lowcard hash at its cap */
++static void g_zipf(double *a, size_t n)      { for (size_t i = 0; i < n; i++) { double u = fr(); if (u < 1e-9) u = 1e-9; a[i] = floor(pow(u, -1.0 / 1.1)); } }              /* skewed counts: lowcard or modcard, imbalanced tables */
++static void g_uniform(double *a, size_t n)   { for (size_t i = 0; i < n; i++) a[i] = fr() * 2e9 - 1e9; }                          /* partition: the toggle never runs; a null row */
++
++static const struct { const char *name; gen_fn g; } SH[] = {
++    { "few_distinct", g_few5 }, { "quantized", g_quantized }, { "lattice_30k", g_lat30k },
++    { "distinct_20k", g_dist20k }, { "lowcard_64", g_low64 }, { "zipf", g_zipf }, { "uniform", g_uniform },
++};
++#define NSH ((int)(sizeof SH / sizeof SH[0]))
++
++static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
++
++int main(int argc, char **argv) {
++    int trace = argc > 1 && strcmp(argv[1], "trace") == 0;
++    int chunks = argc > 2 && strcmp(argv[1], "chunks") == 0;
++    if (chunks) { snprintf(CHUNKS_B, sizeof CHUNKS_B, "%d", atoi(argv[2])); argv += 2; argc -= 2; }   /* ./cqbench chunks N [pairs] [n] [shape] [threads] */
++    int reps = argc > 1 && !trace ? atoi(argv[1]) : 40; if (reps < 8) reps = 8;
++    size_t n = argc > 2 ? (size_t)atol(argv[2]) : 8000000;
++    const char *only = argc > 3 && argv[3][0] ? argv[3] : NULL;
++    int onlyT = argc > 4 ? atoi(argv[4]) : 0;
++    bench_sort_fn A = chunks ? sort_q_default : sort_static, B = chunks ? sort_q_chunks : sort_queue;
++    int P = bench_threads(logos_num_cpus());
++    double *base = malloc(n * 8), *work = malloc(n * 8), *ref = malloc(n * 8);
++    if (!base || !work || !ref) return 1;
++
++    if (!trace) {
++        if (chunks) printf("count-queue granularity: %d chunks per thread (baseline) vs %s, n=%zu, %d pairs, threads %d and %d\n", 8, CHUNKS_B, n, reps, P, P / 2);
++        else printf("count-queue: static ranges (baseline) vs chunk queue + parallel merge, n=%zu, %d pairs, threads %d and %d\n", n, reps, P, P / 2);
++        printf("one binary, one copy of the code, switched at runtime (LOGOS_CQ) -- no code-layout bias.\n");
++        printf("ratio > 1.000 means the queue is faster. Compare against ./pairprobe before believing anything small.\n\n");
++        printf("  %-14s %2s %9s %9s %9s   %s\n", "shape", "T", "ratio", "p10", "p90", "verify");
++    }
++    for (int k = 0; k < NSH; k++) {
++        if (only && strcmp(only, SH[k].name) != 0) continue;
++        RS = 88172645463325252ULL;
++        SH[k].g(base, n);
++        memcpy(ref, base, n * 8); qsort(ref, n, 8, cmp_d);      /* rule 1: verify before timing */
++        int tc[2] = { P, P / 2 > 0 ? P / 2 : 1 };
++        for (int ti = 0; ti < 2; ti++) {
++            if (onlyT && tc[ti] != onlyT) continue;
++            int ok = 1;
++            memcpy(work, base, n * 8); A(work, n, tc[ti]); ok &= memcmp(work, ref, n * 8) == 0;
++            memcpy(work, base, n * 8); B(work, n, tc[ti]); ok &= memcmp(work, ref, n * 8) == 0;
++            if (trace) {
++                fprintf(stderr, "== %s, %d threads: static ==\n", SH[k].name, tc[ti]);
++                memcpy(work, base, n * 8); sort_static(work, n, tc[ti]);
++                fprintf(stderr, "== %s, %d threads: queue ==\n", SH[k].name, tc[ti]);
++                memcpy(work, base, n * 8); sort_queue(work, n, tc[ti]);
++                fprintf(stderr, "   verify %s\n", ok ? "ok" : "FAILED");
++                continue;
++            }
++            double p10 = 0, p90 = 0;
++            double med = bench_paired(A, B, base, work, n, tc[ti], reps, &p10, &p90);
++            printf("  %-14s %2d %9.3f %9.3f %9.3f   %s\n", SH[k].name, tc[ti], med, p10, p90, ok ? "ok" : "FAILED");
++            printf("ROW\t%s\t%d\t%.5f\t%.5f\t%.5f\t%d\n", SH[k].name, tc[ti], med, p10, p90, ok);
++            fflush(stdout);
++        }
++    }
++    if (!trace) printf("\n  p10/p90 bound a single pair; the ratio column is the median over %d of them.\n", reps);
++    free(base); free(work); free(ref);
++    return 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x cqbench -x cqtrace -x scalebench pristine/engines/c/logos_psort.c work/engines/c/logos_psort.c
+--- pristine/engines/c/logos_psort.c	2026-09-12 03:46:37.914632774 -0700
++++ work/engines/c/logos_psort.c	2026-09-12 07:59:50.926796969 -0700
+@@ -2334,6 +2334,64 @@
+ }
+ 
+ 
++/* ============ dynamic chunk queue for the f64 counting routes (count-queue) ============
++ * The lowcard, lattice and modcard routes carved STATIC per-thread index ranges for their map and
++ * emit passes, so the slowest thread (an E-core, or a preempted one on WSL2) set the wall time; the
++ * profile measured 3.0-5.8 ms of busy time across the 14 threads of one lattice map (FINDINGS 3j).
++ * count_try_i32 already pulls fixed-size chunks from an atomic counter. This ports that pattern:
++ * threads take CQ_CHUNKS_PER_THREAD chunks each on average, a slow core simply takes fewer, and
++ * the emit pass (any output range can be regenerated from gstart by one binary search) is queued
++ * the same way. The lattice slot merge, serial and O(slots x P), is split across threads by slot
++ * range with a prefix over per-thread totals; the modcard hash merge is split by KEY RANGE (P+1 bounds
++ * from the sorted sample): each thread first sorts its own map into a list (local lines), then P-way
++ * merges its key range across the P lists, and thread 0 concatenates the disjoint ranges. Each route
++ * now spawns ONCE and uses barriers between its phases instead of a spawn round per pass.
++ *
++ * Runtime toggle so one binary can A/B both with no code-layout bias (the LOGOS_LPT pattern):
++ * LOGOS_CQ=0 forces the static ranges, LOGOS_CQ=1 the queue, unset takes LOGOS_CQ_DEFAULT.
++ * Under -DLOGOS_TRACE each route prints per-thread map/emit busy time and chunks taken. */
++#ifndef LOGOS_CQ_DEFAULT
++#define LOGOS_CQ_DEFAULT 0   /* opt-in: the paired A/B did not resolve a win at 14T on few_distinct/quantized (experiments/team/count-queue.md) */
++#endif
++#ifndef CQ_CHUNKS_PER_THREAD
++#define CQ_CHUNKS_PER_THREAD 8
++#endif
++#ifndef CQ_MIN_CHUNK
++#define CQ_MIN_CHUNK 16384
++#endif
++static inline int cq_on(void) { const char *e = getenv("LOGOS_CQ"); return e ? atoi(e) != 0 : LOGOS_CQ_DEFAULT; }
++typedef struct { atomic_size_t next; size_t n, csize, nchunk; } cq_t;
++static inline int cq_chunks(void) { const char *e = getenv("LOGOS_CQ_CHUNKS"); int v = e ? atoi(e) : 0; return v > 0 ? v : CQ_CHUNKS_PER_THREAD; }   /* granularity sweep: make cqbench, ./cqbench chunks N */
++static void cq_init(cq_t *q, size_t n, int P) {
++    size_t per = (size_t)cq_chunks();
++    size_t cs = (n + (size_t)P * per - 1) / ((size_t)P * per);
++    if (cs < CQ_MIN_CHUNK) cs = CQ_MIN_CHUNK;
++    q->n = n; q->csize = cs; q->nchunk = (n + cs - 1) / cs; atomic_init(&q->next, 0);
++}
++static inline int cq_take(cq_t *q, size_t *lo, size_t *hi) {
++    size_t ch = atomic_fetch_add(&q->next, 1); if (ch >= q->nchunk) return 0;
++    *lo = ch * q->csize; *hi = *lo + q->csize; if (*hi > q->n) *hi = q->n; return 1;
++}
++static inline void cq_drain(cq_t *q) { atomic_store(&q->next, q->nchunk); }   /* an aborting thread stops the others' pulls */
++#ifdef LOGOS_TRACE
++typedef struct { size_t mch, ech; double mms, ems; } cq_stat_t;
++#define CQT(...) __VA_ARGS__
++static void cq_trace(const char *route, const cq_stat_t *st, int P) {
++    double mmin = 1e30, mmax = 0, msum = 0, emin = 1e30, emax = 0, esum = 0; size_t cmin = (size_t)-1, cmax = 0, emn = (size_t)-1, emx = 0;
++    for (int t = 0; t < P; t++) {
++        mmin = st[t].mms < mmin ? st[t].mms : mmin; mmax = st[t].mms > mmax ? st[t].mms : mmax; msum += st[t].mms;
++        emin = st[t].ems < emin ? st[t].ems : emin; emax = st[t].ems > emax ? st[t].ems : emax; esum += st[t].ems;
++        cmin = st[t].mch < cmin ? st[t].mch : cmin; cmax = st[t].mch > cmax ? st[t].mch : cmax;
++        emn = st[t].ech < emn ? st[t].ech : emn; emx = st[t].ech > emx ? st[t].ech : emx;
++    }
++    TRACE("%s: %d threads | map busy ms min %.2f mean %.2f max %.2f (max/mean %.2f) chunks/thread %zu..%zu | emit busy ms min %.2f mean %.2f max %.2f (max/mean %.2f) chunks/thread %zu..%zu",
++          route, P, mmin, msum / P, mmax, msum > 0 ? mmax / (msum / P) : 0.0, cmin, cmax, emin, esum / P, emax, esum > 0 ? emax / (esum / P) : 0.0, emn, emx);
++}
++#else
++#define CQT(...)
++#endif
++typedef struct { void *c; int t; } cq_arg_t;
++
+ /* ============ low-cardinality parallel counting sort (f64) ============
+  * Quantile splitters cannot separate EQUAL keys, so few-distinct data
+  * collapses into a handful of giant buckets (load imbalance) and then pays
+@@ -2359,11 +2417,13 @@
+ #endif
+ static inline uint64_t total_key(double v) { uint64_t u; memcpy(&u, &v, 8); return (u >> 63) ? ~u : (u | 0x8000000000000000ULL); }
+ typedef struct { const double *a; size_t lo, hi; uint64_t *keys; double *vals; size_t *cnts; size_t d; int abort; int tid;
+-                 uint64_t hmul; const uint64_t *hkey; const uint8_t *slot; size_t sd, *hcnt; } lcmap_t;   /* hmul != 0: verified perfect hash from the sample */
++                 uint64_t hmul; const uint64_t *hkey; const uint8_t *slot; size_t sd, *hcnt;
++                 cq_t *q; CQT(cq_stat_t *st;) } lcmap_t;   /* hmul != 0: verified perfect hash from the sample; q != NULL: pull chunks from the queue */
+ static void *lc_map_body(void *p);
+ static void *lc_map(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = lc_map_body(p); PROF(prof_busy_since(((lcmap_t *)p)->tid, g_prof_phase, s0);) return r; }
+-static void *lc_map_body(void *p) {
+-    lcmap_t *m = p; size_t d = 0;
++/* one index range into this thread's table; m->d carries the table size across ranges. 0 = aborted. */
++static int lc_map_range(lcmap_t *m, size_t lo0, size_t hi0) {
++    size_t d = m->d;
+     if (m->hmul) {
+         /* The gate already sorted a sample and found <= LOWCARD_SAMPLE_MAX distinct values; a multiply-shift
+          * perfect hash over those keys turns the per-element lookup into a multiply, a shift, a byte load and
+@@ -2372,48 +2432,81 @@
+          * (make cardbench): scan 2.0 ns at 5 distinct and 30.8 ns at 64 (its binary search above 32), hash
+          * 1.1 ns at both. */
+         const uint64_t mul = m->hmul, *hk = m->hkey; const uint8_t *slot = m->slot; size_t *hc = m->hcnt;
+-        for (size_t i = m->lo; i < m->hi; i++) {
++        for (size_t i = lo0; i < hi0; i++) {
+             double x = m->a[i]; uint64_t k = total_key(x);
+             unsigned h = (unsigned)((k * mul) >> (64 - LC_PHASH_BITS)); unsigned sl = slot[h];
+             if (hk[sl] == k) { hc[sl]++; continue; }
+-            if (x != x) { m->abort = 1; return NULL; }
++            if (x != x) { m->abort = 1; m->d = d; return 0; }
+             size_t lo = 0; for (size_t q = 0; q < d; q++) lo += (m->keys[q] < k);
+             if (lo < d && m->keys[lo] == k) { m->cnts[lo]++; continue; }
+-            if (d == LOWCARD_CAP) { m->abort = 1; return NULL; }
++            if (d == LOWCARD_CAP) { m->abort = 1; m->d = d; return 0; }
+             memmove(m->keys + lo + 1, m->keys + lo, (d - lo) * sizeof(uint64_t));
+             memmove(m->vals + lo + 1, m->vals + lo, (d - lo) * sizeof(double));
+             memmove(m->cnts + lo + 1, m->cnts + lo, (d - lo) * sizeof(size_t));
+             m->keys[lo] = k; m->vals[lo] = x; m->cnts[lo] = 1; d++;
+         }
+-        m->d = d; return NULL;
++        m->d = d; return 1;
+     }
+-    for (size_t i = m->lo; i < m->hi; i++) {
+-        double x = m->a[i]; if (x != x) { m->abort = 1; return NULL; }
++    for (size_t i = lo0; i < hi0; i++) {
++        double x = m->a[i]; if (x != x) { m->abort = 1; m->d = d; return 0; }
+         uint64_t k = total_key(x);
+         size_t lo;
+         if (d <= 32) { lo = 0; for (size_t q = 0; q < d; q++) lo += (m->keys[q] < k); }   /* branchless: no mispredicts */
+         else { size_t hi = d; lo = 0; while (lo < hi) { size_t mid = (lo + hi) >> 1; if (m->keys[mid] < k) lo = mid + 1; else hi = mid; } }
+         if (lo < d && m->keys[lo] == k) { m->cnts[lo]++; continue; }
+-        if (d == LOWCARD_CAP) { m->abort = 1; return NULL; }
++        if (d == LOWCARD_CAP) { m->abort = 1; m->d = d; return 0; }
+         memmove(m->keys + lo + 1, m->keys + lo, (d - lo) * sizeof(uint64_t));
+         memmove(m->vals + lo + 1, m->vals + lo, (d - lo) * sizeof(double));
+         memmove(m->cnts + lo + 1, m->cnts + lo, (d - lo) * sizeof(size_t));
+         m->keys[lo] = k; m->vals[lo] = x; m->cnts[lo] = 1; d++;
+     }
+-    m->d = d; return NULL;
++    m->d = d; return 1;
++}
++static void *lc_map_body(void *p) {
++    lcmap_t *m = p; m->d = 0;
++    CQT(double t0 = trace_now();)
++    if (m->q) { size_t lo, hi; while (cq_take(m->q, &lo, &hi)) { CQT(if (m->st) m->st->mch++;) if (!lc_map_range(m, lo, hi)) { cq_drain(m->q); break; } } }
++    else { CQT(if (m->st) m->st->mch = 1;) lc_map_range(m, m->lo, m->hi); }
++    CQT(if (m->st) m->st->mms = trace_now() - t0;)
++    return NULL;
+ }
+-typedef struct { double *a; size_t lo, hi; const double *gv; const size_t *gstart; size_t gd; int tid; } lcemit_t;
++typedef struct { double *a; size_t lo, hi; const double *gv; const size_t *gstart; size_t gd; int tid; cq_t *q; CQT(cq_stat_t *st;) } lcemit_t;
+ static void *lc_emit_body(void *p);
+ static void *lc_emit(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = lc_emit_body(p); PROF(prof_busy_since(((lcemit_t *)p)->tid, g_prof_phase, s0);) return r; }
++/* regenerate output positions [lo, hi) from the (value, start) list: one binary search, then runs */
++static void lc_emit_range(const lcemit_t *e, size_t lo0, size_t hi0) {
++    size_t v; { size_t lo = 0, hi = e->gd; while (lo < hi) { size_t mid = (lo + hi) >> 1; if (e->gstart[mid + 1] <= lo0) lo = mid + 1; else hi = mid; } v = lo; }
++    size_t pos = lo0;
++    while (pos < hi0 && v < e->gd) { size_t end = e->gstart[v + 1]; if (end > hi0) end = hi0; double val = e->gv[v]; for (; pos < end; pos++) e->a[pos] = val; v++; }
++}
+ static void *lc_emit_body(void *p) {
+     lcemit_t *e = p;
+-    size_t v; { size_t lo = 0, hi = e->gd; while (lo < hi) { size_t mid = (lo + hi) >> 1; if (e->gstart[mid + 1] <= e->lo) lo = mid + 1; else hi = mid; } v = lo; }
+-    size_t pos = e->lo;
+-    while (pos < e->hi && v < e->gd) { size_t end = e->gstart[v + 1]; if (end > e->hi) end = e->hi; double val = e->gv[v]; for (; pos < end; pos++) e->a[pos] = val; v++; }
++    CQT(double t0 = trace_now();)
++    if (e->q) { size_t lo, hi; while (cq_take(e->q, &lo, &hi)) { CQT(if (e->st) e->st->ech++;) lc_emit_range(e, lo, hi); } }
++    else { CQT(if (e->st) e->st->ech = 1;) lc_emit_range(e, e->lo, e->hi); }
++    CQT(if (e->st) e->st->ems = trace_now() - t0;)
+     return NULL;
+ }
+ typedef struct { uint64_t k; double v; size_t c; } lcpair_t;
+ static int cmp_lc_pair(const void *x, const void *y) { uint64_t a = ((const lcpair_t *)x)->k, b = ((const lcpair_t *)y)->k; return (a > b) - (a < b); }
++/* LSD radix sort of (key, value, count) pairs by key: 8-bit digits, a pass whose digit is constant over the
++ * input is skipped (doubles share exponent bytes). glibc's qsort takes its generic memcpy-per-element path
++ * on 24-byte records and measured 13-28 ms per thread for 20k pairs with 14 threads sorting at once
++ * (count-queue trace, distinct_20k); this is well under 1 ms. tmp must hold n pairs. */
++static void lcpair_radix(lcpair_t *a, lcpair_t *tmp, size_t n) {
++    size_t hist[8][256]; memset(hist, 0, sizeof hist);
++    for (size_t i = 0; i < n; i++) { uint64_t k = a[i].k; for (int b = 0; b < 8; b++) hist[b][(k >> (8 * b)) & 255]++; }
++    lcpair_t *src = a, *dst = tmp;
++    for (int b = 0; b < 8; b++) {
++        size_t *h = hist[b]; int constant = 0;
++        for (int v = 0; v < 256; v++) if (h[v] == n) { constant = 1; break; }
++        if (constant) continue;
++        size_t sum = 0; for (int v = 0; v < 256; v++) { size_t c = h[v]; h[v] = sum; sum += c; }
++        for (size_t i = 0; i < n; i++) dst[h[(src[i].k >> (8 * b)) & 255]++] = src[i];
++        lcpair_t *t = src; src = dst; dst = t;
++    }
++    if (src != a) memcpy(a, src, n * sizeof(lcpair_t));
++}
+ /* The sample's reads are independent cache misses; issuing every prefetch before the first read lets the
+  * core overlap them (the line-fill buffers hold ~16). Measured: the two stages together 1.05 -> ~0.15 ms
+  * (make probebench, -DLOGOS_NO_SAMPLE_FAST). */
+@@ -2437,6 +2530,72 @@
+     if (k >= 2) quicksort(s, 0, (long)k - 1, 2 * log2i(k));
+     return m - k;
+ }
++/* fold the P per-thread maps (incremental tables + perfect-hash counters) into one sorted (value, start)
++ * list. Serial: at most P x (LOWCARD_CAP + sd) entries. Returns 1 and hands out gv/gstart/gd. */
++static int lc_fold(const lcmap_t *mp, int P, int hmul, size_t sd, const uint64_t *sk, const double *sv,
++                   double **gv_out, size_t **gstart_out, size_t *gd_out) {
++    size_t total = 0; for (int t = 0; t < P; t++) total += mp[t].d + (hmul ? sd : 0);
++    lcpair_t *pairs = malloc((total ? total : 1) * sizeof(lcpair_t));
++    double *gv = malloc((total ? total : 1) * sizeof(double));
++    size_t *gcnt = malloc((total ? total : 1) * sizeof(size_t));
++    size_t *gstart = malloc((total + 2) * sizeof(size_t));
++    int ok = 0;
++    if (pairs && gv && gcnt && gstart) {
++        size_t w = 0;
++        for (int t = 0; t < P; t++) for (size_t i = 0; i < mp[t].d; i++) { pairs[w].k = mp[t].keys[i]; pairs[w].v = mp[t].vals[i]; pairs[w].c = mp[t].cnts[i]; w++; }
++        if (hmul) for (int t = 0; t < P; t++) for (size_t q = 0; q < sd; q++) if (mp[t].hcnt[q]) { pairs[w].k = sk[q]; pairs[w].v = sv[q]; pairs[w].c = mp[t].hcnt[q]; w++; }
++        qsort(pairs, w, sizeof(lcpair_t), cmp_lc_pair);
++        /* fold equal keys across threads into (value, total count) */
++        size_t gd = 0;
++        for (size_t i = 0; i < w; i++) {
++            if (gd > 0 && pairs[i].k == pairs[i - 1].k) { gcnt[gd - 1] += pairs[i].c; continue; }
++            gv[gd] = pairs[i].v; gcnt[gd] = pairs[i].c; gd++;
++        }
++        /* prefix sums -> each value's output start; gstart[gd] == n */
++        gstart[0] = 0; for (size_t i = 0; i < gd; i++) gstart[i + 1] = gstart[i] + gcnt[i];
++        *gv_out = gv; *gstart_out = gstart; *gd_out = gd; ok = 1;
++    }
++    free(pairs); free(gcnt);
++    if (!ok) { free(gv); free(gstart); }
++    return ok;
++}
++/* count-queue: one spawn, three phases. map (chunk queue) | fold on thread 0 | emit (chunk queue). */
++typedef struct { lcmap_t *mp; int P; size_t n; double *a; cq_t mq, eq; barrier_t bar; atomic_int fail;
++                 int hmul; size_t sd; const uint64_t *sk; const double *sv; double *gv; size_t *gstart; size_t gd; CQT(cq_stat_t *st;) } lc_cq_t;
++static void *lc_cq_worker(void *p) {
++    cq_arg_t *w = p; lc_cq_t *c = w->c; int t = w->t;
++    lc_map(&c->mp[t]);
++    if (c->mp[t].abort) atomic_store(&c->fail, 1);
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("lowcard cq: map phase done");
++    /* every decision below is read after a barrier, so all threads take the same exit and no barrier is left short */
++    if (atomic_load(&c->fail)) return NULL;
++    if (t == 0 && !lc_fold(c->mp, c->P, c->hmul, c->sd, c->sk, c->sv, &c->gv, &c->gstart, &c->gd)) atomic_store(&c->fail, 1);
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("lowcard cq: fold done");
++    if (atomic_load(&c->fail)) return NULL;
++    lcemit_t e; memset(&e, 0, sizeof e); e.a = c->a; e.gv = c->gv; e.gstart = c->gstart; e.gd = c->gd; e.tid = t; e.q = &c->eq; CQT(e.st = c->st + t;)
++    lc_emit(&e);
++    return NULL;
++}
++static int lowcard_cq_run(double *a, size_t n, int P, lcmap_t *mp, pthread_t *th, int hmul, size_t sd, const uint64_t *sk, const double *sv) {
++    lc_cq_t c; memset(&c, 0, sizeof c);
++    c.mp = mp; c.P = P; c.n = n; c.a = a; c.hmul = hmul; c.sd = sd; c.sk = sk; c.sv = sv;
++    cq_init(&c.mq, n, P); cq_init(&c.eq, n, P); atomic_init(&c.fail, 0);
++    cq_arg_t *wa = malloc((size_t)P * sizeof *wa); if (!wa) return 0;
++    CQT(cq_stat_t *st = calloc((size_t)P, sizeof *st); c.st = st;)
++    for (int t = 0; t < P; t++) { wa[t].c = &c; wa[t].t = t; mp[t].q = &c.mq; CQT(mp[t].st = st ? st + t : NULL;) }
++    barrier_init(&c.bar, P);
++    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_cq_worker, &wa[t]);
++    lc_cq_worker(&wa[0]);
++    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
++    barrier_destroy(&c.bar);
++    int sorted = !atomic_load(&c.fail);
++    CQT(if (st) { cq_trace("lowcard cq", st, P); free(st); })
++    TRACE("lowcard: queue run %s (%zu chunks of %zu)", sorted ? "sorted" : "declined", c.mq.nchunk, c.mq.csize);
++    free(c.gv); free(c.gstart); free(wa);
++    return sorted;
++}
+ /* returns 1 if it sorted a[], 0 if it declined (a[] untouched) */
+ static int lowcard_try_f64(double *a, size_t n, int P, const double *ext, size_t ext_m) {
+     P = count_threads(n, P);
+@@ -2486,42 +2645,31 @@
+         if (hmul) { mp[t].hmul = hmul; mp[t].hkey = sk; mp[t].slot = slot; mp[t].sd = sd; mp[t].hcnt = calloc(sd, sizeof(size_t)); if (!mp[t].hcnt) ok = 0; }
+     }
+     int sorted = 0;
+-    if (ok) {
++    if (ok && cq_on()) sorted = lowcard_cq_run(a, n, P, mp, th, hmul != 0, sd, sk, sv);
++    else if (ok) {
++        /* static ranges: LOGOS_CQ=0 (the pre-count-queue path, kept for the A/B) */
++        CQT(cq_stat_t *st = calloc((size_t)P, sizeof *st); for (int t = 0; t < P; t++) mp[t].st = st ? st + t : NULL;)
+         for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_map, &mp[t]);
+         lc_map(&mp[0]);
+         for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+-        int aborted = 0; size_t total = 0, over = 0;
+-        for (int t = 0; t < P; t++) { if (mp[t].abort) aborted = 1; total += mp[t].d + (hmul ? sd : 0); over += mp[t].d; }
++        int aborted = 0; size_t over = 0;
++        for (int t = 0; t < P; t++) { if (mp[t].abort) aborted = 1; over += mp[t].d; }
+         TRACE("lowcard: map done, %zu entries the hash did not cover%s", over, aborted ? ", ABORTED" : "");
+         if (!aborted) {
+-            lcpair_t *pairs = malloc((total ? total : 1) * sizeof(lcpair_t));
+-            double *gv = malloc((total ? total : 1) * sizeof(double));
+-            size_t *gcnt = malloc((total ? total : 1) * sizeof(size_t));
+-            size_t *gstart = malloc((total + 2) * sizeof(size_t));
+-            if (pairs && gv && gcnt && gstart) {
+-                size_t w = 0;
+-                for (int t = 0; t < P; t++) for (size_t i = 0; i < mp[t].d; i++) { pairs[w].k = mp[t].keys[i]; pairs[w].v = mp[t].vals[i]; pairs[w].c = mp[t].cnts[i]; w++; }
+-                if (hmul) for (int t = 0; t < P; t++) for (size_t q = 0; q < sd; q++) if (mp[t].hcnt[q]) { pairs[w].k = sk[q]; pairs[w].v = sv[q]; pairs[w].c = mp[t].hcnt[q]; w++; }
+-                qsort(pairs, w, sizeof(lcpair_t), cmp_lc_pair);
+-                /* fold equal keys across threads into (value, total count) */
+-                size_t gd = 0;
+-                for (size_t i = 0; i < w; i++) {
+-                    if (gd > 0 && pairs[i].k == pairs[i - 1].k) { gcnt[gd - 1] += pairs[i].c; continue; }
+-                    gv[gd] = pairs[i].v; gcnt[gd] = pairs[i].c; gd++;
+-                }
+-                /* prefix sums -> each value's output start; gstart[gd] == n */
+-                gstart[0] = 0; for (size_t i = 0; i < gd; i++) gstart[i + 1] = gstart[i] + gcnt[i];
+-                lcemit_t *em = malloc((size_t)P * sizeof(lcemit_t));
++            double *gv = NULL; size_t *gstart = NULL; size_t gd = 0;
++            if (lc_fold(mp, P, hmul != 0, sd, sk, sv, &gv, &gstart, &gd)) {
++                lcemit_t *em = calloc((size_t)P, sizeof(lcemit_t));
+                 if (em) {
+-                    for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; }
++                    for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; CQT(em[t].st = st ? st + t : NULL;) }
+                     for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &em[t]);
+                     lc_emit(&em[0]);
+                     for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+                     free(em); sorted = 1;
+                 }
+             }
+-            free(pairs); free(gv); free(gcnt); free(gstart);
++            free(gv); free(gstart);
+         }
++        CQT(if (st) { cq_trace("lowcard static", st, P); free(st); })
+     }
+     for (int t = 0; t < P; t++) { free(mp[t].keys); free(mp[t].vals); free(mp[t].cnts); free(mp[t].hcnt); }
+     free(mp); free(th);
+@@ -2578,17 +2726,131 @@
+         if (!hmap_grow(h)) return 0;
+     }
+ }
+-typedef struct { const double *a; size_t lo, hi; hmap_t h; int abort; int tid; } mcmap_t;
++typedef struct { const double *a; size_t lo, hi; hmap_t h; int abort; int tid; cq_t *q; CQT(cq_stat_t *st;) } mcmap_t;
+ static void *mc_map_body(void *p);
+ static void *mc_map(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = mc_map_body(p); PROF(prof_busy_since(((mcmap_t *)p)->tid, g_prof_phase, s0);) return r; }
++static int mc_map_range(mcmap_t *m, size_t lo0, size_t hi0) {
++    for (size_t i = lo0; i < hi0; i++) {
++        double x = m->a[i];
++        if (x != x || !hmap_add(&m->h, total_key(x), x, 1, MODCARD_CAP)) { m->abort = 1; return 0; }
++    }
++    return 1;
++}
+ static void *mc_map_body(void *p) {
+     mcmap_t *m = p;
+-    for (size_t i = m->lo; i < m->hi; i++) {
+-        double x = m->a[i];
+-        if (x != x || !hmap_add(&m->h, total_key(x), x, 1, MODCARD_CAP)) { m->abort = 1; return NULL; }
++    CQT(double t0 = trace_now();)
++    if (m->q) { size_t lo, hi; while (cq_take(m->q, &lo, &hi)) { CQT(if (m->st) m->st->mch++;) if (!mc_map_range(m, lo, hi)) { cq_drain(m->q); break; } } }
++    else { CQT(if (m->st) m->st->mch = 1;) mc_map_range(m, m->lo, m->hi); }
++    CQT(if (m->st) m->st->mms = trace_now() - t0;)
++    return NULL;
++}
++/* count-queue: map (chunk queue) | each thread sorts its OWN map into a list | each thread P-way merges one
++ * KEY RANGE across the P lists, folding equal keys | thread 0 concatenates the disjoint ranges (value order)
++ * into (value, start) | emit (chunk queue). A first design split by a hash share of the key, with every
++ * thread scanning every other thread's map; it paid 22-35 ms of remote-L2 traffic at 14T for 20k distinct. */
++typedef struct { mcmap_t *mp; int P; size_t n; double *a; cq_t mq, eq; barrier_t bar; atomic_int fail;
++                 const uint64_t *bound;                 /* P+1 key bounds from the sorted sample: thread t merges keys in [bound[t], bound[t+1]) */
++                 lcpair_t **lists; size_t *ld;         /* per thread: its OWN map's entries, sorted by key */
++                 lcpair_t **mlists; size_t *md, *mtot; /* per thread: its key range merged across the P lists, entries and elements */
++                 double *gv; size_t *gstart; size_t gd; CQT(cq_stat_t *st;) } mc_cq_t;
++static void *mc_cq_worker(void *p) {
++    cq_arg_t *w = p; mc_cq_t *c = w->c; int t = w->t, P = c->P;
++    mc_map(&c->mp[t]);
++    if (c->mp[t].abort) atomic_store(&c->fail, 1);
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("modcard cq: map phase done");
++    if (atomic_load(&c->fail)) return NULL;
++    /* 2. my own map -> a sorted list. Local work on lines this core wrote; the first design had every thread
++     * scan every other thread's map and paid 22-35 ms of remote-L2 traffic at 14T for 20k distinct. */
++    {   const hmap_t *h = &c->mp[t].h;
++        CQT(double s0 = trace_now();)
++        lcpair_t *L = malloc(2 * (h->used ? h->used : 1) * sizeof(lcpair_t));   /* list + radix scratch */
++        if (!L) atomic_store(&c->fail, 1);
++        else {
++            size_t w2 = 0; for (size_t i = 0; i < h->cap; i++) if (h->keys[i] != UINT64_MAX) { L[w2].k = h->keys[i]; L[w2].v = h->vals[i]; L[w2].c = h->cnts[i]; w2++; }
++            CQT(double s1 = trace_now();)
++            lcpair_radix(L, L + w2, w2);
++            c->lists[t] = L; c->ld[t] = w2;
++            CQT(TRACE("modcard cq: t%d own list: extract %.2f ms + sort %.2f ms, %zu entries, cap %zu", t, s1 - s0, trace_now() - s1, w2, h->cap);)
++        }
++    }
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("modcard cq: own-list sort done");
++    if (atomic_load(&c->fail)) return NULL;
++    /* 3. my key range, P-way merged across the P sorted lists with equal keys folded. Each thread reads
++     * about 1/P of every list, sequentially. */
++    {   uint64_t klo = c->bound[t], khi = c->bound[t + 1];
++        size_t *at = malloc((size_t)P * sizeof(size_t)), *end = malloc((size_t)P * sizeof(size_t)); size_t cap = 0;
++        if (!at || !end) atomic_store(&c->fail, 1);
++        else {
++            for (int q = 0; q < P; q++) {
++                const lcpair_t *L = c->lists[q]; size_t lo = 0, hi = c->ld[q];
++                while (lo < hi) { size_t mid = (lo + hi) >> 1; if (L[mid].k < klo) lo = mid + 1; else hi = mid; } at[q] = lo;
++                hi = c->ld[q]; while (lo < hi) { size_t mid = (lo + hi) >> 1; if (L[mid].k < khi) lo = mid + 1; else hi = mid; } end[q] = lo;
++                cap += end[q] - at[q];
++            }
++            lcpair_t *M = malloc((cap ? cap : 1) * sizeof(lcpair_t));
++            if (!M) atomic_store(&c->fail, 1);
++            else {
++                size_t md = 0, tot = 0;
++                for (;;) {
++                    int best = -1; uint64_t bk = UINT64_MAX;
++                    for (int q = 0; q < P; q++) if (at[q] < end[q] && c->lists[q][at[q]].k < bk) { bk = c->lists[q][at[q]].k; best = q; }
++                    if (best < 0) break;
++                    const lcpair_t *pr = &c->lists[best][at[best]++];
++                    if (md > 0 && M[md - 1].k == pr->k) M[md - 1].c += pr->c; else M[md++] = *pr;
++                    tot += pr->c;
++                }
++                c->mlists[t] = M; c->md[t] = md; c->mtot[t] = tot;
++            }
++        }
++        free(at); free(end);
++    }
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("modcard cq: range merge done");
++    if (atomic_load(&c->fail)) return NULL;
++    /* 4. concatenate the P ranges (value order) into (value, start) */
++    if (t == 0) {
++        size_t gd = 0; for (int q = 0; q < P; q++) gd += c->md[q];
++        c->gv = malloc((gd ? gd : 1) * sizeof(double)); c->gstart = malloc((gd + 2) * sizeof(size_t));
++        if (!c->gv || !c->gstart) atomic_store(&c->fail, 1);
++        else {
++            size_t acc = 0, wo = 0;
++            for (int q = 0; q < P; q++) for (size_t i = 0; i < c->md[q]; i++) { c->gv[wo] = c->mlists[q][i].v; c->gstart[wo] = acc; acc += c->mlists[q][i].c; wo++; }
++            c->gstart[wo] = acc; c->gd = wo;
++            if (acc != c->n) atomic_store(&c->fail, 1);
++        }
+     }
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("modcard cq: concatenate done, %zu distinct", c->gd);
++    if (atomic_load(&c->fail)) return NULL;
++    lcemit_t e; memset(&e, 0, sizeof e); e.a = c->a; e.gv = c->gv; e.gstart = c->gstart; e.gd = c->gd; e.tid = t; e.q = &c->eq; CQT(e.st = c->st + t;)
++    lc_emit(&e);
++    if (t == 0) TRACE("modcard cq: thread 0 emit done");
+     return NULL;
+ }
++static int modcard_cq_run(double *a, size_t n, int P, mcmap_t *mp, pthread_t *th, const uint64_t *bound) {
++    mc_cq_t c; memset(&c, 0, sizeof c);
++    c.mp = mp; c.P = P; c.n = n; c.a = a; c.bound = bound;
++    cq_init(&c.mq, n, P); cq_init(&c.eq, n, P); atomic_init(&c.fail, 0);
++    cq_arg_t *wa = malloc((size_t)P * sizeof *wa);
++    c.lists = calloc((size_t)P, sizeof(lcpair_t *)); c.ld = calloc((size_t)P, sizeof(size_t));
++    c.mlists = calloc((size_t)P, sizeof(lcpair_t *)); c.md = calloc((size_t)P, sizeof(size_t)); c.mtot = calloc((size_t)P, sizeof(size_t));
++    if (!wa || !c.lists || !c.ld || !c.mlists || !c.md || !c.mtot) { free(wa); free(c.lists); free(c.ld); free(c.mlists); free(c.md); free(c.mtot); return 0; }
++    CQT(cq_stat_t *st = calloc((size_t)P, sizeof *st); c.st = st;)
++    for (int t = 0; t < P; t++) { wa[t].c = &c; wa[t].t = t; mp[t].q = &c.mq; CQT(mp[t].st = st ? st + t : NULL;) }
++    barrier_init(&c.bar, P);
++    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, mc_cq_worker, &wa[t]);
++    mc_cq_worker(&wa[0]);
++    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
++    barrier_destroy(&c.bar);
++    int sorted = !atomic_load(&c.fail);
++    CQT(if (st) { cq_trace("modcard cq", st, P); free(st); })
++    TRACE("modcard: queue run %s, %zu distinct", sorted ? "sorted" : "declined", c.gd);
++    for (int t = 0; t < P; t++) { free(c.lists[t]); free(c.mlists[t]); }
++    free(c.lists); free(c.ld); free(c.mlists); free(c.md); free(c.mtot); free(c.gv); free(c.gstart); free(wa);
++    return sorted;
++}
+ 
+ /* ============ lattice (direct-index) counting ============
+  * Most quantized data is a LATTICE: every value an integer multiple of one step
+@@ -2601,25 +2863,88 @@
+ #define LATTICE_MAX_SLOTS 65536
+ #define LATTICE_MIN_SLOTS 4096
+ typedef struct { uint64_t *keys; double *vals; size_t *cnts; } lslots_t;
+-typedef struct { const double *a; size_t lo, hi; double base, step; long margin, slots; lslots_t t; int abort; int tid; } lattice_arg_t;
++typedef struct { const double *a; size_t lo, hi; double base, step; long margin, slots; lslots_t t; int abort; int tid; cq_t *q; CQT(cq_stat_t *st;) } lattice_arg_t;
+ static void *lattice_map_body(void *p);
+ static void *lattice_map(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = lattice_map_body(p); PROF(prof_busy_since(((lattice_arg_t *)p)->tid, g_prof_phase, s0);) return r; }
+-static void *lattice_map_body(void *p) {
+-    lattice_arg_t *m = p; const double inv = 1.0 / m->step;
+-    for (size_t i = m->lo; i < m->hi; i++) {
+-        double x = m->a[i]; if (x != x) { m->abort = 1; return NULL; }
++static int lattice_map_range(lattice_arg_t *m, size_t lo0, size_t hi0) {
++    const double inv = 1.0 / m->step;
++    for (size_t i = lo0; i < hi0; i++) {
++        double x = m->a[i]; if (x != x) { m->abort = 1; return 0; }
+         double q = (x - m->base) * inv; double qi = (double)(long)(q + (q >= 0 ? 0.5 : -0.5));
+         double err = q - qi; if (err < 0) err = -err;
+         double tol = 1e-9 * (qi >= 0 ? qi : -qi) + 1e-9;
+-        if (err > tol) { m->abort = 1; return NULL; }                        /* off-lattice */
+-        long idx = (long)qi + m->margin; if (idx < 0 || idx >= m->slots) { m->abort = 1; return NULL; }
++        if (err > tol) { m->abort = 1; return 0; }                           /* off-lattice */
++        long idx = (long)qi + m->margin; if (idx < 0 || idx >= m->slots) { m->abort = 1; return 0; }
+         uint64_t k = total_key(x), kk = m->t.keys[idx];
+         if (kk == k) { m->t.cnts[idx]++; continue; }
+-        if (kk != UINT64_MAX) { m->abort = 1; return NULL; }                 /* two doubles on one lattice point */
++        if (kk != UINT64_MAX) { m->abort = 1; return 0; }                    /* two doubles on one lattice point */
+         m->t.keys[idx] = k; m->t.vals[idx] = x; m->t.cnts[idx] = 1;
+     }
++    return 1;
++}
++static void *lattice_map_body(void *p) {
++    lattice_arg_t *m = p;
++    CQT(double t0 = trace_now();)
++    if (m->q) { size_t lo, hi; while (cq_take(m->q, &lo, &hi)) { CQT(if (m->st) m->st->mch++;) if (!lattice_map_range(m, lo, hi)) { cq_drain(m->q); break; } } }
++    else { CQT(if (m->st) m->st->mch = 1;) lattice_map_range(m, m->lo, m->hi); }
++    CQT(if (m->st) m->st->mms = trace_now() - t0;)
+     return NULL;
+ }
++/* count-queue: map (chunk queue) | merge my slot range across the P tables (keys must agree, counts sum),
++ * count into gstart[i] | prefix over per-thread totals, counts -> starts in place | emit (chunk queue).
++ * gstart is slot-indexed (empty slots are zero-length runs, which lc_emit_range skips), so no compaction
++ * pass is needed and slot order is value order. */
++typedef struct { lattice_arg_t *mp; int P; size_t n; double *a; long slots; cq_t mq, eq; barrier_t bar; atomic_int fail;
++                 double *gv; size_t *gstart; size_t *tot; CQT(cq_stat_t *st;) } lat_cq_t;
++static void *lat_cq_worker(void *p) {
++    cq_arg_t *w = p; lat_cq_t *c = w->c; int t = w->t, P = c->P;
++    lattice_map(&c->mp[t]);
++    if (c->mp[t].abort) atomic_store(&c->fail, 1);
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("lattice cq: map phase done");
++    if (atomic_load(&c->fail)) return NULL;
++    long s0 = (long)((long long)c->slots * t / P), s1 = (long)((long long)c->slots * (t + 1) / P); size_t tot = 0;
++    for (long i = s0; i < s1; i++) {
++        uint64_t key = UINT64_MAX; size_t cnt = 0; double val = 0;
++        for (int q = 0; q < P; q++) { uint64_t kk = c->mp[q].t.keys[i]; if (kk == UINT64_MAX) continue;
++            if (key == UINT64_MAX) { key = kk; val = c->mp[q].t.vals[i]; } else if (kk != key) { atomic_store(&c->fail, 1); break; }
++            cnt += c->mp[q].t.cnts[i]; }
++        c->gv[i] = val; c->gstart[i] = cnt; tot += cnt;
++    }
++    c->tot[t] = tot;
++    barrier_wait(&c->bar);
++    if (atomic_load(&c->fail)) return NULL;
++    size_t base = 0; for (int q = 0; q < t; q++) base += c->tot[q];
++    for (long i = s0; i < s1; i++) { size_t cnt = c->gstart[i]; c->gstart[i] = base; base += cnt; }
++    if (t == P - 1) { c->gstart[c->slots] = base; if (base != c->n) atomic_store(&c->fail, 1); }
++    barrier_wait(&c->bar);
++    if (t == 0) TRACE("lattice cq: slot merge + prefix done");
++    if (atomic_load(&c->fail)) return NULL;
++    lcemit_t e; memset(&e, 0, sizeof e); e.a = c->a; e.gv = c->gv; e.gstart = c->gstart; e.gd = (size_t)c->slots; e.tid = t; e.q = &c->eq; CQT(e.st = c->st + t;)
++    lc_emit(&e);
++    return NULL;
++}
++static int lattice_cq_run(double *a, size_t n, int P, lattice_arg_t *mp, pthread_t *th, long slots) {
++    if (slots <= 0) return 0;
++    lat_cq_t c; memset(&c, 0, sizeof c);
++    c.mp = mp; c.P = P; c.n = n; c.a = a; c.slots = slots;
++    cq_init(&c.mq, n, P); cq_init(&c.eq, n, P); atomic_init(&c.fail, 0);
++    cq_arg_t *wa = malloc((size_t)P * sizeof *wa);
++    c.gv = malloc((size_t)slots * sizeof(double)); c.gstart = malloc(((size_t)slots + 1) * sizeof(size_t)); c.tot = calloc((size_t)P, sizeof(size_t));
++    if (!wa || !c.gv || !c.gstart || !c.tot) { free(wa); free(c.gv); free(c.gstart); free(c.tot); return 0; }
++    CQT(cq_stat_t *st = calloc((size_t)P, sizeof *st); c.st = st;)
++    for (int t = 0; t < P; t++) { wa[t].c = &c; wa[t].t = t; mp[t].q = &c.mq; CQT(mp[t].st = st ? st + t : NULL;) }
++    barrier_init(&c.bar, P);
++    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lat_cq_worker, &wa[t]);
++    lat_cq_worker(&wa[0]);
++    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
++    barrier_destroy(&c.bar);
++    int sorted = !atomic_load(&c.fail);
++    CQT(if (st) { cq_trace("lattice cq", st, P); free(st); })
++    TRACE("lattice: queue run %s, %ld slots", sorted ? "sorted" : "declined", slots);
++    free(c.gv); free(c.gstart); free(c.tot); free(wa);
++    return sorted;
++}
+ /* returns 1 if sorted, 0 if declined (a[] untouched). samp: sorted sample of m values. */
+ static int lattice_try_f64(double *a, size_t n, int P, const double *samp, size_t m) {
+     /* distinct sample values -> candidate step */
+@@ -2653,15 +2978,19 @@
+         if (!mp[t].t.keys || !mp[t].t.vals || !mp[t].t.cnts) ok = 0; else memset(mp[t].t.keys, 0xFF, (size_t)slots * sizeof(uint64_t));
+     }
+     int sorted = 0;
+-    if (ok) {
++    if (ok && cq_on()) sorted = lattice_cq_run(a, n, P, mp, th, slots);
++    else if (ok) {
++        /* static ranges and a serial merge: LOGOS_CQ=0 (the pre-count-queue path, kept for the A/B) */
++        CQT(cq_stat_t *st = calloc((size_t)P, sizeof *st); for (int t = 0; t < P; t++) mp[t].st = st ? st + t : NULL;)
+         for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lattice_map, &mp[t]);
+         lattice_map(&mp[0]);
+         for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+         int aborted = 0; for (int t = 0; t < P; t++) if (mp[t].abort) aborted = 1;
++        TRACE("lattice static: map joined");
+         if (!aborted) {
+             /* merge by index: keys must agree across threads; counts sum. Index order == value order. */
+             double *gv = malloc((size_t)slots * sizeof(double)); size_t *gstart = malloc(((size_t)slots + 1) * sizeof(size_t));
+-            lcemit_t *em = malloc((size_t)P * sizeof(lcemit_t));
++            lcemit_t *em = calloc((size_t)P, sizeof(lcemit_t));
+             if (gv && gstart && em) {
+                 size_t gd = 0, acc = 0; int conflict = 0;
+                 for (long i = 0; i < slots && !conflict; i++) {
+@@ -2672,8 +3001,8 @@
+                     if (cnt) { gv[gd] = val; gstart[gd] = acc; acc += cnt; gd++; }
+                 }
+                 if (!conflict && acc == n) {
+-                    gstart[gd] = acc;
+-                    for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; }
++                    gstart[gd] = acc; TRACE("lattice static: serial merge done");
++                    for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; CQT(em[t].st = st ? st + t : NULL;) }
+                     for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &em[t]);
+                     lc_emit(&em[0]);
+                     for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+@@ -2682,6 +3011,7 @@
+             }
+             free(gv); free(gstart); free(em);
+         }
++        CQT(if (st) { cq_trace("lattice static", st, P); free(st); })
+     }
+     for (int t = 0; t < P; t++) { free(mp[t].t.keys); free(mp[t].t.vals); free(mp[t].t.cnts); }
+     free(mp); free(th);
+@@ -2703,36 +3033,47 @@
+ #ifndef LOGOS_NO_LATTICE
+     if (lattice_try_f64(a, n, P, samp, m)) { PROF(g_prof.route = LOGOS_ROUTE_LATTICE;) if (!ext) free(samp); return 1; }    /* direct-index when the data is a lattice */
+ #endif
++    /* count-queue: key bounds for the parallel merge, the sample's value quantiles. Equal quantiles (skewed
++     * data) give empty ranges, which is harmless: that thread merges nothing. */
++    uint64_t *bound = malloc(((size_t)P + 1) * sizeof(uint64_t));
++    if (bound) { bound[0] = 0; bound[P] = UINT64_MAX; for (int t = 1; t < P; t++) bound[t] = total_key(samp[(size_t)t * m / P]); }
+     if (!ext) free(samp);
+ 
+     size_t chunk = (n + P - 1) / P;
+     mcmap_t *mp = calloc((size_t)P, sizeof(mcmap_t)); pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
+-    if (!mp || !th) { free(mp); free(th); return 0; }
++    if (!mp || !th) { free(mp); free(th); free(bound); return 0; }
+     int ok = 1;
+     for (int t = 0; t < P; t++) {
+         mp[t].a = a; PROF(mp[t].tid = t;) mp[t].lo = (size_t)t * chunk; mp[t].hi = mp[t].lo + chunk; if (mp[t].hi > n) mp[t].hi = n;
+         if (!hmap_init(&mp[t].h, 4096)) ok = 0;                 /* small start; grows with the data, stays cache-resident */
+     }
+     int sorted = 0;
+-    if (ok) {
++    if (ok && bound && cq_on()) sorted = modcard_cq_run(a, n, P, mp, th, bound);
++    else if (ok) {
++        /* static ranges and a serial hash merge: LOGOS_CQ=0 (the pre-count-queue path, kept for the A/B) */
++        CQT(cq_stat_t *st = calloc((size_t)P, sizeof *st); for (int t = 0; t < P; t++) mp[t].st = st ? st + t : NULL;)
+         for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, mc_map, &mp[t]);
+         mc_map(&mp[0]);
+         for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+         int aborted = 0; for (int t = 0; t < P; t++) if (mp[t].abort) aborted = 1;
++        TRACE("modcard static: map joined");
+         if (!aborted) {
++            CQT(double tm0 = trace_now();)
+             hmap_t g; int gok = hmap_init(&g, 8192);
+             for (int t = 0; gok && t < P; t++) for (size_t i = 0; i < mp[t].h.cap; i++)
+                 if (mp[t].h.keys[i] != UINT64_MAX && !hmap_add(&g, mp[t].h.keys[i], mp[t].h.vals[i], mp[t].h.cnts[i], (size_t)-1)) gok = 0;
++            CQT(TRACE("modcard static: hash fold %.2f ms", trace_now() - tm0);)
+             if (gok) {
+                 size_t gd = g.used;
+                 lcpair_t *pairs = malloc((gd ? gd : 1) * sizeof(lcpair_t));
+                 double *gv = malloc((gd ? gd : 1) * sizeof(double)); size_t *gstart = malloc((gd + 2) * sizeof(size_t));
+-                lcemit_t *em = malloc((size_t)P * sizeof(lcemit_t));
++                lcemit_t *em = calloc((size_t)P, sizeof(lcemit_t));
+                 if (pairs && gv && gstart && em) {
+                     size_t w = 0; for (size_t i = 0; i < g.cap; i++) if (g.keys[i] != UINT64_MAX) { pairs[w].k = g.keys[i]; pairs[w].v = g.vals[i]; pairs[w].c = g.cnts[i]; w++; }
+                     qsort(pairs, w, sizeof(lcpair_t), cmp_lc_pair);
+                     gstart[0] = 0; for (size_t i = 0; i < w; i++) { gv[i] = pairs[i].v; gstart[i + 1] = gstart[i] + pairs[i].c; }
+-                    for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = w; }
++                    CQT(TRACE("modcard static: serial merge %.2f ms, %zu distinct", trace_now() - tm0, w);)
++                    for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = w; CQT(em[t].st = st ? st + t : NULL;) }
+                     for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &em[t]);
+                     lc_emit(&em[0]);
+                     for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+@@ -2742,9 +3083,10 @@
+             }
+             hmap_free(&g);
+         }
++        CQT(if (st) { cq_trace("modcard static", st, P); free(st); })
+     }
+     for (int t = 0; t < P; t++) hmap_free(&mp[t].h);
+-    free(mp); free(th);
++    free(mp); free(th); free(bound);
+     return sorted;
+ }
+ 

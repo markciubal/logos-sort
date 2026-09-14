@@ -1,0 +1,646 @@
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x i32abbench -x scalebench -x '*.orig' -x '*.rej' pristine/engines/c/CHANGELOG.md work/engines/c/CHANGELOG.md
+--- pristine/engines/c/CHANGELOG.md	2026-09-12 07:43:53.201959310 -0700
++++ work/engines/c/CHANGELOG.md	2026-09-12 07:50:13.241752041 -0700
+@@ -1,5 +1,44 @@
+ # Changelog
+ 
++## (unreleased) — int32: the sequential leaf windows its table too, the parallel count route fits threads to a table budget, and the counting gate drops to n/4 (`make i32abbench`, experiments/team/i32-sentinel-seq.md)
++- Three int32 changes, each a RUNTIME toggle so one binary measures both sides with no
++  code-layout bias (methodology rule 3), each paired-adjacent at 8M on a loaded box under the
++  team bench lock, every output verified against qsort first. Ratios are old/new medians.
++- **(a) `leaf_i32_windowed`**: the sequential leaf gated its counting sort on raw min/max, so
++  one INT32_MIN among a 0..99 bulk sent 8M elements to the radix (2.5x, intbench). It now does
++  what `count_try_i32` did the entry before: a 2048-point sample gives a full and a K=5 trimmed
++  window; the window is counted, the tail spills into the scratch buffer (low from the front,
++  high from the back), is sorted by a recursive call and placed before / after the bulk. 1T:
++  one INT32_MIN **3.19x**, both extremes **4.91x**, a 0.1% far tail 1e6 wide **4.86x**; the
++  guards (clean bulk, span 101, 5% sentinel, span 1e8, full range) 0.985-1.024. Measured
++  against the clean row adjacently the sentinel row is now within noise of it (section G).
++  `-DLOGOS_NO_I32_LEAF_WINDOW` compiles it out, `LOGOS_I32_NO_LEAF_WINDOW=1` turns it off.
++- **(b) table budget**: the parallel count route had a fixed 262144-slot cap and lost to one
++  core for spans between that and ~n/8 (intbench 1e6 row, P/1 0.60-0.87). The cap is now a
++  MEMORY budget (`COUNT_I32_TABLE_BUDGET_MB`, 64): Pc = min(count_threads, budget/span),
++  declining below 3 threads or above span n. 14T old/new: span 5e5 **4.10x**, 1e6 **3.20x**
++  (P/1 0.60 -> 2.68), 2e6 **2.34x** (8 threads), 4e6 **1.52x** (4 threads); 8e6 and full
++  range unchanged. `LOGOS_I32_FIXED_CAP=1` restores the old rule.
++- **(b, mechanism) persistent count tables**: traced at span 1e6, the 53 MB of per-thread
++  tables cost 8-28 ms just to FREE, and 8 threads beat 14 by 1.3x for footprint reasons alone.
++  The tables now live in a static pool (grown, never freed, bounded by the budget), each
++  thread zeroing its own. **1.14-1.38x** across the band (section F); the free step is gone
++  from the trace. A 256 MB budget would buy another 1.32x at span 4e6 and 1.17x at 8e6, at
++  224-256 MB persistent; 64 MB stays the default. `-DLOGOS_NO_CNTI_POOL` / `LOGOS_I32_NO_TABLE_POOL=1`.
++- **(c) `LEAF_I32_COUNT_DIV` 1 -> 4**: found in the baseline: at 1T the "n = 8e6" row (span =
++  n, counting) was slower than the "1e8" row (radix). Swept DIV 1/2/4/8 paired: counting still
++  wins at span 2e6 (radix 0.83x), loses at 4e6 (1.27-1.36x) and at span n (**2.0x**); the
++  crossover sits between n/4 and n/2 (the table stops being cache resident), so the gate is
++  span <= n/4. Parallel leaves (buckets of n/168) measure neutral under it (0.99-1.03).
++- Harness int32 coverage 180 -> 306 checks (954 total): span n/2 (the budget band), a rare
++  far low tail needing its own recursive sort, tails on both sides with a 2^32 span, values on
++  the exact window edges, a 2.5% sentinel that must decline at the sample, and n = 8192 (above
++  the window's minimum, below MIN_PARALLEL).
++- Predictions and grades: (a) predicted <= 1.15x the clean row and a paired 2.0-2.5x over the
++  radix: measured 3.19x (the radix on this loaded box is dearer than the sample suggested).
++  (b) predicted P/1 2.0-3.0 and paired 3-4x: measured 2.68 and 3.20x. (c) predicted the
++  crossover at ~n/4 and ~1.6x at span n: measured between n/4 and n/2, 2.0x.
++
+ ## (unreleased) — the view grows value-space queries and finishes with the engine's own leaf
+ - `logos_view_rank(x)`, `logos_view_count_in_range(lo, hi)` and `logos_view_topk(k)` join
+   `logos_view_at` and `logos_view_range`. Every answer is exact and verified against a
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x i32abbench -x scalebench -x '*.orig' -x '*.rej' pristine/engines/c/Makefile work/engines/c/Makefile
+--- pristine/engines/c/Makefile	2026-09-12 07:43:53.089960373 -0700
++++ work/engines/c/Makefile	2026-09-12 07:50:13.241752041 -0700
+@@ -267,6 +267,12 @@
+ intbench: intbench.c $(LIB).a $(HDR)
+ 	$(CC) $(CFLAGS) $(BENCHFLAGS) intbench.c $(LIB).a -o $@ $(LDLIBS)
+ 
++# int32 paired A/B (experiments/team/i32-sentinel-seq.md): the sequential leaf's windowed counting, the
++# parallel count route's table budget and the sequential counting gate, each a RUNTIME toggle so one
++# binary measures both sides with no code-layout bias. Run: make i32abbench && ./i32abbench [pairs] [n] [A|B|C]
++i32abbench: i32abbench.c $(LIB).a $(HDR)
++	$(CC) $(CFLAGS) $(BENCHFLAGS) i32abbench.c $(LIB).a -o $@ $(LDLIBS)
++
+ # Per-phase profile -> profile-report.html (treemaps of thread-time by phase and
+ # leaf path, per-thread busy/stalled/idle bars, streaming rate vs memcpy). The
+ # engine is rebuilt with -DLOGOS_PROFILE into its own object; the normal library
+@@ -355,4 +361,4 @@
+ 	rm -rf logos-sort-c-$(VERSION)
+ 
+ clean:
+-	rm -f $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o logos-sort-c-*.tar.gz
++	rm -f $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o intbench i32abbench scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o logos-sort-c-*.tar.gz
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x i32abbench -x scalebench -x '*.orig' -x '*.rej' pristine/engines/c/harness.c work/engines/c/harness.c
+--- pristine/engines/c/harness.c	2026-09-12 07:43:53.453956919 -0700
++++ work/engines/c/harness.c	2026-09-12 08:08:54.488704206 -0700
+@@ -130,12 +130,16 @@
+ 
+     printf("== correctness: logos vs qsort (int32) ==\n");
+     int ichecks = 0, ifails = 0;
+-    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
++    const size_t isz[] = { 0, 1, 1000, 8192, 200000, 1000000 };
+     /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
+-       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
++       span-2 ends, the old fixed table cap and one past it, all-negative and zero-straddling data, the
+        INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
+-       narrow bulk. See FINDINGS 3w. */
+-    for (int mode = 0; mode < 12; mode++) {
++       narrow bulk. See FINDINGS 3w. Modes 12..16 (experiments/team/i32-sentinel-seq.md): the table-budget
++       band above the old cap (span n/2), and the sequential leaf's windowed counting at 1 thread: a rare
++       multi-valued low tail that needs its own recursive sort, tails on BOTH sides whose span overflows
++       32-bit arithmetic, values on the exact window edges, and a tail too frequent for the trim (declines
++       at the sample). n = 8192 sits just above LEAF_I32_WINDOW_MIN_N and below MIN_PARALLEL. */
++    for (int mode = 0; mode < 17; mode++) {
+         for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
+             size_t n = isz[si];
+             int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
+@@ -154,10 +158,16 @@
+                 case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
+                 case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
+                 case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
+-                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
++                case 11: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
++                case 12: orig[i] = (int32_t)(r % (n / 2 + 1));  break;   /* span n/2: past the old cap, inside the budget */
++                case 13: orig[i] = (i % 1024 == 7) ? INT32_MIN + (int32_t)(r % 1000000) : (int32_t)(r % 100); break; /* 0.1% low tail, 1e6 wide, far away */
++                case 14: orig[i] = (i % 1024 == 7) ? INT32_MIN + (int32_t)(r % 1000) : (i % 1024 == 500) ? INT32_MAX - (int32_t)(r % 1000) : (int32_t)(r % 100); break; /* both tails, span 2^32 */
++                case 15: orig[i] = (i % 4096 == 1) ? -1 : (i % 4096 == 2) ? 100 : (int32_t)(r % 100); break; /* window edges: -1 and 100 next to a 0..99 bulk */
++                default: orig[i] = (i % 40 == 3) ? INT32_MIN : (int32_t)(r % 100); break;   /* 2.5% sentinel: the sample sees it, declines */
+                 }
+             }
+             if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
++            if (mode == 15 && n > 3) { orig[n / 2] = INT32_MIN; }
+             memcpy(ref, orig, n * sizeof(int32_t));
+             qsort(ref, n, sizeof(int32_t), cmp_i);
+             for (int t = 1; t <= 16; t *= 4) {
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x i32abbench -x scalebench -x '*.orig' -x '*.rej' pristine/engines/c/i32abbench.c work/engines/c/i32abbench.c
+--- pristine/engines/c/i32abbench.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/i32abbench.c	2026-09-12 07:50:13.249752075 -0700
+@@ -0,0 +1,253 @@
++/* i32abbench.c — paired A/B for the int32 changes in experiments/team/i32-sentinel-seq.md.
++ *
++ * Every variant here is a RUNTIME toggle read uncached from the environment, so ONE binary (one code
++ * layout) measures both sides of each pair: no copy-swap is needed and the ~1.24x layout bias of
++ * separately compiled copies (methodology rule 3) does not exist. Drift cancels inside a pair
++ * (bench_paired's design, ported to int32 below). Ratio > 1.000 means the NEW behaviour is faster.
++ *
++ *   section A  sequential leaf, windowed counting     LOGOS_I32_NO_LEAF_WINDOW=1  vs  unset
++ *   section B  parallel count route, table budget     LOGOS_I32_FIXED_CAP=1       vs  unset (64 MB)
++ *              plus intbench-style adjacent 1T vs PT min-of-reps, which is the P/1 the target names
++ *   section C  sequential counting gate divisor       LOGOS_I32_COUNT_DIV=1       vs  2, 4, 8
++ *   section D  table budget sweep, P threads           LOGOS_I32_TABLE_MB=64       vs  32, 128, 256
++ *   section F  persistent count tables, P threads      LOGOS_I32_NO_TABLE_POOL=1   vs  unset
++ *   section G  the target's own metric: sentinel row / clean row, the two DATA sets sorted adjacently by
++ *              the same engine (no toggle), 1 thread, window on and then window off
++ *   section E  the gate divisor's one PARALLEL side-effect: partition leaves of ~n/168 elements count
++ *              under DIV 1 and radix under DIV 4 when the span is in (n/4, n], i.e. spans that decline
++ *              the count route (6e6, 8e6 at 64 MB)                LOGOS_I32_COUNT_DIV=1 vs 4, P threads
++ *
++ * Usage: ./i32abbench [pairs] [n] [section: A|B|C|all]        LOGOS_THREADS=N overrides P. */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++static uint64_t RS = 12345;
++static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
++
++typedef void (*isort_fn)(int32_t *, size_t, int);
++/* the two sides of a pair: environment set for the call, cleared after (all workers are joined by then) */
++static const char *g_var_a = NULL, *g_val_a = NULL, *g_var_b = NULL, *g_val_b = NULL;
++static void side_a(int32_t *a, size_t n, int t) { if (g_var_a) setenv(g_var_a, g_val_a, 1); logos_sort_i32(a, n, t); if (g_var_a) unsetenv(g_var_a); }
++static void side_b(int32_t *a, size_t n, int t) { if (g_var_b) setenv(g_var_b, g_val_b, 1); logos_sort_i32(a, n, t); if (g_var_b) unsetenv(g_var_b); }
++
++/* bench_paired from bench_common.h, for int32: median of tA/tB over adjacent pairs, alternating order */
++static double paired_i32(isort_fn A, isort_fn B, const int32_t *base, int32_t *work, size_t n, int threads, int reps, double *p10, double *p90) {
++    double *r = malloc((size_t)reps * sizeof(double)); if (!r) return 0.0;
++    for (int i = 0; i < reps; i++) {
++        double ta, tb, s;
++        if (i & 1) { memcpy(work, base, n * 4); s = bench_now_(); B(work, n, threads); tb = bench_now_() - s;
++                     memcpy(work, base, n * 4); s = bench_now_(); A(work, n, threads); ta = bench_now_() - s; }
++        else       { memcpy(work, base, n * 4); s = bench_now_(); A(work, n, threads); ta = bench_now_() - s;
++                     memcpy(work, base, n * 4); s = bench_now_(); B(work, n, threads); tb = bench_now_() - s; }
++        r[i] = tb > 0 ? ta / tb : 1.0;
++    }
++    qsort(r, (size_t)reps, sizeof(double), bench_cmp_d_);
++    double med = (reps & 1) ? r[reps / 2] : 0.5 * (r[reps / 2 - 1] + r[reps / 2]);
++    if (p10) *p10 = r[(int)(0.10 * reps)]; if (p90) *p90 = r[(int)(0.90 * reps)];
++    free(r); return med;
++}
++/* two different inputs, one engine: median of t(base1)/t(base2) over adjacent pairs, alternating order */
++static double paired_data(isort_fn f, const int32_t *b1, const int32_t *b2, int32_t *work, size_t n, int threads, int reps, double *p10, double *p90) {
++    double *r = malloc((size_t)reps * sizeof(double)); if (!r) return 0.0;
++    for (int i = 0; i < reps; i++) {
++        double t1, t2, s;
++        if (i & 1) { memcpy(work, b2, n * 4); s = bench_now_(); f(work, n, threads); t2 = bench_now_() - s;
++                     memcpy(work, b1, n * 4); s = bench_now_(); f(work, n, threads); t1 = bench_now_() - s; }
++        else       { memcpy(work, b1, n * 4); s = bench_now_(); f(work, n, threads); t1 = bench_now_() - s;
++                     memcpy(work, b2, n * 4); s = bench_now_(); f(work, n, threads); t2 = bench_now_() - s; }
++        r[i] = t2 > 0 ? t1 / t2 : 1.0;
++    }
++    qsort(r, (size_t)reps, sizeof(double), bench_cmp_d_);
++    double med = (reps & 1) ? r[reps / 2] : 0.5 * (r[reps / 2 - 1] + r[reps / 2]);
++    if (p10) *p10 = r[(int)(0.10 * reps)]; if (p90) *p90 = r[(int)(0.90 * reps)];
++    free(r); return med;
++}
++/* rule 1: both sides against qsort before anything is timed */
++static int verify_both(const int32_t *base, int32_t *work, int32_t *ref, size_t n, int t) {
++    int ok = 1;
++    memcpy(work, base, n * 4); side_a(work, n, t); ok &= memcmp(work, ref, n * 4) == 0;
++    memcpy(work, base, n * 4); side_b(work, n, t); ok &= memcmp(work, ref, n * 4) == 0;
++    return ok;
++}
++static double min_of(isort_fn f, const int32_t *base, int32_t *work, size_t n, int t, int reps) {
++    double best = 1e30;
++    for (int r = 0; r < reps; r++) { memcpy(work, base, n * 4); double s = bench_now_(); f(work, n, t); double d = bench_now_() - s; if (d < best) best = d; }
++    return best;
++}
++
++typedef void (*gen_fn)(int32_t *, size_t);
++static void s_clean(int32_t *a, size_t n)    { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 100); }
++static void s_one_min(int32_t *a, size_t n)  { s_clean(a, n); a[n / 2] = INT32_MIN; }
++static void s_both(int32_t *a, size_t n)     { s_clean(a, n); a[n / 3] = INT32_MIN; a[2 * n / 3] = INT32_MAX; }
++static void s_one_neg1(int32_t *a, size_t n) { s_clean(a, n); a[n / 2] = -1; }
++static void s_many_min(int32_t *a, size_t n) { s_clean(a, n); for (size_t i = 0; i < n; i += 20) a[i] = INT32_MIN; }
++static void s_tail01(int32_t *a, size_t n)   { s_clean(a, n); for (size_t i = 7; i < n; i += 1024) a[i] = INT32_MIN + (int32_t)(nr() % 1000000); }  /* 0.1% wide FAR tail: trimmed window + recursive tail sort (a near tail of span 1e6 fits the plain gate at 8M and never reaches the window) */
++static void s_full(int32_t *a, size_t n)     { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(uint32_t)nr(); }
++static void s_1e8(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 100000000); }
++static void s_1e5(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 100000); }
++static void s_5e5(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 500000); }
++static void s_1e6(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 1000000); }
++static void s_2e6(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 2000000); }
++static void s_4e6(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 4000000); }
++static void s_8e6(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 8000000); }
++static void s_6e6(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 6000000); }
++static void s_16e6(int32_t *a, size_t n)     { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 16000000); }
++static void s_n2(int32_t *a, size_t n)       { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % (n / 2 + 1)); }
++static void s_n(int32_t *a, size_t n)        { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % (n + 1)); }
++
++typedef struct { const char *name; gen_fn g; const char *note; } shape_t;
++static const shape_t SA[] = {
++    { "bulk 0..99",             s_clean,    "guard: plain counting, window never consulted" },
++    { "bulk + one INT32_MIN",   s_one_min,  "THE target: one far sentinel" },
++    { "bulk + both extremes",   s_both,     "span 2^32, tails on both sides" },
++    { "bulk + one -1",          s_one_neg1, "guard: span 101, plain counting" },
++    { "bulk + 0.1% wide tail",  s_tail01,   "trimmed window, tail sorted recursively" },
++    { "bulk + 5% INT32_MIN",    s_many_min, "guard: declines at the sample" },
++    { "span 1e8",               s_1e8,      "guard: pays the sample, then radix" },
++    { "full 2^32",              s_full,     "guard: pays the sample, then radix" },
++};
++static const shape_t SB[] = {
++    { "span 1e5",               s_1e5,      "guard: under the old cap, same tables" },
++    { "span 5e5",               s_5e5,      "band: 14 threads x 2 MB" },
++    { "span 1e6",               s_1e6,      "THE target: 14 threads x 4 MB" },
++    { "span 2e6",               s_2e6,      "band: 8 threads x 8 MB" },
++    { "span 4e6",               s_4e6,      "band: 4 threads x 16 MB" },
++    { "span 8e6",               s_8e6,      "declines (2 threads): partition, as before" },
++    { "full 2^32",              s_full,     "guard: declines at the sample" },
++};
++static const shape_t SC[] = {
++    { "span 1e6",  s_1e6, "counts under every DIV <= 8" },
++    { "span 2e6",  s_2e6, "" }, { "span 4e6", s_4e6, "" }, { "span n/2", s_n2, "" }, { "span n", s_n, "the inherited gate's top edge" },
++};
++#define NA ((int)(sizeof SA / sizeof SA[0]))
++#define NB ((int)(sizeof SB / sizeof SB[0]))
++#define NC ((int)(sizeof SC / sizeof SC[0]))
++
++int main(int argc, char **argv) {
++    int pairs = argc > 1 ? atoi(argv[1]) : 20; if (pairs < 4) pairs = 4;
++    size_t n = argc > 2 ? (size_t)atol(argv[2]) : 8000000;
++    const char *sec = argc > 3 ? argv[3] : "all";
++    int P = bench_threads(logos_num_cpus());
++    int32_t *base = malloc(n * 4), *work = malloc(n * 4), *ref = malloc(n * 4);
++    if (!base || !work || !ref) return 1;
++    double p10, p90;
++    printf("i32abbench: n=%zu, %d pairs, P=%d. One binary, runtime toggles: no layout bias. ratio > 1 = NEW faster.\n\n", n, pairs, P);
++
++    if (!strcmp(sec, "all") || !strcmp(sec, "A")) {
++        g_var_a = "LOGOS_I32_NO_LEAF_WINDOW"; g_val_a = "1"; g_var_b = NULL;
++        printf("== A: sequential leaf, windowed counting (old = window off), 1 thread ==\n");
++        printf("  %-26s %8s %8s %8s  %s\n", "shape", "old/new", "p10", "p90", "note");
++        for (int s = 0; s < NA; s++) {
++            RS = 12345; SA[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            int ok = verify_both(base, work, ref, n, 1);
++            double med = paired_i32(side_a, side_b, base, work, n, 1, pairs, &p10, &p90);
++            printf("  %-26s %8.3f %8.3f %8.3f  %s%s\n", SA[s].name, med, p10, p90, SA[s].note, ok ? "" : "   VERIFY FAILED");
++            printf("ROW\tA\t%s\t1\t%.4f\t%.4f\t%.4f\t%d\n", SA[s].name, med, p10, p90, ok); fflush(stdout);
++        }
++        printf("\n");
++    }
++    if (!strcmp(sec, "all") || !strcmp(sec, "B")) {
++        g_var_a = "LOGOS_I32_FIXED_CAP"; g_val_a = "1"; g_var_b = NULL;
++        printf("== B: parallel count route, table budget (old = fixed 262144-slot cap), %d threads ==\n", P);
++        printf("  %-14s %8s %8s %8s | %9s %9s %9s %6s  %s\n", "shape", "old/new", "p10", "p90", "1T min", "PT old", "PT new", "P/1new", "note");
++        for (int s = 0; s < NB; s++) {
++            RS = 12345; SB[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            int ok = verify_both(base, work, ref, n, P);
++            double med = paired_i32(side_a, side_b, base, work, n, P, pairs, &p10, &p90);
++            /* intbench-style: 1T and PT adjacent, min of reps, so the P/1 column is the one the target names */
++            int reps = pairs / 2 < 3 ? 3 : pairs / 2; double t1 = 1e30, to = 1e30, tn = 1e30;
++            for (int r = 0; r < reps; r++) {
++                double d;
++                d = min_of(side_b, base, work, n, 1, 1); if (d < t1) t1 = d;
++                d = min_of(side_a, base, work, n, P, 1); if (d < to) to = d;
++                d = min_of(side_b, base, work, n, P, 1); if (d < tn) tn = d;
++            }
++            printf("  %-14s %8.3f %8.3f %8.3f | %8.1fms %8.1fms %8.1fms %6.2f  %s%s\n", SB[s].name, med, p10, p90, t1, to, tn, t1 / tn, SB[s].note, ok ? "" : "   VERIFY FAILED");
++            printf("ROW\tB\t%s\t%d\t%.4f\t%.4f\t%.4f\t%d\t%.2f\t%.2f\t%.2f\n", SB[s].name, P, med, p10, p90, ok, t1, to, tn); fflush(stdout);
++        }
++        printf("\n");
++    }
++    if (!strcmp(sec, "all") || !strcmp(sec, "C")) {
++        static const char *DIVS[] = { "2", "4", "8" };
++        printf("== C: sequential counting gate span <= n/DIV (old = DIV 1), 1 thread ==\n");
++        printf("  %-12s %6s %8s %8s %8s  %s\n", "shape", "DIV", "old/new", "p10", "p90", "note");
++        for (int s = 0; s < NC; s++) {
++            RS = 12345; SC[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            for (int d = 0; d < 3; d++) {
++                g_var_a = "LOGOS_I32_COUNT_DIV"; g_val_a = "1"; g_var_b = "LOGOS_I32_COUNT_DIV"; g_val_b = DIVS[d];
++                int ok = verify_both(base, work, ref, n, 1);
++                double med = paired_i32(side_a, side_b, base, work, n, 1, pairs, &p10, &p90);
++                printf("  %-12s %6s %8.3f %8.3f %8.3f  %s%s\n", SC[s].name, DIVS[d], med, p10, p90, SC[s].note, ok ? "" : "   VERIFY FAILED");
++                printf("ROW\tC\t%s\t%s\t%.4f\t%.4f\t%.4f\t%d\n", SC[s].name, DIVS[d], med, p10, p90, ok); fflush(stdout);
++            }
++        }
++    }
++    if (!strcmp(sec, "all") || !strcmp(sec, "D")) {
++        static const char *MBS[] = { "32", "128", "256" };
++        static const shape_t SD[] = { { "span 1e6", s_1e6, "" }, { "span 2e6", s_2e6, "" }, { "span 4e6", s_4e6, "" }, { "span 8e6", s_8e6, "declines at 64 MB" } };
++        printf("== D: table budget sweep (old = 64 MB, the default), %d threads ==\n", P);
++        printf("  %-12s %6s %8s %8s %8s  %s\n", "shape", "MB", "64/new", "p10", "p90", "note");
++        for (int s = 0; s < 4; s++) {
++            RS = 12345; SD[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            for (int d = 0; d < 3; d++) {
++                g_var_a = "LOGOS_I32_TABLE_MB"; g_val_a = "64"; g_var_b = "LOGOS_I32_TABLE_MB"; g_val_b = MBS[d];
++                int ok = verify_both(base, work, ref, n, P);
++                double med = paired_i32(side_a, side_b, base, work, n, P, pairs, &p10, &p90);
++                printf("  %-12s %6s %8.3f %8.3f %8.3f  %s%s\n", SD[s].name, MBS[d], med, p10, p90, SD[s].note, ok ? "" : "   VERIFY FAILED");
++                printf("ROW\tD\t%s\t%s\t%.4f\t%.4f\t%.4f\t%d\n", SD[s].name, MBS[d], med, p10, p90, ok); fflush(stdout);
++            }
++        }
++    }
++    if (!strcmp(sec, "all") || !strcmp(sec, "E")) {
++        static const shape_t SE[] = { { "span 6e6", s_6e6, "leaves ~36k wide: count at DIV 1, radix at DIV 4" }, { "span 8e6", s_8e6, "leaves ~48k wide: same" }, { "span 1.6e7", s_16e6, "guard: leaves ~95k wide, radix under both" } };
++        printf("== E: gate divisor in the PARALLEL leaves (old = DIV 1, new = DIV 4), %d threads ==\n", P);
++        printf("  %-12s %8s %8s %8s  %s\n", "shape", "old/new", "p10", "p90", "note");
++        for (int s = 0; s < 3; s++) {
++            RS = 12345; SE[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            g_var_a = "LOGOS_I32_COUNT_DIV"; g_val_a = "1"; g_var_b = "LOGOS_I32_COUNT_DIV"; g_val_b = "4";
++            int ok = verify_both(base, work, ref, n, P);
++            double med = paired_i32(side_a, side_b, base, work, n, P, pairs, &p10, &p90);
++            printf("  %-12s %8.3f %8.3f %8.3f  %s%s\n", SE[s].name, med, p10, p90, SE[s].note, ok ? "" : "   VERIFY FAILED");
++            printf("ROW\tE\t%s\t%d\t%.4f\t%.4f\t%.4f\t%d\n", SE[s].name, P, med, p10, p90, ok); fflush(stdout);
++        }
++    }
++    if (!strcmp(sec, "all") || !strcmp(sec, "F")) {
++        static const shape_t SF[] = { { "span 1e5", s_1e5, "14 x 0.4 MB" }, { "span 1e6", s_1e6, "14 x 4 MB" }, { "span 2e6", s_2e6, "8 x 8 MB" }, { "span 4e6", s_4e6, "4 x 16 MB" } };
++        printf("== F: persistent count tables (old = calloc/free per call), %d threads ==\n", P);
++        printf("  %-12s %8s %8s %8s  %s\n", "shape", "old/new", "p10", "p90", "note");
++        for (int s = 0; s < 4; s++) {
++            RS = 12345; SF[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            g_var_a = "LOGOS_I32_NO_TABLE_POOL"; g_val_a = "1"; g_var_b = NULL;
++            int ok = verify_both(base, work, ref, n, P);
++            double med = paired_i32(side_a, side_b, base, work, n, P, pairs, &p10, &p90);
++            printf("  %-12s %8.3f %8.3f %8.3f  %s%s\n", SF[s].name, med, p10, p90, SF[s].note, ok ? "" : "   VERIFY FAILED");
++            printf("ROW\tF\t%s\t%d\t%.4f\t%.4f\t%.4f\t%d\n", SF[s].name, P, med, p10, p90, ok); fflush(stdout);
++        }
++    }
++    if (!strcmp(sec, "all") || !strcmp(sec, "G")) {
++        static const shape_t SG[] = { { "bulk + one INT32_MIN", s_one_min, "" }, { "bulk + both extremes", s_both, "" }, { "bulk + 0.1% wide tail", s_tail01, "" }, { "bulk + one -1", s_one_neg1, "control: plain counting both" } };
++        int32_t *clean = malloc(n * 4); if (!clean) return 1;
++        RS = 12345; s_clean(clean, n);
++        printf("== G: sentinel row / clean row, same engine, adjacent, 1 thread (the target's metric) ==\n");
++        printf("  %-26s %8s %8s %8s | %8s %8s %8s\n", "shape", "win ON", "p10", "p90", "win OFF", "p10", "p90");
++        for (int s = 0; s < 4; s++) {
++            RS = 12345; SG[s].g(base, n); memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++            g_var_a = "LOGOS_I32_NO_LEAF_WINDOW"; g_val_a = "1"; g_var_b = NULL;
++            int ok = verify_both(base, work, ref, n, 1);
++            double q10, q90;
++            double on  = paired_data(side_b, base, clean, work, n, 1, pairs, &p10, &p90);
++            double off = paired_data(side_a, base, clean, work, n, 1, pairs, &q10, &q90);
++            printf("  %-26s %8.3f %8.3f %8.3f | %8.3f %8.3f %8.3f  %s%s\n", SG[s].name, on, p10, p90, off, q10, q90, SG[s].note, ok ? "" : "   VERIFY FAILED");
++            printf("ROW\tG\t%s\t1\t%.4f\t%.4f\t%.4f\t%.4f\t%d\n", SG[s].name, on, p10, p90, off, ok); fflush(stdout);
++        }
++        free(clean);
++    }
++    free(base); free(work); free(ref);
++    return 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x i32abbench -x scalebench -x '*.orig' -x '*.rej' pristine/engines/c/intbench.c work/engines/c/intbench.c
+--- pristine/engines/c/intbench.c	2026-09-12 07:43:53.421957223 -0700
++++ work/engines/c/intbench.c	2026-09-12 08:08:54.500704263 -0700
+@@ -2,9 +2,10 @@
+  *
+  * An int32 array is always a lattice: step exactly 1, base min, no tolerance, no NaN, no two values
+  * sharing a slot. That is a fact of the TYPE, not of the data, so it never has to be probed. Both
+- * paths now use it: the sequential leaf counts when span <= n, and the parallel path reaches
+- * count_try_i32. The 1-thread column still gates on raw min/max, which is why it stays slow on the
+- * sentinel rows of section 2 while the parallel column does not.
++ * paths now use it: the sequential leaf counts when span <= n/4 (was n; the crossover against the
++ * 3-pass radix was measured between n/4 and n/2, experiments/team/i32-sentinel-seq.md), and the parallel
++ * path reaches count_try_i32. Both paths now window their table from the sample when the raw span
++ * overflows it, so a rare far sentinel costs neither column anything.
+  *
+  * Section 1 races 1 thread against P on a span ladder. It is what found the defect: before
+  * count_try_i32 existed the parallel path lost to a SINGLE core for every span under about n/8.
+@@ -116,8 +117,10 @@
+            "  baseline means one outlier pushed the span past the counting gate and the sort\n"
+            "  fell back to a full radix or partition it did not need. The PARALLEL path absorbs\n"
+            "  rare far sentinels: count_try_i32 windows the table from the sample and spills the\n"
+-           "  tail. The 1-thread column still gates on raw min/max in leaf_i32, which is why it\n"
+-           "  stays slow on those rows. See FINDINGS 3w.\n", P);
++           "  tail, and since experiments/team/i32-sentinel-seq.md the 1-thread leaf does the same\n"
++           "  (leaf_i32_windowed), so only the 5%% row should stay slow. The parallel count route\n"
++           "  now fits its thread count to a table budget instead of a fixed span cap, which is why\n"
++           "  the 1e6 row no longer loses to one core. See FINDINGS 3w.\n", P);
+     free(base); free(w);
+     return 0;
+ }
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x i32abbench -x scalebench -x '*.orig' -x '*.rej' pristine/engines/c/logos_psort.c work/engines/c/logos_psort.c
+--- pristine/engines/c/logos_psort.c	2026-09-12 07:43:52.649964566 -0700
++++ work/engines/c/logos_psort.c	2026-09-12 07:50:13.253752094 -0700
+@@ -3666,6 +3666,76 @@
+     for (size_t i = 0; i < n; i++) { uint32_t v = from[i]; a[c3[(v >> 24) & 0xFF]++] = (int32_t)(v ^ 0x80000000u); }
+ #undef RPI
+ }
++/* Sequential counting gate: the leaf counts when span <= n / LEAF_I32_COUNT_DIV. DIV 1 is the inherited
++ * "span <= n". LOGOS_I32_COUNT_DIV in the environment overrides it, uncached, so ONE binary can sweep the
++ * gate with no code-layout bias (make i32abbench, experiments/team/i32-sentinel-seq.md). */
++#ifndef LEAF_I32_COUNT_DIV
++#define LEAF_I32_COUNT_DIV 4            /* was 1 ("span <= n"). Measured at 8M, 1 thread, paired (make i32abbench C):
++                                           counting still beats the 3-pass radix at span 2e6 (radix 0.83x) and loses
++                                           at 4e6 (radix 1.27-1.36x) and at span n (2.0x): the table stops being cache
++                                           resident between n/4 and n/2. n/4 takes every win and no loss; 1e6 rows are
++                                           unchanged, and the parallel leaves (buckets of n/168) measure neutral. */
++#endif
++static inline int64_t leaf_i32_count_max(size_t n) {
++    const char *e = getenv("LOGOS_I32_COUNT_DIV"); long d = e ? atol(e) : LEAF_I32_COUNT_DIV; if (d < 1) d = 1;
++    return (int64_t)(n / (size_t)d);
++}
++/* Windowed counting for the SEQUENTIAL leaf (experiments/team/i32-sentinel-seq.md). One far value pushes
++ * the span past the table -- INT32_MIN among a 0..99 bulk cost ~2.5x at one thread, make intbench -- and
++ * the parallel route already answered that in count_try_i32: take the window from the SAMPLE, count the
++ * window, spill the tail. Same idea here, on one thread, with the tails going into the scratch buffer
++ * (low tail from the front, high tail from the back), sorted by a recursive call and placed before /
++ * after the bulk. Slot order is value order and the tails lie outside the window on both sides, so there
++ * is no merge. Returns 1 if a[] was sorted, 0 if it declined; nothing is written to a[] until every
++ * element has been counted or spilled, so declining costs at most one read pass. The tail budget is
++ * n/32 like the parallel route, and the trim is K = 5 of a 2048-point sample, so a sentinel rarer than
++ * about 0.25% is absorbed and a frequent one declines at the sample before touching the array.
++ * -DLOGOS_NO_I32_LEAF_WINDOW compiles it out; LOGOS_I32_NO_LEAF_WINDOW in the environment turns it off
++ * at run time (uncached, so one binary can A/B both, make i32abbench). */
++#ifndef LEAF_I32_WINDOW_MIN_N
++#define LEAF_I32_WINDOW_MIN_N 4096      /* below this the sample is the array and the radix is cheap anyway */
++#endif
++#ifndef LEAF_I32_SPILL_DIV
++#define LEAF_I32_SPILL_DIV 32           /* tail budget n/32, the same as count_try_i32 */
++#endif
++static inline int leaf_i32_window_off(void) { return getenv("LOGOS_I32_NO_LEAF_WINDOW") != NULL; }
++static void leaf_i32(int32_t *a, size_t n, uint32_t *buf, ctx_t *c);
++static int leaf_i32_windowed(int32_t *a, size_t n, uint32_t *buf, ctx_t *c, int64_t cmax) {
++    size_t m = 2048; if (m > n / 4) m = n / 4;
++    enum { K = 5 };
++    int32_t lo5[K], hi5[K]; int nl = 0, nh = 0;
++    for (size_t i = 0; i < m; i++) {
++        size_t q = SAMPLE_POS(i, m, n); int32_t v = a[q < n ? q : n - 1];
++        if (nl < K) { int j = nl++; while (j > 0 && lo5[j - 1] > v) { lo5[j] = lo5[j - 1]; j--; } lo5[j] = v; }
++        else if (v < lo5[K - 1]) { int j = K - 1; while (j > 0 && lo5[j - 1] > v) { lo5[j] = lo5[j - 1]; j--; } lo5[j] = v; }
++        if (nh < K) { int j = nh++; while (j > 0 && hi5[j - 1] < v) { hi5[j] = hi5[j - 1]; j--; } hi5[j] = v; }
++        else if (v > hi5[K - 1]) { int j = K - 1; while (j > 0 && hi5[j - 1] < v) { hi5[j] = hi5[j - 1]; j--; } hi5[j] = v; }
++    }
++    if (nl == 0) return 0;
++    int32_t sfl = lo5[0], sfh = hi5[0];                                  /* the sample's own range: covers the most */
++    int32_t stl = nl >= K ? lo5[K - 1] : lo5[0], sth = nh >= K ? hi5[K - 1] : hi5[0];   /* trimmed: survives a seen sentinel */
++    int32_t wlo, whi;
++    if ((int64_t)sfh - (int64_t)sfl + 1 <= cmax) { wlo = sfl; whi = sfh; }
++    else if ((int64_t)sth - (int64_t)stl + 1 <= cmax) { wlo = stl; whi = sth; }
++    else return 0;                                                       /* even the trimmed window overflows: not a tail */
++    int64_t span = (int64_t)whi - (int64_t)wlo + 1;
++    uint32_t *C = c->aux; memset(C, 0, (size_t)span * sizeof(uint32_t));
++    size_t nlo = 0, hat = n, nsp = 0, spcap = n / LEAF_I32_SPILL_DIV + 64;
++    for (size_t i = 0; i < n; i++) {
++        int32_t v = a[i];
++        if (v >= wlo && v <= whi) C[(size_t)((int64_t)v - wlo)]++;
++        else { if (++nsp > spcap) return 0; if (v < wlo) buf[nlo++] = (uint32_t)v; else buf[--hat] = (uint32_t)v; }
++    }
++    size_t nhi = n - hat, w = nlo;
++    for (int64_t v = 0; v < span; v++) { uint32_t k = C[v]; int32_t val = (int32_t)(v + wlo); while (k-- > 0) a[w++] = val; }
++    TRACE("i32 leaf: windowed count n=%zu span=%lld window [%d,%d] spill lo=%zu hi=%zu", n, (long long)span, wlo, whi, nlo, nhi);
++    /* both tails out of the scratch before either recursion reuses it (a tail is at most n/32 + 64) */
++    for (size_t i = 0; i < nlo; i++) a[i] = (int32_t)buf[i];
++    for (size_t i = 0; i < nhi; i++) a[hat + i] = (int32_t)buf[hat + i];
++    if (nlo > 1) leaf_i32(a, nlo, buf, c);
++    if (nhi > 1) leaf_i32(a + hat, nhi, buf, c);
++    return 1;
++}
+ static void leaf_i32(int32_t *a, size_t n, uint32_t *buf, ctx_t *c) {   /* buf: n uint32 scratch */
+     if (n < 2) return;
+     int32_t mn = a[0], mx = a[0]; int asc = 1, desc = 1;
+@@ -3673,13 +3743,18 @@
+     if (asc) return;
+     if (desc) { for (size_t l = 0, r = n - 1; l < r; l++, r--) { int32_t t = a[l]; a[l] = a[r]; a[r] = t; } return; }
+     int64_t span = (int64_t)mx - (int64_t)mn + 1;
+-    if (span <= (int64_t)n) {
++    int64_t cmax = leaf_i32_count_max(n);
++    if (span <= cmax) {
+         uint32_t *C = c->aux; memset(C, 0, (size_t)span * sizeof(uint32_t));
+         for (size_t i = 0; i < n; i++) C[(size_t)((int64_t)a[i] - mn)]++;
+         size_t w = 0;
+         for (int64_t v = 0; v < span; v++) { uint32_t k = C[v]; int32_t val = (int32_t)(v + mn); while (k-- > 0) a[w++] = val; }
+         return;
+     }
++#ifndef LOGOS_NO_I32_LEAF_WINDOW
++    /* the raw span overflowed the table; a sample-derived window may still fit (the sentinel case) */
++    if (n >= LEAF_I32_WINDOW_MIN_N && !leaf_i32_window_off() && leaf_i32_windowed(a, n, buf, c, cmax)) return;
++#endif
+     if (g_simd_i32) { g_simd_i32(a, n); return; }               /* SIMD leaf for full-range ints */
+     lsd_radix_i32(a, n, c->aux, buf, c);
+ }
+@@ -3748,9 +3823,35 @@
+  * Measured before this existed (`make intbench`, 8M): the parallel path lost to a SINGLE core for
+  * every span below about n/8, by up to 3x, because it had no counting route to reach. */
+ #ifndef COUNT_I32_MAX_SLOTS
+-#define COUNT_I32_MAX_SLOTS (1 << 18)   /* per-thread table 1 MB, 14 MB at 14 threads. Above this the
+-                                           calloc and its page faults start eating the win, and the
+-                                           partition is already ahead by span ~ n/8. */
++#define COUNT_I32_MAX_SLOTS (1 << 18)   /* the OLD fixed cap: per-thread table 1 MB, 14 MB at 14 threads.
++                                           Kept as the A/B baseline (LOGOS_I32_FIXED_CAP in the environment
++                                           restores it). It left a band, 262144 < span <= ~n/8, where the
++                                           partition LOST to one core (intbench span 1e6, P/1 0.60-0.87). */
++#endif
++/* Table budget (experiments/team/i32-sentinel-seq.md). The per-thread tables cost 4 B x span x threads, so
++ * instead of a fixed span cap the route fits the THREAD COUNT to a memory budget: Pc = min(count_threads,
++ * budget / span), and declines below COUNT_MIN_THREADS threads or above span n. At 8M and 64 MB that is
++ * 14 threads to span 1.2M, 8 at 2M, 4 at 4M, and a decline at 8M where the partition already wins.
++ * LOGOS_I32_TABLE_MB in the environment overrides the budget, uncached, so one binary can sweep it. */
++#ifndef COUNT_I32_TABLE_BUDGET_MB
++#define COUNT_I32_TABLE_BUDGET_MB 64
++#endif
++static inline size_t cnti_budget_slots(void) {
++    const char *e = getenv("LOGOS_I32_TABLE_MB"); long mb = e ? atol(e) : COUNT_I32_TABLE_BUDGET_MB; if (mb < 1) mb = 1;
++    return (size_t)mb << 18;                                      /* MB -> 4-byte slots */
++}
++static inline int cnti_fixed_cap(void) { return getenv("LOGOS_I32_FIXED_CAP") != NULL; }
++/* Persistent count tables (experiments/team/i32-sentinel-seq.md). Traced at span 1e6, 14 threads, 8M: the
++ * 53 MB of per-thread tables cost 8-28 ms just to FREE (page teardown) on top of the faults taken inside the
++ * count pass, and a 32 MB budget (8 threads) beat the 64 MB one (14 threads) by 1.3x for that reason alone.
++ * So the tables live in a static pool, grown when a call needs more and never freed, each thread zeroing its
++ * own table before it counts (a parallel memset, ~0.3 ms for 4 MB); the same one-sort-at-a-time contract as
++ * the ctx bundles. Footprint is bounded by the budget. -DLOGOS_NO_CNTI_POOL restores calloc/free per call;
++ * LOGOS_I32_NO_TABLE_POOL in the environment does the same at run time (uncached, for the A/B). */
++#ifndef LOGOS_NO_CNTI_POOL
++#define CNTI_POOL_MAX 64
++static uint32_t *g_cnti_tab[CNTI_POOL_MAX]; static size_t g_cnti_cap[CNTI_POOL_MAX];
++static inline int cnti_pool_off(void) { return getenv("LOGOS_I32_NO_TABLE_POOL") != NULL; }
+ #endif
+ typedef struct {
+     int32_t *a; size_t n; int P;
+@@ -3761,6 +3862,7 @@
+     /* windowed mode: the table covers [wlo, whi] and everything else spills (see cnti_window) */
+     int32_t wlo, whi; int32_t **spill; size_t *spn, spcap;
+     int32_t *sbuf, *sbuf2; size_t n_below, n_spill; atomic_int fail;
++    int pooled;                                                   /* tables come from the persistent pool: zero them here */
+ } cnti_t;
+ typedef struct { cnti_t *c; int t; int32_t lo, hi; } cnti_arg_t;
+ 
+@@ -3775,6 +3877,7 @@
+ static void *cnti_body(void *p) {
+     cnti_arg_t *w = p; cnti_t *c = w->c; int t = w->t, P = c->P;
+     uint32_t *T = c->tab[t]; size_t ch, sn = 0;
++    if (c->pooled) memset(T, 0, (size_t)c->span * sizeof(uint32_t));   /* own table only; others are read after the barrier */
+     int32_t *sp = c->spill ? c->spill[t] : NULL;
+     const int32_t wlo = c->wlo, whi = c->whi;
+     while ((ch = atomic_fetch_add(&c->next, 1)) < c->nchunk) {
+@@ -3838,6 +3941,15 @@
+      * a full parallel min/max pass only to be turned away -- the J5 mistake, see the ledger. */
+     int windowed = 0; int32_t wlo = 0, whi = 0;
+     int32_t sfull_lo = 0, sfull_hi = 0, strim_lo = 0, strim_hi = 0;
++    int Pc0 = count_threads(n, P); if (Pc0 < 1) Pc0 = 1;         /* merging P tables costs O(span*P) */
++    int64_t max_slots; size_t budget_slots = 0;
++    if (cnti_fixed_cap()) max_slots = COUNT_I32_MAX_SLOTS;
++    else {
++        budget_slots = cnti_budget_slots();
++        int floor_t = Pc0 < COUNT_MIN_THREADS ? Pc0 : COUNT_MIN_THREADS;
++        max_slots = (int64_t)(budget_slots / (size_t)floor_t);    /* the widest span that still gets floor_t threads */
++        if (max_slots > (int64_t)n) max_slots = (int64_t)n;       /* the leaf's rule: a table wider than n is sparse */
++    }
+     {   size_t m = 2048; if (m > n) m = n;
+         /* Track the K smallest and K largest of the sample, which gives both the plain min/max gate
+          * and a TRIMMED window in one pass. The trimmed window is what survives a sentinel: a value
+@@ -3857,7 +3969,7 @@
+         strim_hi = nh >= K ? hi5[K - 1] : hi5[0];
+         /* The trimmed window is the narrowest candidate, so if even that overflows the table nothing
+          * will fit and we decline here, before spawning anything (the J5 lesson). */
+-        if ((int64_t)strim_hi - (int64_t)strim_lo + 1 > COUNT_I32_MAX_SLOTS) return 0;
++        if ((int64_t)strim_hi - (int64_t)strim_lo + 1 > max_slots) return 0;
+     }
+     cnti_t c; memset(&c, 0, sizeof c);
+     atomic_init(&c.fail, 0);
+@@ -3866,23 +3978,26 @@
+     pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
+     if (!wa || !th) { free(wa); free(th); return 0; }
+     for (int t = 0; t < P; t++) { wa[t].c = &c; wa[t].t = t; }
++    TRACE("i32: count route pre-gate passed, max_slots %lld", (long long)max_slots);
+     for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, cnti_minmax, &wa[t]);
+     cnti_minmax(&wa[0]);
+     for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
++    TRACE("i32: parallel min/max done");
+     int32_t mn = INT32_MAX, mx = INT32_MIN;
+     for (int t = 0; t < P; t++) { if (wa[t].lo < mn) mn = wa[t].lo; if (wa[t].hi > mx) mx = wa[t].hi; }
+     int64_t span = (int64_t)mx - (int64_t)mn + 1;                 /* 64-bit on purpose: see the header */
+-    if (span > COUNT_I32_MAX_SLOTS) {
++    if (span > max_slots) {
+         /* The true range does not fit but a sample-derived window might, which is the sentinel case:
+          * the tail is too far away to count and too rare for the sample to have seen. Prefer the
+          * sample's own min/max, which covers the most; fall back to the trimmed window when the
+          * sample did see the sentinel. Either way the tail spills and is sorted as its own run. */
+-        if ((int64_t)sfull_hi - (int64_t)sfull_lo + 1 <= COUNT_I32_MAX_SLOTS) { wlo = sfull_lo; whi = sfull_hi; }
++        if ((int64_t)sfull_hi - (int64_t)sfull_lo + 1 <= max_slots) { wlo = sfull_lo; whi = sfull_hi; }
+         else { wlo = strim_lo; whi = strim_hi; }
+         windowed = 1; mn = wlo; span = (int64_t)whi - (int64_t)wlo + 1;
+     }
+-    if (span < 2 || span > COUNT_I32_MAX_SLOTS) { free(wa); free(th); return 0; }
+-    int Pc = count_threads(n, P);                                 /* merging P tables costs O(span*P) */
++    if (span < 2 || span > max_slots) { free(wa); free(th); return 0; }
++    int Pc = Pc0;
++    if (budget_slots) { size_t pm = budget_slots / (size_t)span; if (pm < (size_t)Pc) Pc = (int)pm; }   /* fit the threads to the budget */
+     if (Pc < 1) Pc = 1;
+     int ok = 1;
+     c.P = Pc; c.mn = mn; c.span = span; c.wlo = wlo; c.whi = whi;
+@@ -3897,7 +4012,17 @@
+         if (!c.spill || !c.spn || !c.sbuf || !c.sbuf2) ok = 0;
+         for (int t = 0; ok && t < Pc; t++) { c.spill[t] = malloc(c.spcap * sizeof(int32_t)); if (!c.spill[t]) ok = 0; }
+     }
++#ifndef LOGOS_NO_CNTI_POOL
++    if (ok && Pc <= CNTI_POOL_MAX && !cnti_pool_off()) {
++        c.pooled = 1;
++        for (int t = 0; ok && t < Pc; t++) {
++            if (g_cnti_cap[t] < (size_t)span) { free(g_cnti_tab[t]); g_cnti_tab[t] = malloc((size_t)span * sizeof(uint32_t)); g_cnti_cap[t] = g_cnti_tab[t] ? (size_t)span : 0; }
++            c.tab[t] = g_cnti_tab[t]; if (!c.tab[t]) ok = 0;
++        }
++    } else
++#endif
+     for (int t = 0; ok && t < Pc; t++) { c.tab[t] = calloc((size_t)span, sizeof(uint32_t)); if (!c.tab[t]) ok = 0; }
++    TRACE("i32: %d tables of %lld slots allocated (%.1f MB)", Pc, (long long)span, (double)Pc * (double)span * 4.0 / 1048576.0);
+     if (ok) {
+         c.csize = (n + (size_t)Pc * 4 - 1) / ((size_t)Pc * 4); if (c.csize < 4096) c.csize = 4096;
+         c.nchunk = (n + c.csize - 1) / c.csize;
+@@ -3910,6 +4035,9 @@
+         TRACE("i32: counting route, span %lld, %d threads, %s, spill %zu", (long long)span, Pc,
+               windowed ? "windowed" : "full range", c.n_spill);
+     }
++    if (!c.pooled) { for (int t = 0; c.tab && t < Pc; t++) free(c.tab[t]); }
++    if (c.tab) for (int t = 0; t < Pc; t++) c.tab[t] = NULL;
++    TRACE("i32: tables %s", c.pooled ? "returned to the pool" : "freed");
+     for (int t = 0; c.tab && t < Pc; t++) free(c.tab[t]);
+     for (int t = 0; c.spill && t < Pc; t++) free(c.spill[t]);
+     free(c.spill); free(c.spn); free(c.sbuf); free(c.sbuf2);
+@@ -3922,6 +4050,7 @@
+     if (n < 2) return;
+     if ((size_t)P > n) P = (int)n;
+     P = effective_threads(n, P);
++    TRACE_START();
+     if (P == 1 || n < MIN_PARALLEL) {
+         uint32_t *buf = malloc(n * sizeof(uint32_t)); ctx_t c;
+         if (!buf || !ctx_init(&c, n, 0)) { free(buf); ctx_free(&c); qsort(a, n, sizeof(int32_t), cmp_i32); return; }

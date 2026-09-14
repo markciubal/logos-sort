@@ -1,0 +1,233 @@
+######## 2026-09-13: 'heavy_tail is benchmarking very slow' (scale report 02:01: 14T 10M logos 104.4 ms vs uniform 19.9, best opponent 64.5) ########
+
+=== 1. htprobe: runtime toggles (none moves heavy_tail) and the 1M / 10M route trace ===
+=== route, 1M (trace build: which decisions fire) ===
+=== heavy_tail n=1000000 T=1
+  [0.00] psort_f64 n=1000000 P=1
+  [0.11] prescan done
+  [1.78] sodo: m=384 distinct=384 chao1=73920 inv=0.000 ks=1.0000 nan=0
+  [2.00] seq: buffers ready (pooled=1)
+  [3.40] gate [0..1000000) R=2 seen=5 chains=1 merged=5
+  [3.48] reloc: detect_runs_parallel -> bail, R=0
+  [3.48] seq: relocation declined
+  [31.16] seq: leaf done (result in a)
+  [31.25] seq: copyback done
+=== heavy_tail n=1000000 T=14
+  [0.00] psort_f64 n=1000000 P=10
+  [0.01] prescan done
+  [0.35] sodo: m=2048 distinct=2048 chao1=2098176 inv=0.429 ks=1.0000 nan=0
+  [0.43] par: nearsorted declined
+  [0.46] gate [0..100000) R=2 seen=5 chains=1 merged=5
+  [0.46] reloc: detect_runs_parallel -> bail, R=0
+  [0.47] par: relocation declined
+  [1.42] par: KS distance 0.9164 (limit 0.0323) -> not uniform
+  [1.50] par: KS distance in key space 0.5888 -> not log-uniform
+  [1.53] par: exponent map over 10 binades, largest single value 0.03% of the sample
+  [1.56] par: mode 0 is not uniform inside (KS 0.551)
+  [5.29] hf: trial mode 2 style 1, cap 13590 per bucket
+  [10.52] par: histfree scatter done
+  [10.62] par: leaf sizes max 8064 mean 8333 -> imbalance 0.97x
+  [11.27] par: histfree spills 928 (ok)
+  [14.92] par: histfree done
+=== route, 10M ===
+=== heavy_tail n=10000000 T=14
+  [0.00] psort_f64 n=10000000 P=14
+  [0.02] prescan done
+  [0.54] sodo: m=2048 distinct=2048 chao1=2098176 inv=0.571 ks=1.0000 nan=0
+  [0.68] par: nearsorted declined
+  [0.75] gate [0..714286) R=2 seen=5 chains=1 merged=5
+  [0.76] reloc: detect_runs_parallel -> bail, R=0
+  [0.76] par: relocation declined
+  [2.44] par: KS distance 0.9718 (limit 0.0273) -> not uniform
+  [2.57] par: KS distance in key space 0.6676 -> not log-uniform
+  [2.60] par: exponent map over 12 binades, largest single value 0.02% of the sample
+  [2.66] par: mode 0 is not uniform inside (KS 0.582)
+  [9.69] hf: trial mode 2 style 1, cap 95494 per bucket
+  [141.25] par: histfree scatter done
+  [141.35] par: leaf sizes max 54243 mean 59523 -> imbalance 0.91x
+  [143.26] par: histfree spills 0 (ok)
+  [201.34] par: histfree done
+=== time, 1M, 9 reps ===
+heavy_tail vs uniform, n=1000000, min of 9 interleaved reps, threads 1 and 14; each row one runtime toggle
+
+  shape       toggle              T     min ms  median ms  ascending
+  heavy_tail  (default)           1      30.42      40.02  yes
+  heavy_tail  LOGOS_MCGATE_OLD    1      31.86      38.19  yes
+  heavy_tail  LOGOS_TAIL_SEQ      1      35.37      40.98  yes
+  heavy_tail  LOGOS_NO_STREAMS    1      35.06      43.03  yes
+  heavy_tail  LOGOS_MC_OFF        1      33.95      35.74  yes
+  heavy_tail  (default)          14      15.08      16.14  yes
+  heavy_tail  LOGOS_MCGATE_OLD   14      14.25      15.20  yes
+  heavy_tail  LOGOS_TAIL_SEQ     14      14.25      16.49  yes
+  heavy_tail  LOGOS_NO_STREAMS   14      14.08      15.30  yes
+  heavy_tail  LOGOS_MC_OFF       14      14.84      16.22  yes
+  uniform     (default)           1      29.55      37.66  yes
+  uniform     LOGOS_MCGATE_OLD    1      30.33      37.90  yes
+  uniform     LOGOS_TAIL_SEQ      1      30.24      38.53  yes
+  uniform     LOGOS_NO_STREAMS    1      33.09      39.39  yes
+  uniform     LOGOS_MC_OFF        1      32.69      38.64  yes
+  uniform     (default)          14       6.18       7.32  yes
+  uniform     LOGOS_MCGATE_OLD   14       6.38       9.97  yes
+  uniform     LOGOS_TAIL_SEQ     14       6.76       7.47  yes
+  uniform     LOGOS_NO_STREAMS   14       6.45       7.04  yes
+  uniform     LOGOS_MC_OFF       14       6.35       7.76  yes
+=== time, 10M, 5 reps ===
+heavy_tail vs uniform, n=10000000, min of 5 interleaved reps, threads 1 and 14; each row one runtime toggle
+
+  shape       toggle              T     min ms  median ms  ascending
+  heavy_tail  (default)           1     229.62     292.95  yes
+  heavy_tail  LOGOS_MCGATE_OLD    1     221.07     287.20  yes
+  heavy_tail  LOGOS_TAIL_SEQ      1     232.08     265.26  yes
+  heavy_tail  LOGOS_NO_STREAMS    1     215.59     382.61  yes
+  heavy_tail  LOGOS_MC_OFF        1     220.83     333.68  yes
+  heavy_tail  (default)          14     149.73     151.05  yes
+  heavy_tail  LOGOS_MCGATE_OLD   14     142.20     154.08  yes
+  heavy_tail  LOGOS_TAIL_SEQ     14     135.08     158.73  yes
+  heavy_tail  LOGOS_NO_STREAMS   14     155.97     166.43  yes
+  heavy_tail  LOGOS_MC_OFF       14     144.91     156.16  yes
+  uniform     (default)           1     428.46     523.53  yes
+  uniform     LOGOS_MCGATE_OLD    1     380.21     579.27  yes
+  uniform     LOGOS_TAIL_SEQ      1     412.81     669.97  yes
+  uniform     LOGOS_NO_STREAMS    1     393.70     520.43  yes
+  uniform     LOGOS_MC_OFF        1     433.66     487.65  yes
+  uniform     (default)          14      39.85      49.23  yes
+  uniform     LOGOS_MCGATE_OLD   14      38.71      49.97  yes
+  uniform     LOGOS_TAIL_SEQ     14      40.80      44.29  yes
+  uniform     LOGOS_NO_STREAMS   14      41.96      52.83  yes
+  uniform     LOGOS_MC_OFF       14      39.71      46.28  yes
+
+=== 2. htquick build matrix over partition compile flags (machine drifting: uniform 10M 40-138 ms across builds) ===
+  default                    T=14 heavy_tail 1M   27.46 ms   heavy_tail 10M   120.99 ms   uniform 10M   95.20 ms   heavy/uniform 1.27   ok
+      trace: 17.34ms hf: trial mode 2 style 1, cap 95494 per bucket;180.22ms par: histfree scatter done;263.20ms par: histfree done;
+  no_key_ks                  T=14 heavy_tail 1M   17.27 ms   heavy_tail 10M    66.20 ms   uniform 10M   58.26 ms   heavy/uniform 1.14   ok
+      trace: 2.75ms hf: trial mode 2 style 1, cap 95494 per bucket;26.99ms par: histfree scatter done;44.62ms par: histfree done;
+  no_modeks                  T=14 heavy_tail 1M    7.19 ms   heavy_tail 10M    39.36 ms   uniform 10M   41.52 ms   heavy/uniform 0.95   ok
+      trace: 4.78ms hf: trial mode 2 style 1, cap 95494 per bucket;38.56ms par: histfree scatter done;68.22ms par: histfree done;
+  hf_no_ks                   T=14 heavy_tail 1M    6.04 ms   heavy_tail 10M    48.65 ms   uniform 10M   40.24 ms   heavy/uniform 1.21   ok
+      trace: 18.07ms hf: trial mode 2 style 1, cap 95494 per bucket;207.79ms par: histfree scatter done;316.44ms par: histfree done;
+  lookup_branchy             T=14 heavy_tail 1M   31.64 ms   heavy_tail 10M   111.60 ms   uniform 10M   70.39 ms   heavy/uniform 1.59   ok
+      trace: 9.06ms hf: trial mode 2 style 1, cap 95494 per bucket;135.07ms par: histfree scatter done;198.24ms par: histfree done;
+  no_splitter_table: BUILD FAILED
+  exmap                      T=14 heavy_tail 1M   30.87 ms   heavy_tail 10M   192.84 ms   uniform 10M  138.29 ms   heavy/uniform 1.39   ok
+      trace: 7.96ms hf: trial mode 2 style 1, cap 95494 per bucket;105.66ms par: histfree scatter done;172.29ms par: histfree done;
+  model_table                T=14 heavy_tail 1M   17.82 ms   heavy_tail 10M   125.92 ms   uniform 10M   90.39 ms   heavy/uniform 1.39   ok
+      trace: 8.48ms hf: trial mode 2 style 1, cap 95494 per bucket;107.01ms par: histfree scatter done;178.79ms par: histfree done;
+
+=== 3. htprof: -DLOGOS_PROFILE, interleaved, 12 reps each ===
+=== 10M ===
+n=10000000, P=14, 12 interleaved reps each (order alternates). ms; busy/cpu/wait are summed over threads.
+
+  shape      rep route         total | scat wall scat busy  scat cpu  preempt     wait | leaf wall  leaf cpu
+  heavy_tail   0 sample-sort partition    157.6 |     71.4     648.3     648.3      0.0    128.4 |     81.2     948.3 
+  uniform      0 sample-sort partition    122.5 |     36.5     315.2     315.2      0.0    150.5 |     83.5    1013.6 
+  uniform      1 sample-sort partition    125.4 |     29.2     292.1     292.1      0.0    180.8 |     93.5    1035.1 
+  heavy_tail   1 sample-sort partition    167.7 |     86.3     916.8     915.8      1.1    195.5 |     78.3     920.8 
+  heavy_tail   2 sample-sort partition    139.7 |     48.8     535.6     535.6      0.0    167.6 |     88.2     922.0 
+  uniform      2 sample-sort partition    115.1 |     27.8     267.6     267.3      0.3     95.9 |     85.0    1059.0 
+  uniform      3 sample-sort partition    116.3 |     27.3     322.3     322.3      0.0    158.3 |     85.5     915.7 
+  heavy_tail   3 sample-sort partition    153.1 |     66.6     639.3     639.2      0.0    151.7 |     82.4    1022.1 
+  heavy_tail   4 sample-sort partition    133.0 |     54.0     525.7     525.5      0.2    145.7 |     76.6     894.6 
+  uniform      4 sample-sort partition    103.9 |     30.7     305.0     304.9      0.0     96.9 |     71.3     902.9 
+  uniform      5 sample-sort partition     93.9 |     26.0     268.5     268.5      0.0     66.4 |     66.1     854.8 
+  heavy_tail   5 sample-sort partition    162.0 |     84.4     943.4     943.4      0.0    153.3 |     75.5     865.5 
+  heavy_tail   6 sample-sort partition    213.1 |    119.0    1237.4    1237.4      0.0    331.6 |     90.6     933.4 
+  uniform      6 sample-sort partition     98.6 |     24.8     286.8     286.7      0.1     17.9 |     71.7     961.5 
+  uniform      7 sample-sort partition     92.6 |     23.0     274.0     273.9      0.1     21.5 |     67.8     902.2 
+  heavy_tail   7 sample-sort partition    140.7 |     48.7     522.1     522.1      0.0     62.2 |     89.4     885.0 
+  heavy_tail   8 sample-sort partition    136.9 |     50.2     556.6     556.6      0.0    178.8 |     84.4     903.1 
+  uniform      8 sample-sort partition    110.1 |     35.5     320.6     320.6      0.0    149.8 |     72.1     873.8 
+  uniform      9 sample-sort partition     92.4 |     26.5     267.0     267.0      0.0     68.2 |     63.8     805.1 
+  heavy_tail   9 sample-sort partition    135.8 |     50.0     512.6     512.4      0.2     98.3 |     83.5    1074.5 
+  heavy_tail  10 sample-sort partition    112.8 |     47.7     522.8     522.7      0.1     11.3 |     62.7     825.1 
+  uniform     10 sample-sort partition    101.2 |     26.3     274.5     274.5      0.0     64.5 |     72.5     960.7 
+  uniform     11 sample-sort partition    100.0 |     26.3     267.8     267.8      0.0    140.5 |     71.6     863.7 
+  heavy_tail  11 sample-sort partition    120.4 |     58.1     589.4     589.4      0.0    143.7 |     60.3     759.1 
+
+  medians          total  scat wall  scat busy  scat cpu  preempt  cpu ns/elem in scatter  leaf wall  leaf cpu
+  heavy_tail     140.2       56.0      573.0     573.0      0.0                    57.3       81.8     911.9
+  uniform        102.5       26.9      280.6     280.6      0.0                    28.1       71.9     909.3
+
+  verdict: the scatter costs heavy_tail 57.3 CPU ns per element against uniform's 28.1 (2.04x)
+
+=== 1M ===
+
+  medians          total  scat wall  scat busy  scat cpu  preempt  cpu ns/elem in scatter  leaf wall  leaf cpu
+  heavy_tail      18.3       10.7       32.0      31.9      0.0                    31.9        5.4      44.5
+  uniform         11.4        4.1       17.0      17.0      0.0                    17.0        5.5      44.4
+
+  verdict: the scatter costs heavy_tail 31.9 CPU ns per element against uniform's 17.0 (1.88x)
+
+=== baseline: reports/profile-report.html (2026-09-11 19:17), 14 threads, 8M ===
+uniform    total 24.3 ms, scatter 5.4, leaf 18.0
+heavy_tail total 24.6 ms, scatter 11.0, leaf 12.7   (scatter ratio 2.04x, the same as today's 2.04x)
+
+######## 4. THE FIX: the key grid (mode 10), make kgbench, harness 1568 ########
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  key grid: 32 checks, 0 failures
+  signed zeros: 36 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== trace: does the grid get built and chosen? ===
+  [trace    10.06 ms] par: key grid 11429 cells, shift 42
+  [trace    10.39 ms] hf: trial mode 10 style 0, cap 95494 per bucket
+  [trace   172.80 ms] par: histfree scatter done
+  [trace   266.96 ms] par: histfree done
+=== floor before ===
+  1000000        1.309     0.678     4.871       76.5%
+  8000000        0.954     0.799     1.495        9.8%
+=== kgbench 8.4M ===
+key grid: off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_KGRID)
+ratio > 1.000 means the grid is that much faster. Compare against ./pairprobe.
+
+  shape         T     ratio       p10       p90  what it is                             verify
+  heavy_tail    1     1.046     0.887     1.575  Pareto 1.2 x 1000, the scale report's  ok
+  heavy_tail   14     1.361     1.160     1.571                                         ok
+  pareto_0.8    1     0.977     0.912     1.099  heavier tail                           ok
+  pareto_0.8   14     1.325     1.064     1.786                                         ok
+  lognormal     1     1.015     0.911     1.186  sigma 2                                ok
+  lognormal    14     1.395     1.145     1.561                                         ok
+  exponential   1     1.005     0.935     1.081  mean 1000                              ok
+  exponential  14     1.323     1.259     1.590                                         ok
+  bimodal       1     1.005     0.941     1.061  guard: key range spans both signs      ok
+  bimodal      14     1.007     0.949     1.124                                         ok
+  mixed_sign    1     1.008     0.983     1.232  guard: heavy tails on both signs       ok
+  mixed_sign   14     1.011     0.934     1.204                                         ok
+  clustered     1     1.002     0.982     1.060  16 clusters                            ok
+  clustered    14     0.990     0.934     1.083                                         ok
+  int_wide      1     0.993     0.950     1.064  full int32 range                       ok
+  int_wide     14     0.999     0.944     1.110                                         ok
+  uniform       1     1.022     0.977     1.159  guard: its certificate comes first     ok
+  uniform      14     1.001     0.955     1.127                                         ok
+=== kgbench 1M ===
+key grid: off vs on, n=1000000, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_KGRID)
+ratio > 1.000 means the grid is that much faster. Compare against ./pairprobe.
+
+  shape         T     ratio       p10       p90  what it is                             verify
+  heavy_tail    1     1.002     0.974     1.038  Pareto 1.2 x 1000, the scale report's  ok
+  heavy_tail   14     1.825     1.638     2.104                                         ok
+  pareto_0.8    1     1.000     0.948     1.035  heavier tail                           ok
+  pareto_0.8   14     1.754     1.199     2.107                                         ok
+  lognormal     1     1.001     0.949     1.059  sigma 2                                ok
+  lognormal    14     1.665     1.603     1.912                                         ok
+  exponential   1     0.978     0.948     1.068  mean 1000                              ok
+  exponential  14     1.540     1.490     1.620                                         ok
+  bimodal       1     0.989     0.905     1.134  guard: key range spans both signs      ok
+  bimodal      14     0.988     0.938     1.106                                         ok
+  mixed_sign    1     1.011     0.977     1.074  guard: heavy tails on both signs       ok
+  mixed_sign   14     0.987     0.939     1.103                                         ok
+  clustered     1     1.003     0.979     1.066  16 clusters                            ok
+  clustered    14     1.005     0.963     1.173                                         ok
+  int_wide      1     0.983     0.855     1.129  full int32 range                       ok
+  int_wide     14     1.030     0.976     1.333                                         ok
+  uniform       1     1.003     0.948     1.057  guard: its certificate comes first     ok
+  uniform      14     1.000     0.956     1.353                                         ok
+=== floor after ===
+  1000000        0.997     0.934     1.128        2.5%
+  8000000        1.014     0.925     1.172        3.4%

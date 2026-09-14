@@ -1,0 +1,1715 @@
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/CHANGELOG.md work/engines/c/CHANGELOG.md
+--- pristine/engines/c/CHANGELOG.md	2026-09-12 03:46:36.774652315 -0700
++++ work/engines/c/CHANGELOG.md	2026-09-12 04:35:54.051455693 -0700
+@@ -1,5 +1,43 @@
+ # Changelog
+ 
++## (unreleased) — batch quantiles on the view, and the int32 view (experiments/team/view-analytics.md)
++- `logos_view_quantiles(v, q, m, out)` and its rank-space primitive `logos_view_ranks(v, ks, m, out)`:
++  m cuts in one pass. The cuts are sorted, the bucket walk is monotone (no search per cut), a bucket
++  several cuts share is marked once, and the touched set is sorted TOGETHER through
++  `logos_sort_buckets_f64` with everything else masked as done, so the buckets sort in parallel.
++  `logos_view_range` / `topk` go through the same set-force, so a range spanning buckets is parallel too.
++- **What a batch can and cannot buy.** `force()` was already idempotent per bucket, so a loop of m
++  `logos_view_at` calls touches exactly the buckets the batch touches; the batch only sorts them side by
++  side. Measured with the paired harness (both routes in one binary, 8M, 14 threads, three runs):
++  ten quantiles through the batch are 1.17-1.40x faster than the same ten through the loop, and
++  1.29-1.67x faster than sort-then-index (uniform 1.45/1.67/1.53, heavy_tail 1.29/1.53/1.41, bimodal
++  1.63/1.63/1.56, clustered 1.34/1.37/1.32). The predicted 2.0-2.8x over sort-then-index did not
++  happen because one forced 47k-element bucket costs ~1.4 ms at one thread (30 ns/element, the same as
++  a plain `logos_sort_f64` on that many elements, cold or hot), so ten of them are most of a partition.
++- **The int32 view** (`logos_view_create_i32` and the same API with an `_i32` suffix; the body is
++  `logos_view_impl.h`, included once per type). `logos_partition_i32` is a lazy flag on
++  `do_buckets_i32` (place the bucket, record min/max, skip `leaf_i32`) and `logos_sort_buckets_i32`
++  is the leaf on its own; `count_try_i32` firing returns 0 buckets like the f64 route does.
++  **Measured near-neutral, kept as an API, not a speedup:** paired sort-then-index / view+quantiles
++  is 1.02-1.12x on span-1e8, full-range and clustered ints and 0.97-1.02x on span 2e5 (counting sorts
++  it outright, nothing to defer, as predicted). The mechanism is the leaf share: the paired
++  eager-sort / partition-only ratio says the leaf `leaf_i32` is 7-17% of an int32 sort against 32-44%
++  (63% traced on a quiet box) for f64, because the int32 engine still runs the OLD histogram path
++  whose bucket lookup is a binary search over 167 splitters on both passes. The int32 lever is that
++  partition (H0b's direct-index table and the histogram-free partition, never ported to int32), not
++  the view.
++- **A latent race fixed.** `logos_sort_buckets_f64`'s workers each called `ctx_init`, which advances
++  the pool cursor `g_ctx_next` with a plain increment, so two threads could draw the same pooled
++  buffers; `hf_partition` avoids this by initialising its contexts on the calling thread. Both bucket
++  sorters now do the same. One int32 verify failure was seen before the fix (viewbench_i32 clustered,
++  one run) and none in three runs and 120 stress repetitions after it; the race was not reproduced
++  on demand, so this is the likely cause, not a proven one.
++- `make test` grows by 288 view checks (f64 and int32, 8 shapes x 6 sizes x 3 thread counts: ranks,
++  a 13-cut quantile list with duplicates and out-of-range cuts, rank(x) on and between values,
++  count-in-range, top-k, materialise-all byte-identical to qsort). `make viewbench_i32` is the int32
++  table; `make viewbench` gained the quantile rows and three paired lines, the last of which is the
++  deferred leaf share.
++
+ ## (unreleased) — the view grows value-space queries and finishes with the engine's own leaf
+ - `logos_view_rank(x)`, `logos_view_count_in_range(lo, hi)` and `logos_view_topk(k)` join
+   `logos_view_at` and `logos_view_range`. Every answer is exact and verified against a
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/Makefile work/engines/c/Makefile
+--- pristine/engines/c/Makefile	2026-09-12 03:46:36.650654457 -0700
++++ work/engines/c/Makefile	2026-09-12 03:57:49.790572349 -0700
+@@ -44,7 +44,7 @@
+ 	$(CC) $(CFLAGS) -c $(SRC2) -o $@
+ 
+ OBJ3    := logos_view.o
+-$(OBJ3): logos_view.c logos_view.h $(HDR)
++$(OBJ3): logos_view.c logos_view.h logos_view_impl.h $(HDR)
+ 	$(CC) $(CFLAGS) -c logos_view.c -o $@
+ 
+ $(LIB).a: $(OBJ) $(OBJ2) $(OBJ3)
+@@ -118,6 +118,11 @@
+ viewbench: viewbench.c $(LIB).a $(HDR) logos_view.h
+ 	$(CC) $(CFLAGS) $(BENCHFLAGS) viewbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+ 
++# The int32 twin of viewbench: the same table over logos_view_*_i32, plus the small-span shape where
++# the counting route sorts outright and a view can defer nothing (the honest zero row).
++viewbench_i32: viewbench_i32.c $(LIB).a $(HDR) logos_view.h
++	$(CC) $(CFLAGS) $(BENCHFLAGS) viewbench_i32.c $(LIB).a -o $@ $(LDLIBS) -lm
++
+ # Ledger re-run: two engine copies whose flags come from LB0/LB1, measured with the PAIRED harness
+ # so machine drift cancels, then run again with the assignment swapped so code-layout bias cancels
+ # too (tools/ledger_rerun.py drives both orientations). This is how a verdict reached against the
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/harness.c work/engines/c/harness.c
+--- pristine/engines/c/harness.c	2026-09-12 03:46:37.086646937 -0700
++++ work/engines/c/harness.c	2026-09-12 04:00:32.207880840 -0700
+@@ -1,265 +1,360 @@
+-/* harness.c — correctness + benchmark harness: logos_psort vs C stdlib qsort.
+- *
+- * Build:  make harness            (or: cc -O3 -pthread logos_psort.c harness.c -o harness -lm)
+- * Run:    ./harness               exit code 0 = every correctness check passed
+- *
+- * CORRECTNESS: for every (distribution x size x thread count), the data is sorted
+- * by logos_sort* and, independently, by qsort. The two outputs must agree
+- * element-for-element, and an XOR checksum proves the output is a permutation
+- * of the input (nothing lost, nothing invented). qsort is the oracle.
+- *
+- * BENCHMARK: best-of-k wall time of qsort vs logos at 1 thread and at N
+- * threads, across data shapes that exercise different paths (uniform, nearly
+- * sorted, clustered, heavy-tailed, low-cardinality).
+- */
+-#define _GNU_SOURCE
+-#include "logos_psort.h"
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <math.h>
+-#include <time.h>
+-
+-/* ---- deterministic RNG (xorshift64) ---- */
+-static uint64_t RS;
+-static void seed(uint64_t s) { RS = s ? s : 1; }
+-static uint64_t nextr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
+-static double frand(void) { return (double)(nextr() >> 11) / (double)(1ULL << 53); }
+-
+-static double now_ms(void) {
+-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+-    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+-}
+-
+-/* ---- qsort comparators (the reference) ---- */
+-static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+-static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
+-
+-/* ---- data shapes ---- */
+-enum { D_UNIFORM, D_SORTED, D_REVERSE, D_NEARSORT, D_FEWDIST, D_EQUAL, D_NEG, D_SKEWED, D_CLUSTER,
+-       D_SEGMENTED, D_FEWRUNS, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER, D_N };
+-static const char *DNAME[D_N] = { "uniform", "sorted", "reverse", "near_sorted", "few_distinct",
+-                                  "all_equal", "negatives", "heavy_tail", "clustered",
+-                                  "segmented", "few_runs", "prefix_shuffle", "bimodal", "quantized", "int_wide", "mod_card_30k",
+-                                  "block_perm", "block_overlap" };
+-
+-static void gen(double *a, size_t n, int d) {
+-    size_t i;
+-    switch (d) {
+-    case D_UNIFORM:  for (i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9; break;
+-    case D_SORTED:   for (i = 0; i < n; i++) a[i] = (double)i; break;
+-    case D_REVERSE:  for (i = 0; i < n; i++) a[i] = (double)(n - i); break;
+-    case D_NEARSORT: for (i = 0; i < n; i++) a[i] = (double)i;
+-                     for (i = 0; n > 0 && i < n / 100; i++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
+-                     break;
+-    case D_FEWDIST:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 5) * 1e6; break;
+-    case D_EQUAL:    for (i = 0; i < n; i++) a[i] = 42.0; break;
+-    case D_NEG:      for (i = 0; i < n; i++) a[i] = frand() * 2e6 - 1e6; break;
+-    case D_SKEWED:   for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); break; /* Pareto tail */
+-    case D_CLUSTER:  for (i = 0; i < n; i++) { double s = 0; int k; for (k = 0; k < 4; k++) s += frand(); a[i] = (s - 2.0) * 1e6; } break;
+-    /* many (>=16) sorted blocks -> 4-way merge path */
+-    case D_SEGMENTED: { size_t blk = n / 64 ? n / 64 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 64.0 + (double)(i / blk); } break;
+-    /* 2-8 long runs -> galloping 2-way merge */
+-    case D_FEWRUNS:  { size_t blk = n / 4 ? n / 4 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 4.0 + (double)(i / blk); } break;
+-    /* sorted with the first 10% shuffled -> momentum insertion must ABORT and fall through */
+-    case D_PREFIXSHUF: for (i = 0; i < n; i++) a[i] = (double)i;
+-                       { size_t m = n / 10; for (i = m; i > 1; i--) { size_t j = nextr() % i; double t = a[i - 1]; a[i - 1] = a[j]; a[j] = t; } } break;
+-    /* two tight clusters far apart -> gap-split partition */
+-    case D_BIMODAL:  for (i = 0; i < n; i++) a[i] = (nextr() & 1 ? 1e9 : -1e9) + frand() * 10.0; break;
+-    /* dyadic fractions (few active mantissa bytes) -> quantized float radix */
+-    case D_QUANTIZED: for (i = 0; i < n; i++) a[i] = (double)(nextr() % 4096) / 64.0; break;
+-    /* integer-valued doubles across the full int32 range -> byte-skip int32 radix */
+-    case D_INTWIDE:  for (i = 0; i < n; i++) a[i] = (double)(int32_t)nextr(); break;
+-    /* ~30k distinct non-integer values -> moderate-cardinality hash-map counting */
+-    case D_MODCARD:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 30000) * 1.5; break;
+-    /* 64 sorted blocks with DISJOINT value ranges, concatenated in shuffled order (merged log
+-     * partitions) -> disjoint-run relocation (J5): memcpy, no merge. Fractional values so the
+-     * quantized-radix probe does not claim them first. block_overlap: every value-block whose
+-     * index is 1 mod 8 starts 10% inside its predecessor, so a quarter of the data sits in
+-     * two-run chains and the chain-merge path runs. */
+-    case D_BLOCKPERM: case D_BLOCKOVER: {
+-        size_t nb = 64, blk = (n + nb - 1) / nb; if (blk < 1) blk = 1;
+-        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
+-        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
+-        for (i = 0; i < n; i++) {
+-            size_t b = perm[i / blk]; double base = (double)b * (double)blk;
+-            if (d == D_BLOCKOVER && (b & 7) == 1) base -= (double)blk * 0.1;
+-            a[i] = base + (double)(i % blk) + frand() * 0.5;
+-        }
+-    } break;
+-    }
+-}
+-
+-/* XOR of raw bits: invariant under permutation, so equal-before/after proves
+-   the output is a rearrangement of the input. */
+-static uint64_t xsum(const double *a, size_t n) {
+-    uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x;
+-}
+-
+-/* ================= correctness ================= */
+-static int correctness(void) {
+-    const size_t sizes[] = { 0, 1, 2, 63, 64, 65, 1000, 50000, 1000000 };
+-    const int threads[] = { 1, 2, 4, 8 };
+-    int checks = 0, fails = 0;
+-    seed(0x9E3779B97F4A7C15ULL);
+-
+-    printf("== correctness: logos vs qsort (double) ==\n");
+-    for (int d = 0; d < D_N; d++) {
+-        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+-            size_t n = sizes[si];
+-            double *orig = malloc((n ? n : 1) * sizeof(double));
+-            double *ref  = malloc((n ? n : 1) * sizeof(double));
+-            gen(orig, n, d);
+-            memcpy(ref, orig, n * sizeof(double));
+-            qsort(ref, n, sizeof(double), cmp_d);              /* the oracle */
+-            uint64_t before = xsum(orig, n);
+-            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+-                double *a = malloc((n ? n : 1) * sizeof(double));
+-                memcpy(a, orig, n * sizeof(double));
+-                logos_sort_f64(a, n, threads[ti]);
+-                int ok = xsum(a, n) == before;
+-                for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
+-                checks++;
+-                if (!ok) { fails++; printf("  FAIL  shape=%-12s n=%-8zu threads=%d\n", DNAME[d], n, threads[ti]); }
+-                free(a);
+-            }
+-            free(orig); free(ref);
+-        }
+-    }
+-    printf("  double: %d checks, %d failures\n", checks, fails);
+-
+-    printf("== correctness: logos vs qsort (int32) ==\n");
+-    int ichecks = 0, ifails = 0;
+-    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
+-    /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
+-       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
+-       INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
+-       narrow bulk. See FINDINGS 3w. */
+-    for (int mode = 0; mode < 12; mode++) {
+-        for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
+-            size_t n = isz[si];
+-            int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
+-            int32_t *ref  = malloc((n ? n : 1) * sizeof(int32_t));
+-            for (size_t i = 0; i < n; i++) {
+-                uint64_t r = nextr();
+-                switch (mode) {
+-                case 0:  orig[i] = (int32_t)r;                  break;   /* full range */
+-                case 1:  orig[i] = (int32_t)(r % 7) - 3;        break;   /* few distinct, signed */
+-                case 2:  orig[i] = (int32_t)i;                  break;   /* already sorted */
+-                case 3:  orig[i] = 42;                          break;   /* span 1: route declines */
+-                case 4:  orig[i] = (int32_t)(r & 1);            break;   /* span 2: smallest accepted */
+-                case 5:  orig[i] = (int32_t)(r % 262144);       break;   /* span == the table cap */
+-                case 6:  orig[i] = (int32_t)(r % 262145);       break;   /* one past the cap: declines */
+-                case 7:  orig[i] = -(int32_t)(r % 100) - 1;     break;   /* all negative */
+-                case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
+-                case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
+-                case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
+-                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
+-                }
+-            }
+-            if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
+-            memcpy(ref, orig, n * sizeof(int32_t));
+-            qsort(ref, n, sizeof(int32_t), cmp_i);
+-            for (int t = 1; t <= 16; t *= 4) {
+-                int32_t *a = malloc((n ? n : 1) * sizeof(int32_t));
+-                memcpy(a, orig, n * sizeof(int32_t));
+-                logos_sort_i32(a, n, t);
+-                int ok = memcmp(a, ref, n * sizeof(int32_t)) == 0;
+-                ichecks++;
+-                if (!ok) { ifails++; printf("  FAIL  int32 mode=%d n=%zu threads=%d\n", mode, n, t); }
+-                free(a);
+-            }
+-            free(orig); free(ref);
+-        }
+-    }
+-    printf("  int32:  %d checks, %d failures\n\n", ichecks, ifails);
+-    return fails + ifails;
+-}
+-
+-/* ================= benchmark ================= */
+-static double best_qsort(const double *base, size_t n, int reps) {
+-    double best = 1e300; double *a = malloc(n * sizeof(double));
+-    for (int r = 0; r < reps; r++) { memcpy(a, base, n * sizeof(double)); double t = now_ms(); qsort(a, n, sizeof(double), cmp_d); t = now_ms() - t; if (t < best) best = t; }
+-    free(a); return best;
+-}
+-static double best_logos(const double *base, size_t n, int threads, int reps) {
+-    double best = 1e300; double *a = malloc(n * sizeof(double));
+-    for (int r = 0; r < reps; r++) {
+-        memcpy(a, base, n * sizeof(double)); double t = now_ms(); logos_sort_f64(a, n, threads); t = now_ms() - t;
+-        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { printf("  !! unsorted output in benchmark\n"); break; }
+-        if (t < best) best = t;
+-    }
+-    free(a); return best;
+-}
+-
+-static void benchmark(void) {
+-    int cpus = logos_num_cpus();
+-    int P = cpus > 1 ? cpus : 4;            /* on a 1-core box, P=4 shows overhead honestly */
+-    const size_t sizes[] = { 1000000, 8000000 };
+-    const int dists[] = { D_UNIFORM, D_NEARSORT, D_CLUSTER, D_FEWDIST, D_SKEWED, D_SEGMENTED, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER };
+-
+-    printf("== benchmark: double, best-of-k wall time (online CPUs: %d) ==\n", cpus);
+-    printf("  %-12s %6s   %9s   %11s %7s   %11s %7s\n", "shape", "n", "qsort", "logos t=1", "x", "logos t=" , "x");
+-    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+-        size_t n = sizes[si]; int reps = n >= 8000000 ? 2 : 3;
+-        double *base = malloc(n * sizeof(double));
+-        for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
+-            seed(7); gen(base, n, dists[di]);
+-            double tq = best_qsort(base, n, reps);
+-            double t1 = best_logos(base, n, 1, reps);
+-            double tp = best_logos(base, n, P, reps);
+-            printf("  %-12s %5zuM   %7.1fms   %9.1fms %6.2fx   %7.1fms(%d) %6.2fx\n",
+-                   DNAME[dists[di]], n / 1000000, tq, t1, tq / t1, tp, P, tq / tp);
+-        }
+-        free(base);
+-    }
+-
+-    /* int32 */
+-    size_t n = 8000000; int32_t *bi = malloc(n * sizeof(int32_t));
+-    seed(11); for (size_t i = 0; i < n; i++) bi[i] = (int32_t)nextr();
+-    double tq = 1e300, tl = 1e300; int32_t *a = malloc(n * sizeof(int32_t));
+-    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); qsort(a, n, 4, cmp_i); t = now_ms() - t; if (t < tq) tq = t; }
+-    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); logos_sort_i32(a, n, 1); t = now_ms() - t; if (t < tl) tl = t; }
+-    printf("\n== benchmark: int32 8M uniform ==\n  qsort %7.1fms   logos t=1 %7.1fms   %.2fx\n", tq, tl, tq / tl);
+-    free(a); free(bi);
+-
+-    if (cpus == 1)
+-        printf("\n  note: this machine has ONE core. The t=%d column measures thread-coordination\n"
+-               "  overhead, not parallel speedup; on real cores it drops toward t=1 / cores.\n", P);
+-}
+-
+-
+-/* ---- parity extras: argSort family, findOutliers, strings ---- */
+-static int extras_checks(void) {
+-    int fails = 0, checks = 0;
+-    seed(0xC0FFEE);
+-    for (size_t n = 1; n <= 200000; n = n * 17 + 1) {
+-        double *a = malloc(n * 8); uint32_t *p = malloc(n * 4);
+-        for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 40);
+-        logos_argsort_f64(a, n, p);
+-        int ok = 1; char *seen = calloc(n, 1);
+-        for (size_t i = 0; i < n; i++) { if (p[i] >= n || seen[p[i]]) { ok = 0; break; } seen[p[i]] = 1; }
+-        for (size_t i = 1; ok && i < n; i++) { if (a[p[i-1]] > a[p[i]]) ok = 0; else if (a[p[i-1]] == a[p[i]] && p[i-1] > p[i]) ok = 0; }
+-        free(seen); checks++; if (!ok) { fails++; printf("  FAIL argsort_f64 n=%zu\n", n); }
+-        free(a); free(p);
+-    }
+-    { size_t n = 200000; double *a = malloc(n * 8); for (size_t i = 0; i < n; i++) a[i] = (double)i;
+-      a[7] = 1e18; a[n - 4] = -1e18; uint32_t out[16]; size_t c = logos_find_outliers_f64(a, n, out, 16, 0);
+-      int f7 = 0, fn = 0; for (size_t i = 0; i < c && i < 16; i++) { if (out[i] == 7) f7 = 1; if (out[i] == n - 4) fn = 1; }
+-      checks++; if (!(c >= 2 && f7 && fn)) { fails++; printf("  FAIL findOutliers\n"); } free(a); }
+-    { const char *s[] = {"delta","alpha","charlie","alpha","","bravo","al"}; size_t n = 7; logos_sort_strings(s, n);
+-      int ok = 1; for (size_t i = 1; i < n; i++) if (strcmp(s[i-1], s[i]) > 0) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL strings\n"); } }
+-    printf("  extras: %d checks, %d failures\n", checks, fails);
+-    return fails;
+-}
+-
+-int main(void) {
+-    printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
+-    int fails = correctness();
+-    printf("== parity extras ==\n");
+-    fails += extras_checks();
+-    printf("\n");
+-    benchmark();
+-    printf("\n%s\n", fails ? "RESULT: CORRECTNESS FAILURES — do not ship" : "RESULT: all correctness checks passed");
+-    return fails ? 1 : 0;
+-}
++/* harness.c — correctness + benchmark harness: logos_psort vs C stdlib qsort.
++ *
++ * Build:  make harness            (or: cc -O3 -pthread logos_psort.c harness.c -o harness -lm)
++ * Run:    ./harness               exit code 0 = every correctness check passed
++ *
++ * CORRECTNESS: for every (distribution x size x thread count), the data is sorted
++ * by logos_sort* and, independently, by qsort. The two outputs must agree
++ * element-for-element, and an XOR checksum proves the output is a permutation
++ * of the input (nothing lost, nothing invented). qsort is the oracle.
++ *
++ * BENCHMARK: best-of-k wall time of qsort vs logos at 1 thread and at N
++ * threads, across data shapes that exercise different paths (uniform, nearly
++ * sorted, clustered, heavy-tailed, low-cardinality).
++ */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include "logos_view.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <time.h>
++
++/* ---- deterministic RNG (xorshift64) ---- */
++static uint64_t RS;
++static void seed(uint64_t s) { RS = s ? s : 1; }
++static uint64_t nextr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double frand(void) { return (double)(nextr() >> 11) / (double)(1ULL << 53); }
++
++static double now_ms(void) {
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++/* ---- qsort comparators (the reference) ---- */
++static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
++static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
++
++/* ---- data shapes ---- */
++enum { D_UNIFORM, D_SORTED, D_REVERSE, D_NEARSORT, D_FEWDIST, D_EQUAL, D_NEG, D_SKEWED, D_CLUSTER,
++       D_SEGMENTED, D_FEWRUNS, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER, D_N };
++static const char *DNAME[D_N] = { "uniform", "sorted", "reverse", "near_sorted", "few_distinct",
++                                  "all_equal", "negatives", "heavy_tail", "clustered",
++                                  "segmented", "few_runs", "prefix_shuffle", "bimodal", "quantized", "int_wide", "mod_card_30k",
++                                  "block_perm", "block_overlap" };
++
++static void gen(double *a, size_t n, int d) {
++    size_t i;
++    switch (d) {
++    case D_UNIFORM:  for (i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9; break;
++    case D_SORTED:   for (i = 0; i < n; i++) a[i] = (double)i; break;
++    case D_REVERSE:  for (i = 0; i < n; i++) a[i] = (double)(n - i); break;
++    case D_NEARSORT: for (i = 0; i < n; i++) a[i] = (double)i;
++                     for (i = 0; n > 0 && i < n / 100; i++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
++                     break;
++    case D_FEWDIST:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 5) * 1e6; break;
++    case D_EQUAL:    for (i = 0; i < n; i++) a[i] = 42.0; break;
++    case D_NEG:      for (i = 0; i < n; i++) a[i] = frand() * 2e6 - 1e6; break;
++    case D_SKEWED:   for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); break; /* Pareto tail */
++    case D_CLUSTER:  for (i = 0; i < n; i++) { double s = 0; int k; for (k = 0; k < 4; k++) s += frand(); a[i] = (s - 2.0) * 1e6; } break;
++    /* many (>=16) sorted blocks -> 4-way merge path */
++    case D_SEGMENTED: { size_t blk = n / 64 ? n / 64 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 64.0 + (double)(i / blk); } break;
++    /* 2-8 long runs -> galloping 2-way merge */
++    case D_FEWRUNS:  { size_t blk = n / 4 ? n / 4 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 4.0 + (double)(i / blk); } break;
++    /* sorted with the first 10% shuffled -> momentum insertion must ABORT and fall through */
++    case D_PREFIXSHUF: for (i = 0; i < n; i++) a[i] = (double)i;
++                       { size_t m = n / 10; for (i = m; i > 1; i--) { size_t j = nextr() % i; double t = a[i - 1]; a[i - 1] = a[j]; a[j] = t; } } break;
++    /* two tight clusters far apart -> gap-split partition */
++    case D_BIMODAL:  for (i = 0; i < n; i++) a[i] = (nextr() & 1 ? 1e9 : -1e9) + frand() * 10.0; break;
++    /* dyadic fractions (few active mantissa bytes) -> quantized float radix */
++    case D_QUANTIZED: for (i = 0; i < n; i++) a[i] = (double)(nextr() % 4096) / 64.0; break;
++    /* integer-valued doubles across the full int32 range -> byte-skip int32 radix */
++    case D_INTWIDE:  for (i = 0; i < n; i++) a[i] = (double)(int32_t)nextr(); break;
++    /* ~30k distinct non-integer values -> moderate-cardinality hash-map counting */
++    case D_MODCARD:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 30000) * 1.5; break;
++    /* 64 sorted blocks with DISJOINT value ranges, concatenated in shuffled order (merged log
++     * partitions) -> disjoint-run relocation (J5): memcpy, no merge. Fractional values so the
++     * quantized-radix probe does not claim them first. block_overlap: every value-block whose
++     * index is 1 mod 8 starts 10% inside its predecessor, so a quarter of the data sits in
++     * two-run chains and the chain-merge path runs. */
++    case D_BLOCKPERM: case D_BLOCKOVER: {
++        size_t nb = 64, blk = (n + nb - 1) / nb; if (blk < 1) blk = 1;
++        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
++        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
++        for (i = 0; i < n; i++) {
++            size_t b = perm[i / blk]; double base = (double)b * (double)blk;
++            if (d == D_BLOCKOVER && (b & 7) == 1) base -= (double)blk * 0.1;
++            a[i] = base + (double)(i % blk) + frand() * 0.5;
++        }
++    } break;
++    }
++}
++
++/* XOR of raw bits: invariant under permutation, so equal-before/after proves
++   the output is a rearrangement of the input. */
++static uint64_t xsum(const double *a, size_t n) {
++    uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x;
++}
++
++/* ================= correctness ================= */
++static int correctness(void) {
++    const size_t sizes[] = { 0, 1, 2, 63, 64, 65, 1000, 50000, 1000000 };
++    const int threads[] = { 1, 2, 4, 8 };
++    int checks = 0, fails = 0;
++    seed(0x9E3779B97F4A7C15ULL);
++
++    printf("== correctness: logos vs qsort (double) ==\n");
++    for (int d = 0; d < D_N; d++) {
++        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++            size_t n = sizes[si];
++            double *orig = malloc((n ? n : 1) * sizeof(double));
++            double *ref  = malloc((n ? n : 1) * sizeof(double));
++            gen(orig, n, d);
++            memcpy(ref, orig, n * sizeof(double));
++            qsort(ref, n, sizeof(double), cmp_d);              /* the oracle */
++            uint64_t before = xsum(orig, n);
++            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
++                double *a = malloc((n ? n : 1) * sizeof(double));
++                memcpy(a, orig, n * sizeof(double));
++                logos_sort_f64(a, n, threads[ti]);
++                int ok = xsum(a, n) == before;
++                for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
++                checks++;
++                if (!ok) { fails++; printf("  FAIL  shape=%-12s n=%-8zu threads=%d\n", DNAME[d], n, threads[ti]); }
++                free(a);
++            }
++            free(orig); free(ref);
++        }
++    }
++    printf("  double: %d checks, %d failures\n", checks, fails);
++
++    printf("== correctness: logos vs qsort (int32) ==\n");
++    int ichecks = 0, ifails = 0;
++    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
++    /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
++       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
++       INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
++       narrow bulk. See FINDINGS 3w. */
++    for (int mode = 0; mode < 12; mode++) {
++        for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
++            size_t n = isz[si];
++            int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
++            int32_t *ref  = malloc((n ? n : 1) * sizeof(int32_t));
++            for (size_t i = 0; i < n; i++) {
++                uint64_t r = nextr();
++                switch (mode) {
++                case 0:  orig[i] = (int32_t)r;                  break;   /* full range */
++                case 1:  orig[i] = (int32_t)(r % 7) - 3;        break;   /* few distinct, signed */
++                case 2:  orig[i] = (int32_t)i;                  break;   /* already sorted */
++                case 3:  orig[i] = 42;                          break;   /* span 1: route declines */
++                case 4:  orig[i] = (int32_t)(r & 1);            break;   /* span 2: smallest accepted */
++                case 5:  orig[i] = (int32_t)(r % 262144);       break;   /* span == the table cap */
++                case 6:  orig[i] = (int32_t)(r % 262145);       break;   /* one past the cap: declines */
++                case 7:  orig[i] = -(int32_t)(r % 100) - 1;     break;   /* all negative */
++                case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
++                case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
++                case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
++                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
++                }
++            }
++            if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
++            memcpy(ref, orig, n * sizeof(int32_t));
++            qsort(ref, n, sizeof(int32_t), cmp_i);
++            for (int t = 1; t <= 16; t *= 4) {
++                int32_t *a = malloc((n ? n : 1) * sizeof(int32_t));
++                memcpy(a, orig, n * sizeof(int32_t));
++                logos_sort_i32(a, n, t);
++                int ok = memcmp(a, ref, n * sizeof(int32_t)) == 0;
++                ichecks++;
++                if (!ok) { ifails++; printf("  FAIL  int32 mode=%d n=%zu threads=%d\n", mode, n, t); }
++                free(a);
++            }
++            free(orig); free(ref);
++        }
++    }
++    printf("  int32:  %d checks, %d failures\n\n", ichecks, ifails);
++    return fails + ifails;
++}
++
++/* ================= benchmark ================= */
++static double best_qsort(const double *base, size_t n, int reps) {
++    double best = 1e300; double *a = malloc(n * sizeof(double));
++    for (int r = 0; r < reps; r++) { memcpy(a, base, n * sizeof(double)); double t = now_ms(); qsort(a, n, sizeof(double), cmp_d); t = now_ms() - t; if (t < best) best = t; }
++    free(a); return best;
++}
++static double best_logos(const double *base, size_t n, int threads, int reps) {
++    double best = 1e300; double *a = malloc(n * sizeof(double));
++    for (int r = 0; r < reps; r++) {
++        memcpy(a, base, n * sizeof(double)); double t = now_ms(); logos_sort_f64(a, n, threads); t = now_ms() - t;
++        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { printf("  !! unsorted output in benchmark\n"); break; }
++        if (t < best) best = t;
++    }
++    free(a); return best;
++}
++
++static void benchmark(void) {
++    int cpus = logos_num_cpus();
++    int P = cpus > 1 ? cpus : 4;            /* on a 1-core box, P=4 shows overhead honestly */
++    const size_t sizes[] = { 1000000, 8000000 };
++    const int dists[] = { D_UNIFORM, D_NEARSORT, D_CLUSTER, D_FEWDIST, D_SKEWED, D_SEGMENTED, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER };
++
++    printf("== benchmark: double, best-of-k wall time (online CPUs: %d) ==\n", cpus);
++    printf("  %-12s %6s   %9s   %11s %7s   %11s %7s\n", "shape", "n", "qsort", "logos t=1", "x", "logos t=" , "x");
++    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++        size_t n = sizes[si]; int reps = n >= 8000000 ? 2 : 3;
++        double *base = malloc(n * sizeof(double));
++        for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
++            seed(7); gen(base, n, dists[di]);
++            double tq = best_qsort(base, n, reps);
++            double t1 = best_logos(base, n, 1, reps);
++            double tp = best_logos(base, n, P, reps);
++            printf("  %-12s %5zuM   %7.1fms   %9.1fms %6.2fx   %7.1fms(%d) %6.2fx\n",
++                   DNAME[dists[di]], n / 1000000, tq, t1, tq / t1, tp, P, tq / tp);
++        }
++        free(base);
++    }
++
++    /* int32 */
++    size_t n = 8000000; int32_t *bi = malloc(n * sizeof(int32_t));
++    seed(11); for (size_t i = 0; i < n; i++) bi[i] = (int32_t)nextr();
++    double tq = 1e300, tl = 1e300; int32_t *a = malloc(n * sizeof(int32_t));
++    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); qsort(a, n, 4, cmp_i); t = now_ms() - t; if (t < tq) tq = t; }
++    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); logos_sort_i32(a, n, 1); t = now_ms() - t; if (t < tl) tl = t; }
++    printf("\n== benchmark: int32 8M uniform ==\n  qsort %7.1fms   logos t=1 %7.1fms   %.2fx\n", tq, tl, tq / tl);
++    free(a); free(bi);
++
++    if (cpus == 1)
++        printf("\n  note: this machine has ONE core. The t=%d column measures thread-coordination\n"
++               "  overhead, not parallel speedup; on real cores it drops toward t=1 / cores.\n", P);
++}
++
++
++/* ---- parity extras: argSort family, findOutliers, strings ---- */
++static int extras_checks(void) {
++    int fails = 0, checks = 0;
++    seed(0xC0FFEE);
++    for (size_t n = 1; n <= 200000; n = n * 17 + 1) {
++        double *a = malloc(n * 8); uint32_t *p = malloc(n * 4);
++        for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 40);
++        logos_argsort_f64(a, n, p);
++        int ok = 1; char *seen = calloc(n, 1);
++        for (size_t i = 0; i < n; i++) { if (p[i] >= n || seen[p[i]]) { ok = 0; break; } seen[p[i]] = 1; }
++        for (size_t i = 1; ok && i < n; i++) { if (a[p[i-1]] > a[p[i]]) ok = 0; else if (a[p[i-1]] == a[p[i]] && p[i-1] > p[i]) ok = 0; }
++        free(seen); checks++; if (!ok) { fails++; printf("  FAIL argsort_f64 n=%zu\n", n); }
++        free(a); free(p);
++    }
++    { size_t n = 200000; double *a = malloc(n * 8); for (size_t i = 0; i < n; i++) a[i] = (double)i;
++      a[7] = 1e18; a[n - 4] = -1e18; uint32_t out[16]; size_t c = logos_find_outliers_f64(a, n, out, 16, 0);
++      int f7 = 0, fn = 0; for (size_t i = 0; i < c && i < 16; i++) { if (out[i] == 7) f7 = 1; if (out[i] == n - 4) fn = 1; }
++      checks++; if (!(c >= 2 && f7 && fn)) { fails++; printf("  FAIL findOutliers\n"); } free(a); }
++    { const char *s[] = {"delta","alpha","charlie","alpha","","bravo","al"}; size_t n = 7; logos_sort_strings(s, n);
++      int ok = 1; for (size_t i = 1; i < n; i++) if (strcmp(s[i-1], s[i]) > 0) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL strings\n"); } }
++    printf("  extras: %d checks, %d failures\n", checks, fails);
++    return fails;
++}
++
++/* ---- the sorted view (logos_view.h): every query is checked against the qsort reference ----
++ * Shapes are chosen so both outcomes of the partition are exercised: ones that reach the lazy
++ * partition (a view with many buckets) and ones a route sorts outright (a view with one finished
++ * bucket: few_distinct and near_sorted for f64; span <= 2^18, few distinct, sorted for int32). The
++ * quantile list has out-of-range, duplicate and unordered cuts on purpose, and the rank/count probes
++ * sit on values that exist in the data as well as between them. */
++static size_t lb_d(const double *r, size_t n, double x) { size_t l = 0, h = n; while (l < h) { size_t m = (l + h) >> 1; if (r[m] < x) l = m + 1; else h = m; } return l; }
++static size_t lb_i(const int32_t *r, size_t n, int32_t x) { size_t l = 0, h = n; while (l < h) { size_t m = (l + h) >> 1; if (r[m] < x) l = m + 1; else h = m; } return l; }
++static const double VQ[13] = { 0.5, 0.0, 1.0, 0.5, 0.25, 0.75, 0.1, 0.9, -1.0, 2.0, 0.501, 0.499, 0.333 };
++static size_t vq_rank(double q, size_t n) { if (!(q > 0)) q = 0; if (q > 1) q = 1; return (size_t)(q * (double)(n - 1) + 0.5); }
++static int view_checks(void) {
++    int fails = 0, checks = 0;
++    const size_t sizes[] = { 2, 1000, 5000, 50000, 300000, 1000000 };
++    const int threads[] = { 1, 4, 16 };
++    const int dists[] = { D_UNIFORM, D_FEWDIST, D_NEARSORT, D_BIMODAL, D_SKEWED, D_CLUSTER, D_INTWIDE, D_EQUAL };
++    seed(0x5EEDF00DULL);
++    for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
++        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++            size_t n = sizes[si];
++            double *orig = malloc(n * 8), *ref = malloc(n * 8), *a = malloc(n * 8);
++            gen(orig, n, dists[di]); memcpy(ref, orig, n * 8); qsort(ref, n, 8, cmp_d);
++            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
++                memcpy(a, orig, n * 8);
++                logos_view *v = logos_view_create_f64(a, n, threads[ti]);
++                int ok = v != NULL;
++                if (ok) {
++                    size_t rk[5] = { n / 2, 0, n - 1, n / 3, (7 * n) / 9 };
++                    for (int i = 0; ok && i < 5; i++) ok = logos_view_at(v, rk[i]) == ref[rk[i]];
++                    double qo[13]; logos_view_quantiles(v, VQ, 13, qo);
++                    for (int i = 0; ok && i < 13; i++) ok = qo[i] == ref[vq_rank(VQ[i], n)];
++                    double xs[4] = { ref[n / 3], ref[n / 3] + 0.5, ref[0] - 1.0, ref[n - 1] + 1.0 };
++                    for (int i = 0; ok && i < 4; i++) ok = logos_view_rank(v, xs[i]) == lb_d(ref, n, xs[i]);
++                    ok = ok && logos_view_count_in_range(v, ref[n / 4], ref[(3 * n) / 4]) == lb_d(ref, n, ref[(3 * n) / 4]) - lb_d(ref, n, ref[n / 4]);
++                    size_t k = n < 200 ? n : 200; const double *top = logos_view_topk(v, k);
++                    ok = ok && top && memcmp(top, ref + n - k, k * 8) == 0;
++                    logos_view_all(v);
++                    ok = ok && memcmp(a, ref, n * 8) == 0 && logos_view_materialised(v) == logos_view_nbuckets(v);
++                    logos_view_free(v);
++                }
++                checks++; if (!ok) { fails++; printf("  FAIL  view f64 shape=%s n=%zu threads=%d\n", DNAME[dists[di]], n, threads[ti]); }
++            }
++            free(orig); free(ref); free(a);
++        }
++    }
++    printf("  view f64: %d checks, %d failures\n", checks, fails);
++    int ichecks = 0, ifails = 0;
++    for (int mode = 0; mode < 8; mode++) {
++        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++            size_t n = sizes[si];
++            int32_t *orig = malloc(n * 4), *ref = malloc(n * 4), *a = malloc(n * 4);
++            for (size_t i = 0; i < n; i++) {
++                uint64_t r = nextr();
++                switch (mode) {
++                case 0:  orig[i] = (int32_t)r;                          break;   /* full range: partition */
++                case 1:  orig[i] = (int32_t)(r % 100000000);            break;   /* span 1e8: partition */
++                case 2:  orig[i] = (int32_t)(r % 200000);               break;   /* span 2e5: counting sorts outright */
++                case 3:  orig[i] = (int32_t)(r % 7) - 3;                break;   /* few distinct */
++                case 4:  orig[i] = (int32_t)i;                          break;   /* sorted */
++                case 5:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX;     break;   /* the two extremes only */
++                case 6:  orig[i] = (int32_t)((r % 16) * 100000000u + (nextr() % 100000)); break; /* 16 clusters */
++                default: orig[i] = (int32_t)(r % 100);                  break;   /* narrow bulk + far sentinels */
++                }
++            }
++            if (mode == 7 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
++            memcpy(ref, orig, n * 4); qsort(ref, n, 4, cmp_i);
++            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
++                memcpy(a, orig, n * 4);
++                logos_view_i32 *v = logos_view_create_i32(a, n, threads[ti]);
++                int ok = v != NULL;
++                if (ok) {
++                    size_t rk[5] = { n / 2, 0, n - 1, n / 3, (7 * n) / 9 };
++                    for (int i = 0; ok && i < 5; i++) ok = logos_view_at_i32(v, rk[i]) == ref[rk[i]];
++                    int32_t qo[13]; logos_view_quantiles_i32(v, VQ, 13, qo);
++                    for (int i = 0; ok && i < 13; i++) ok = qo[i] == ref[vq_rank(VQ[i], n)];
++                    int32_t xs[4] = { ref[n / 3], ref[n / 3] == INT32_MAX ? INT32_MAX : ref[n / 3] + 1, INT32_MIN, INT32_MAX };
++                    for (int i = 0; ok && i < 4; i++) ok = logos_view_rank_i32(v, xs[i]) == lb_i(ref, n, xs[i]);
++                    ok = ok && logos_view_count_in_range_i32(v, ref[n / 4], ref[(3 * n) / 4]) == lb_i(ref, n, ref[(3 * n) / 4]) - lb_i(ref, n, ref[n / 4]);
++                    size_t k = n < 200 ? n : 200; const int32_t *top = logos_view_topk_i32(v, k);
++                    ok = ok && top && memcmp(top, ref + n - k, k * 4) == 0;
++                    logos_view_all_i32(v);
++                    ok = ok && memcmp(a, ref, n * 4) == 0 && logos_view_materialised_i32(v) == logos_view_nbuckets_i32(v);
++                    logos_view_free_i32(v);
++                }
++                ichecks++; if (!ok) { ifails++; printf("  FAIL  view i32 mode=%d n=%zu threads=%d\n", mode, n, threads[ti]); }
++            }
++            free(orig); free(ref); free(a);
++        }
++    }
++    printf("  view i32: %d checks, %d failures\n", ichecks, ifails);
++    return fails + ifails;
++}
++
++int main(void) {
++    printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
++    int fails = correctness();
++    printf("== parity extras ==\n");
++    fails += extras_checks();
++    printf("== sorted view (f64 and int32) ==\n");
++    fails += view_checks();
++    printf("\n");
++    benchmark();
++    printf("\n%s\n", fails ? "RESULT: CORRECTNESS FAILURES — do not ship" : "RESULT: all correctness checks passed");
++    return fails ? 1 : 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/logos_psort.c work/engines/c/logos_psort.c
+--- pristine/engines/c/logos_psort.c	2026-09-12 03:46:36.150663095 -0700
++++ work/engines/c/logos_psort.c	2026-09-12 04:17:25.291675881 -0700
+@@ -3693,6 +3693,8 @@
+     int P, nbk, nsp; int32_t *src, *dst; size_t n; const int32_t *sp;
+     size_t nchunk, csize; size_t *counts, *offs, *bstart, *bsize;
+     barrier_t bar; atomic_size_t hnext, snext, next; uint8_t *bidx;
++    int lazy;                    /* 1: place the buckets but do not sort them (logos_partition_i32) */
++    int32_t *vmin, *vmax;        /* lazy: per-bucket extremes, computed while the bucket is copied back */
+ } jobi_t;
+ typedef struct { jobi_t *j; int t; ctx_t *ctx; } wargi_t;
+ static void do_hist_i32(jobi_t *j) {
+@@ -3717,6 +3719,16 @@
+     size_t b;
+     while ((b = atomic_fetch_add(&j->next, 1)) < (size_t)j->nbk) {
+         size_t s = j->bstart[b], nb = j->bsize[b];
++        if (j->lazy) {
++            /* A view only needs the bucket PLACED (see the f64 twin in hf_leaves): copy it back and
++             * record its extremes on the way, which a value query needs to find x's bucket exactly. An
++             * empty bucket reads (INT32_MAX, INT32_MIN); the view repairs that to keep its searches
++             * monotone. The leaf, the part a view defers, is skipped. */
++            int32_t mn = INT32_MAX, mx = INT32_MIN;
++            for (size_t i = 0; i < nb; i++) { int32_t x = j->dst[s + i]; j->src[s + i] = x; mn = x < mn ? x : mn; mx = x > mx ? x : mx; }
++            if (j->vmin) { j->vmin[b] = mn; j->vmax[b] = mx; }
++            continue;
++        }
+         if (g_simd_i32 && nb > 1) g_simd_i32(j->dst + s, nb);
+         else if (nb > 1) leaf_i32(j->dst + s, nb, (uint32_t *)(j->src + s), ctx);
+         if (nb) memcpy(j->src + s, j->dst + s, nb * sizeof(int32_t));
+@@ -3917,7 +3929,13 @@
+     return ok;
+ }
+ #endif  /* LOGOS_NO_COUNT_I32 */
+-static void psort_i32(int32_t *a, size_t n, int P) {
++/* vstart/vnbk non-NULL: partition only (the int32 twin of psort_f64's lazy mode). *vnbk is 0 whenever
++ * the array came out FULLY sorted instead: the sequential leaf, the prescan and the counting route all
++ * produce sorted output, and so does the qsort fallback, so 0 means "nothing left to do". */
++static void psort_i32_ex(int32_t *a, size_t n, int P, size_t *vstart, int *vnbk, int32_t *vmin, int32_t *vmax);
++static void psort_i32(int32_t *a, size_t n, int P) { psort_i32_ex(a, n, P, NULL, NULL, NULL, NULL); }
++static void psort_i32_ex(int32_t *a, size_t n, int P, size_t *vstart, int *vnbk, int32_t *vmin, int32_t *vmax) {
++    if (vnbk) *vnbk = 0;
+     if (P < 1) P = 1;
+     if (n < 2) return;
+     if ((size_t)P > n) P = (int)n;
+@@ -3938,6 +3956,7 @@
+     if (count_try_i32(a, n, P)) return;
+ #endif
+     jobi_t j; memset(&j, 0, sizeof j);
++    j.lazy = vnbk != NULL; j.vmin = j.lazy ? vmin : NULL; j.vmax = j.lazy ? vmax : NULL;
+     j.P = P; j.nbk = P * BUCKETS_PER_THREAD; if (j.nbk > MAX_BUCKETS) j.nbk = P * (MAX_BUCKETS / P > 0 ? MAX_BUCKETS / P : 1); j.nsp = j.nbk - 1; j.src = a; j.n = n;
+     j.csize = (n + (size_t)P * 4 - 1) / ((size_t)P * 4); if (j.csize > CHUNK_MAX) j.csize = CHUNK_MAX; if (j.csize < 1) j.csize = 1;
+     j.nchunk = (n + j.csize - 1) / j.csize;
+@@ -3975,6 +3994,11 @@
+       barrier_destroy(&j.bar);
+       for (int t = 0; t < P; t++) ctx_free(&ctxs[t]);
+       if (!ok) goto fallback; }
++    if (j.lazy && vstart) {                                        /* hand the boundaries to the view */
++        for (int b = 0; b < j.nbk; b++) vstart[b] = j.bstart[b];
++        vstart[j.nbk] = n; *vnbk = j.nbk;
++        TRACE("i32: lazy partition, %d buckets placed unsorted, leaf_i32 skipped", j.nbk);
++    }
+     free(j.bidx); free(j.dst); free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
+     return;
+ fallback:
+@@ -4051,20 +4075,26 @@
+  * sort it was deferring. done[b] != 0 skips a bucket; each bucket is written by exactly one thread. */
+ typedef struct { double *a; const size_t *starts; int nbk; unsigned char *done; atomic_size_t *next;
+                  size_t maxb; int seq; } sb_arg_t;
++typedef struct { sb_arg_t *w; ctx_t *ctx; } sb_targ_t;
+ static void *sb_worker(void *p) {
+-    sb_arg_t *w = p; ctx_t c; size_t b;
++    sb_targ_t *ta = p; sb_arg_t *w = ta->w; ctx_t *c = ta->ctx; size_t b;
+     double *scratch = malloc((w->maxb ? w->maxb : 1) * sizeof(double));
+-    if (!scratch || !ctx_init(&c, w->maxb, 0)) { free(scratch); return NULL; }
+-    c.seq = w->seq;
++    if (!scratch) return NULL;
++    c->seq = w->seq;
+     while ((b = atomic_fetch_add(w->next, 1)) < (size_t)w->nbk) {
+         if (w->done[b]) continue;
+         size_t s0 = w->starts[b], nb = w->starts[b + 1] - s0;
+-        if (nb > 1) { double *r = leaf_f64(w->a + s0, nb, scratch, &c); if (r != w->a + s0) memcpy(w->a + s0, r, nb * sizeof(double)); }
++        if (nb > 1) { double *r = leaf_f64(w->a + s0, nb, scratch, c); if (r != w->a + s0) memcpy(w->a + s0, r, nb * sizeof(double)); }
+         w->done[b] = 1;
+     }
+-    ctx_free(&c); free(scratch);
++    free(scratch);
+     return NULL;
+ }
++/* Contexts are initialised HERE, on the calling thread, before any worker starts: ctx_init advances
++ * the pool cursor g_ctx_next with a plain increment, so a worker that calls it races every other
++ * worker for the same pooled buffers (hf_partition initialises its P contexts up front for the same
++ * reason). A worker whose context could not be made leaves its buckets undone; the serial tail below
++ * finishes them. */
+ void logos_sort_buckets_f64(double *a, const size_t *starts, int nbk, unsigned char *done, int nthreads) {
+     if (!a || !starts || nbk <= 0 || !done) return;
+     int P = nthreads > 0 ? nthreads : logos_num_cpus();
+@@ -4076,12 +4106,17 @@
+ #endif
+     atomic_size_t next; atomic_init(&next, 0);
+     sb_arg_t w = { a, starts, nbk, done, &next, maxb, P == 1 };
+-    pthread_t *th = P > 1 ? malloc((size_t)P * sizeof(pthread_t)) : NULL;
+-    if (P > 1 && !th) P = 1;
+-    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, sb_worker, &w);
+-    sb_worker(&w);
+-    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+-    free(th);
++    pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
++    ctx_t *ctxs = calloc((size_t)P, sizeof(ctx_t));
++    sb_targ_t *ta = calloc((size_t)P, sizeof(sb_targ_t));
++    int made = 0;
++    if (th && ctxs && ta) { for (int t = 0; t < P; t++) { if (!ctx_init(&ctxs[t], maxb, 0)) break; made++; } }
++    for (int t = 0; t < made; t++) { ta[t].w = &w; ta[t].ctx = &ctxs[t]; }
++    for (int t = 1; t < made; t++) pthread_create(&th[t], NULL, sb_worker, &ta[t]);
++    if (made > 0) sb_worker(&ta[0]);
++    for (int t = 1; t < made; t++) pthread_join(th[t], NULL);
++    for (int t = 0; t < made; t++) ctx_free(&ctxs[t]);
++    free(th); free(ctxs); free(ta);
+     /* a worker that could not get a context leaves its buckets undone; finish them here, serially */
+     for (int b = 0; b < nbk; b++) if (!done[b]) { size_t s0 = starts[b], nb = starts[b + 1] - s0; if (nb > 1) logos_sort_f64(a + s0, nb, 1); done[b] = 1; }
+ }
+@@ -4097,6 +4132,59 @@
+ #endif
+     psort_i32(a, n, nthreads);
+ }
++/* The int32 twins of logos_partition_f64 / logos_sort_buckets_f64 (contract in logos_psort.h). The
++ * int32 engine still runs the OLD histogram path (do_hist_i32 / do_scatter_i32 / do_buckets_i32), so
++ * its lazy mode is a flag on do_buckets_i32 rather than on hf_leaves; the bucket boundaries it reports
++ * come from the histogram's exact prefix sums. */
++int logos_partition_i32(int32_t *a, size_t n, int nthreads, size_t *starts, int32_t *bmin, int32_t *bmax) {
++    if (!a || !starts || n < 2) return 0;
++    int nbk = 0;
++#ifndef LOGOS_NO_CTX_POOL
++    if (ns_depth == 0) g_ctx_next = 0;
++#endif
++    psort_i32_ex(a, n, nthreads, starts, &nbk, bmin, bmax);
++    return nbk;
++}
++typedef struct { int32_t *a; const size_t *starts; int nbk; unsigned char *done; atomic_size_t *next; size_t maxb; } sbi_arg_t;
++typedef struct { sbi_arg_t *w; ctx_t *ctx; } sbi_targ_t;
++static void *sbi_worker(void *p) {
++    sbi_targ_t *ta = p; sbi_arg_t *w = ta->w; ctx_t *c = ta->ctx; size_t b;
++    uint32_t *buf = malloc((w->maxb ? w->maxb : 1) * sizeof(uint32_t));
++    if (!buf) return NULL;
++    while ((b = atomic_fetch_add(w->next, 1)) < (size_t)w->nbk) {
++        if (w->done[b]) continue;
++        size_t s0 = w->starts[b], nb = w->starts[b + 1] - s0;
++        if (nb > 1) { if (g_simd_i32) g_simd_i32(w->a + s0, nb); else leaf_i32(w->a + s0, nb, buf, c); }
++        w->done[b] = 1;
++    }
++    free(buf);
++    return NULL;
++}
++/* Same shape as the f64 one, contexts made on the calling thread (see logos_sort_buckets_f64). */
++void logos_sort_buckets_i32(int32_t *a, const size_t *starts, int nbk, unsigned char *done, int nthreads) {
++    if (!a || !starts || nbk <= 0 || !done) return;
++    int P = nthreads > 0 ? nthreads : logos_num_cpus();
++    if (P > nbk) P = nbk;
++    if (P < 1) P = 1;
++    size_t maxb = 1; for (int b = 0; b < nbk; b++) { size_t c = starts[b + 1] - starts[b]; if (c > maxb) maxb = c; }
++#ifndef LOGOS_NO_CTX_POOL
++    if (ns_depth == 0) g_ctx_next = 0;
++#endif
++    atomic_size_t next; atomic_init(&next, 0);
++    sbi_arg_t w = { a, starts, nbk, done, &next, maxb };
++    pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
++    ctx_t *ctxs = calloc((size_t)P, sizeof(ctx_t));
++    sbi_targ_t *ta = calloc((size_t)P, sizeof(sbi_targ_t));
++    int made = 0;
++    if (th && ctxs && ta) { for (int t = 0; t < P; t++) { if (!ctx_init(&ctxs[t], maxb, 0)) break; made++; } }
++    for (int t = 0; t < made; t++) { ta[t].w = &w; ta[t].ctx = &ctxs[t]; }
++    for (int t = 1; t < made; t++) pthread_create(&th[t], NULL, sbi_worker, &ta[t]);
++    if (made > 0) sbi_worker(&ta[0]);
++    for (int t = 1; t < made; t++) pthread_join(th[t], NULL);
++    for (int t = 0; t < made; t++) ctx_free(&ctxs[t]);
++    free(th); free(ctxs); free(ta);
++    for (int b = 0; b < nbk; b++) if (!done[b]) { size_t s0 = starts[b], nb = starts[b + 1] - s0; if (nb > 1) logos_sort_i32(a + s0, nb, 1); done[b] = 1; }
++}
+ int logos_num_cpus(void) { long c = sysconf(_SC_NPROCESSORS_ONLN); return c < 1 ? 1 : (int)c; }
+ 
+ /* ---- strict in-place entries (~1n memory; slower; for RAM-bound large n) ---- */
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/logos_psort.h work/engines/c/logos_psort.h
+--- pristine/engines/c/logos_psort.h	2026-09-12 03:46:36.318660193 -0700
++++ work/engines/c/logos_psort.h	2026-09-12 03:54:53.125777712 -0700
+@@ -38,6 +38,10 @@
+ int logos_partition_f64(double *a, size_t n, int nthreads, size_t *starts, double *bmin, double *bmax);
+ /* Sort placed buckets in place with the engine's leaf, one context per thread; done[b] != 0 skips b. */
+ void logos_sort_buckets_f64(double *a, const size_t *starts, int nbk, unsigned char *done, int nthreads);
++/* The int32 twins. psort_i32 runs the histogram partition, so the boundaries are exact prefix sums;
++ * returns 0 when the array came out sorted (counting route, sequential leaf, prescan, fallback). */
++int logos_partition_i32(int32_t *a, size_t n, int nthreads, size_t *starts, int32_t *bmin, int32_t *bmax);
++void logos_sort_buckets_i32(int32_t *a, const size_t *starts, int nbk, unsigned char *done, int nthreads);
+ 
+ /* Sort n signed 32-bit ints ascending, in place; 4-byte elements throughout.
+  * Uses ~5n bytes of scratch. */
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/logos_view.c work/engines/c/logos_view.c
+--- pristine/engines/c/logos_view.c	2026-09-12 03:46:36.470657566 -0700
++++ work/engines/c/logos_view.c	2026-09-12 03:57:49.694573802 -0700
+@@ -18,11 +18,19 @@
+  * splitters come from a single sample taken before any element moves, every boundary is known at once,
+  * and one P-way pass serves every query that follows.
+  *
++ * WHY A BATCH QUERY EXISTS. A loop of single lookups already sorts each bucket at most once, so a
++ * batch of m ranks cannot touch fewer buckets than the loop does. What it can do is sort the buckets
++ * it touches side by side instead of one after another: the touched set goes to the engine's bucket
++ * sorter with everything else masked as done. Ten quantiles at 8M touch ten of 168 buckets, and ten
++ * sequential leaves are a few ms against a ~20 ms partition, so the batch is worth about a tenth over
++ * the loop, not a multiple (viewbench measures it with the paired harness).
++ *
+  * WHY THIS FILE IS SO SHORT. The first version hand-rolled a partition and cost two to four times an
+  * entire eager sort: it re-derived, badly, a component this engine spent several sessions tuning. The
+  * fix was to stop competing with the engine and call it. `logos_partition_f64` is the engine's own
+  * partition with its leaf phase skipped, and `logos_sort_buckets_f64` is its leaf phase on its own.
+- * Everything below is bookkeeping. */
++ * Everything else is bookkeeping, and the bookkeeping is the same for int32, so the body lives in
++ * logos_view_impl.h and is included once per type below. */
+ #define _GNU_SOURCE
+ #include "logos_view.h"
+ #include "logos_psort.h"
+@@ -34,114 +42,34 @@
+ #ifndef VIEW_MIN_N
+ #define VIEW_MIN_N 4096              /* below this a view is pointless: just sort */
+ #endif
++#ifndef VIEW_PAR_FORCE
++#define VIEW_PAR_FORCE 1             /* batch queries sort their touched buckets in parallel; 0 = serially */
++#endif
+ 
+-struct logos_view {
+-    double *a; size_t n;
+-    int nbk, threads;
+-    size_t *start;                   /* nbk+1 boundaries; start[0]==0, start[nbk]==n */
+-    double *bmin, *bmax;             /* per-bucket extremes, monotone after fixup (see create) */
+-    unsigned char *done;             /* per bucket: has it been sorted */
+-    size_t materialised;
+-};
+-
+-logos_view *logos_view_create_f64(double *a, size_t n, int threads) {
+-    if (!a || n < 2) return NULL;
+-    logos_view *v = calloc(1, sizeof *v);
+-    if (!v) return NULL;
+-    v->a = a; v->n = n;
+-    v->threads = threads > 0 ? threads : logos_num_cpus();
+-    if (v->threads < 1) v->threads = 1;
+-    size_t cap = (size_t)LOGOS_MAX_VIEW_BUCKETS + 2;
+-    v->start = calloc(cap, sizeof(size_t));
+-    v->bmin = malloc(cap * sizeof(double));
+-    v->bmax = malloc(cap * sizeof(double));
+-    v->done = calloc(cap, 1);
+-    if (!v->start || !v->bmin || !v->bmax || !v->done) { logos_view_free(v); return NULL; }
+-
+-    int nbk = n >= VIEW_MIN_N ? logos_partition_f64(a, n, threads, v->start, v->bmin, v->bmax) : 0;
+-    if (nbk <= 0) {
+-        /* Either too small to bother, or a route in the dispatcher sorted the array outright. Either
+-         * way there is nothing to defer: sort if needed and model it as one finished bucket. */
+-        if (n < VIEW_MIN_N) logos_sort_f64(a, n, threads);
+-        v->nbk = 1; v->start[0] = 0; v->start[1] = n;
+-        v->bmin[0] = a[0]; v->bmax[0] = a[n - 1];
+-        v->done[0] = 1; v->materialised = 1;
+-        return v;
+-    }
+-    v->nbk = nbk;
+-    /* Empty buckets read (+inf, -inf), which breaks the monotone order a binary search needs. Give
+-     * an empty bucket its neighbours' values so bmax is non-decreasing and bmin is non-decreasing;
+-     * it holds no elements, so it can never be the answer to anything, only stepped over. */
+-    for (int b = 0; b < nbk; b++) if (v->start[b + 1] == v->start[b]) v->bmax[b] = b ? v->bmax[b - 1] : -INFINITY;
+-    for (int b = nbk - 1; b >= 0; b--) if (v->start[b + 1] == v->start[b]) v->bmin[b] = b + 1 < nbk ? v->bmin[b + 1] : INFINITY;
+-    return v;
+-}
+-
+-/* largest b with start[b] <= k */
+-static int find_rank(const logos_view *v, size_t k) {
+-    int lo = 0, hi = v->nbk - 1;
+-    while (lo < hi) { int mid = (lo + hi + 1) >> 1; if (v->start[mid] <= k) lo = mid; else hi = mid - 1; }
+-    return lo;
+-}
+-
+-static void force(logos_view *v, int b) {
+-    if (v->done[b]) return;
+-    size_t s = v->start[b], c = v->start[b + 1] - s;
+-    if (c > 1) logos_sort_buckets_f64(v->a + s, (const size_t[]){ 0, c }, 1, v->done + b, 1);
+-    v->done[b] = 1; v->materialised++;
+-}
+-
+-double logos_view_at(logos_view *v, size_t k) {
+-    if (!v || k >= v->n) return 0.0;
+-    force(v, find_rank(v, k));
+-    return v->a[k];
+-}
+-
+-void logos_view_range(logos_view *v, size_t lo, size_t hi) {
+-    if (!v || lo >= hi || lo >= v->n) return;
+-    if (hi > v->n) hi = v->n;
+-    int b0 = find_rank(v, lo), b1 = find_rank(v, hi - 1);
+-    for (int b = b0; b <= b1; b++) force(v, b);
+-}
+-
+-const double *logos_view_topk(logos_view *v, size_t k) {
+-    if (!v || k == 0) return NULL;
+-    if (k > v->n) k = v->n;
+-    logos_view_range(v, v->n - k, v->n);
+-    return v->a + v->n - k;
+-}
+-
+-/* Elements strictly less than x. Every bucket whose max is below x lies wholly below x; the first
+- * bucket whose max reaches x is the only one that can straddle it, and only if its min is below x. */
+-size_t logos_view_rank(logos_view *v, double x) {
+-    if (!v) return 0;
+-    if (x != x) return v->n;                            /* NaN sorts last in this engine */
+-    int lo = 0, hi = v->nbk;                            /* first b with bmax[b] >= x, or nbk */
+-    while (lo < hi) { int mid = (lo + hi) >> 1; if (v->bmax[mid] >= x) hi = mid; else lo = mid + 1; }
+-    if (lo == v->nbk) return v->n;
+-    if (!(v->bmin[lo] < x)) return v->start[lo];        /* nothing in bucket lo is below x */
+-    force(v, lo);
+-    const double *p = v->a + v->start[lo]; size_t c = v->start[lo + 1] - v->start[lo], l = 0, h = c;
+-    while (l < h) { size_t m = (l + h) >> 1; if (p[m] < x) l = m + 1; else h = m; }
+-    return v->start[lo] + l;
+-}
+-
+-size_t logos_view_count_in_range(logos_view *v, double lo, double hi) {
+-    if (!v || !(lo < hi)) return 0;
+-    return logos_view_rank(v, hi) - logos_view_rank(v, lo);
+-}
+-
+-void logos_view_all(logos_view *v) {
+-    if (!v) return;
+-    logos_sort_buckets_f64(v->a, v->start, v->nbk, v->done, v->threads);
+-    v->materialised = (size_t)v->nbk;
+-}
+-
+-size_t logos_view_nbuckets(const logos_view *v) { return v ? (size_t)v->nbk : 0; }
+-size_t logos_view_materialised(const logos_view *v) { return v ? v->materialised : 0; }
+-size_t logos_view_n(const logos_view *v) { return v ? v->n : 0; }
+-
+-void logos_view_free(logos_view *v) {
+-    if (!v) return;
+-    free(v->start); free(v->bmin); free(v->bmax); free(v->done); free(v);
+-}
++/* ---- double ---- */
++#define VT double
++#define VIEW logos_view
++#define VFN(name) logos_view_##name
++#define VCREATE logos_view_create_f64
++#define VS(name) name##_f64
++#define VPART logos_partition_f64
++#define VSORTB logos_sort_buckets_f64
++#define VSORT logos_sort_f64
++#define VLO (-INFINITY)
++#define VHI INFINITY
++#define VNAN(x) ((x) != (x))
++#include "logos_view_impl.h"
++
++/* ---- int32 ---- */
++#define VT int32_t
++#define VIEW logos_view_i32
++#define VFN(name) logos_view_##name##_i32
++#define VCREATE logos_view_create_i32
++#define VS(name) name##_i32
++#define VPART logos_partition_i32
++#define VSORTB logos_sort_buckets_i32
++#define VSORT logos_sort_i32
++#define VLO INT32_MIN
++#define VHI INT32_MAX
++#define VNAN(x) 0
++#include "logos_view_impl.h"
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/logos_view.h work/engines/c/logos_view.h
+--- pristine/engines/c/logos_view.h	2026-09-12 03:46:36.966648997 -0700
++++ work/engines/c/logos_view.h	2026-09-12 03:57:49.750572954 -0700
+@@ -23,6 +23,7 @@
+  *   double med    = logos_view_at(v, n / 2);            // sorts ~n/nbk elements, not n
+  *   size_t below  = logos_view_rank(v, 100.0);          // how many elements are < 100.0
+  *   const double *top = logos_view_topk(v, 100);        // the 100 largest, ascending, in place
++ *   double qs[3]; logos_view_quantiles(v, (double[]){0.25, 0.5, 0.75}, 3, qs);   // one pass, <= 3 buckets
+  *   logos_view_all(v);                                  // finish; a[] now equals a full sort
+  *   logos_view_free(v);
+  */
+@@ -30,6 +31,7 @@
+ #define LOGOS_VIEW_H
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -52,6 +54,17 @@
+ /* The k largest elements, ascending, as a pointer into a[]: a + n - k. Sorts the buckets they span. */
+ const double *logos_view_topk(logos_view *v, size_t k);
+ 
++/* ---- batch queries: m answers in one pass ---- */
++
++/* out[i] = the element of rank ks[i] (clamped to n-1), any order, duplicates allowed. The cuts are
++ * sorted, the buckets they land in are walked once, and every touched bucket is sorted once, the
++ * touched set in parallel. m ranks cost the partition plus at most m buckets, usually fewer. */
++void logos_view_ranks(logos_view *v, const size_t *ks, size_t m, double *out);
++
++/* out[i] = quantile q[i] in [0,1]: the element of rank round(q * (n - 1)), so q=0 is the minimum,
++ * q=1 the maximum, q=0.5 the median (the upper one for even n). Same cost model as logos_view_ranks. */
++void logos_view_quantiles(logos_view *v, const double *q, size_t m, double *out);
++
+ /* ---- value space ---- */
+ 
+ /* Number of elements strictly less than x. Sorts at most one bucket. NaN x returns n. */
+@@ -73,6 +86,26 @@
+ 
+ void logos_view_free(logos_view *v);
+ 
++/* ---- the int32 twin: the same API over logos_sort_i32's partition ------------------------------
++ * The int32 engine's counting route sorts small-span data outright (span <= 2^18), in which case the
++ * view holds one finished bucket and every query is a lookup; there is nothing to defer and nothing
++ * to gain. Full-range and wide-span data reach the histogram partition and defer the leaf as f64 does.
++ * Rank-space quantiles use the same round(q * (n - 1)) rule. */
++typedef struct logos_view_i32 logos_view_i32;
++logos_view_i32 *logos_view_create_i32(int32_t *a, size_t n, int threads);
++int32_t logos_view_at_i32(logos_view_i32 *v, size_t k);
++void logos_view_range_i32(logos_view_i32 *v, size_t lo, size_t hi);
++const int32_t *logos_view_topk_i32(logos_view_i32 *v, size_t k);
++void logos_view_ranks_i32(logos_view_i32 *v, const size_t *ks, size_t m, int32_t *out);
++void logos_view_quantiles_i32(logos_view_i32 *v, const double *q, size_t m, int32_t *out);
++size_t logos_view_rank_i32(logos_view_i32 *v, int32_t x);
++size_t logos_view_count_in_range_i32(logos_view_i32 *v, int32_t lo, int32_t hi);
++void logos_view_all_i32(logos_view_i32 *v);
++size_t logos_view_nbuckets_i32(const logos_view_i32 *v);
++size_t logos_view_materialised_i32(const logos_view_i32 *v);
++size_t logos_view_n_i32(const logos_view_i32 *v);
++void logos_view_free_i32(logos_view_i32 *v);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/logos_view_impl.h work/engines/c/logos_view_impl.h
+--- pristine/engines/c/logos_view_impl.h	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/logos_view_impl.h	2026-09-12 03:57:49.678574044 -0700
+@@ -0,0 +1,187 @@
++/* logos_view_impl.h — the body of the sorted view, included once per element type by logos_view.c.
++ *
++ * The f64 and int32 views are the same bookkeeping over different engine entry points, so the code
++ * lives here once and logos_view.c includes it twice (the pattern DEFINE_INPLACE_MSD uses in the
++ * engine, spelled as an include so the code reads as plain C). Before including, define:
++ *
++ *   VT          element type                      double            int32_t
++ *   VIEW        the opaque struct                  logos_view        logos_view_i32
++ *   VFN(name)   public query names                 logos_view_##name logos_view_##name##_i32
++ *   VCREATE     the constructor                    logos_view_create_f64 / _i32
++ *   VS(name)    file-local helper names, unique per type
++ *   VPART / VSORTB / VSORT   the engine's partition, bucket sorter and eager sort for VT
++ *   VLO / VHI   what an empty bucket's max / min read (-inf / +inf, INT32_MIN / INT32_MAX)
++ *   VNAN(x)     1 when x sorts last as NaN does; 0 for ints
++ *
++ * See logos_view.c for the design notes and logos_view.h for the API. */
++
++struct VIEW {
++    VT *a; size_t n;
++    int nbk, threads;
++    size_t *start;                   /* nbk+1 boundaries; start[0]==0, start[nbk]==n */
++    VT *bmin, *bmax;                 /* per-bucket extremes, monotone after fixup (see create) */
++    unsigned char *done;             /* per bucket: has it been sorted */
++    unsigned char *need, *mask;      /* scratch for batch queries: the touched set, and its complement as a done-mask */
++    size_t materialised;
++};
++
++VIEW *VCREATE(VT *a, size_t n, int threads) {
++    if (!a || n < 2) return NULL;
++    VIEW *v = calloc(1, sizeof *v);
++    if (!v) return NULL;
++    v->a = a; v->n = n;
++    v->threads = threads > 0 ? threads : logos_num_cpus();
++    if (v->threads < 1) v->threads = 1;
++    size_t cap = (size_t)LOGOS_MAX_VIEW_BUCKETS + 2;
++    v->start = calloc(cap, sizeof(size_t));
++    v->bmin = malloc(cap * sizeof(VT));
++    v->bmax = malloc(cap * sizeof(VT));
++    v->done = calloc(cap, 1); v->need = calloc(cap, 1); v->mask = calloc(cap, 1);
++    if (!v->start || !v->bmin || !v->bmax || !v->done || !v->need || !v->mask) { VFN(free)(v); return NULL; }
++
++    int nbk = n >= VIEW_MIN_N ? VPART(a, n, threads, v->start, v->bmin, v->bmax) : 0;
++    if (nbk <= 0) {
++        /* Either too small to bother, or a route in the dispatcher sorted the array outright. Either
++         * way there is nothing to defer: sort if needed and model it as one finished bucket. */
++        if (n < VIEW_MIN_N) VSORT(a, n, threads);
++        v->nbk = 1; v->start[0] = 0; v->start[1] = n;
++        v->bmin[0] = a[0]; v->bmax[0] = a[n - 1];
++        v->done[0] = 1; v->materialised = 1;
++        return v;
++    }
++    v->nbk = nbk;
++    /* Empty buckets read (+inf, -inf), which breaks the monotone order a binary search needs. Give
++     * an empty bucket its neighbours' values so bmax is non-decreasing and bmin is non-decreasing;
++     * it holds no elements, so it can never be the answer to anything, only stepped over. */
++    for (int b = 0; b < nbk; b++) if (v->start[b + 1] == v->start[b]) v->bmax[b] = b ? v->bmax[b - 1] : VLO;
++    for (int b = nbk - 1; b >= 0; b--) if (v->start[b + 1] == v->start[b]) v->bmin[b] = b + 1 < nbk ? v->bmin[b + 1] : VHI;
++    return v;
++}
++
++/* largest b with start[b] <= k */
++static int VS(find_rank)(const VIEW *v, size_t k) {
++    int lo = 0, hi = v->nbk - 1;
++    while (lo < hi) { int mid = (lo + hi + 1) >> 1; if (v->start[mid] <= k) lo = mid; else hi = mid - 1; }
++    return lo;
++}
++
++static void VS(force)(VIEW *v, int b) {
++    if (v->done[b]) return;
++    size_t s = v->start[b], c = v->start[b + 1] - s;
++    if (c > 1) VSORTB(v->a + s, (const size_t[]){ 0, c }, 1, v->done + b, 1);
++    v->done[b] = 1; v->materialised++;
++}
++
++/* Force a SET of buckets, need[b] != 0. One bucket (or one thread) sorts on the calling thread as a
++ * single query does; several sort IN PARALLEL through the engine's bucket sorter, with every bucket
++ * outside the set masked as already done. This is what a batch query has over a loop of single ones:
++ * force() is already idempotent per bucket, so the batch cannot touch fewer buckets, it can only sort
++ * the ones it touches side by side. -DVIEW_PAR_FORCE=0 keeps them serial (the A/B in viewbench). */
++static void VS(force_set)(VIEW *v, unsigned char *need) {
++    int cnt = 0;
++    for (int b = 0; b < v->nbk; b++) { if (need[b] && !v->done[b]) cnt++; else need[b] = 0; }
++    if (cnt == 0) return;
++    if (cnt == 1 || v->threads == 1 || !VIEW_PAR_FORCE) { for (int b = 0; b < v->nbk; b++) if (need[b]) VS(force)(v, b); return; }
++    for (int b = 0; b < v->nbk; b++) v->mask[b] = !need[b];
++    VSORTB(v->a, v->start, v->nbk, v->mask, cnt < v->threads ? cnt : v->threads);
++    for (int b = 0; b < v->nbk; b++) if (need[b]) { v->done[b] = 1; v->materialised++; }
++}
++
++VT VFN(at)(VIEW *v, size_t k) {
++    if (!v || k >= v->n) return 0;
++    VS(force)(v, VS(find_rank)(v, k));
++    return v->a[k];
++}
++
++void VFN(range)(VIEW *v, size_t lo, size_t hi) {
++    if (!v || lo >= hi || lo >= v->n) return;
++    if (hi > v->n) hi = v->n;
++    int b0 = VS(find_rank)(v, lo), b1 = VS(find_rank)(v, hi - 1);
++    memset(v->need, 0, (size_t)v->nbk);
++    for (int b = b0; b <= b1; b++) v->need[b] = 1;
++    VS(force_set)(v, v->need);
++}
++
++const VT *VFN(topk)(VIEW *v, size_t k) {
++    if (!v || k == 0) return NULL;
++    if (k > v->n) k = v->n;
++    VFN(range)(v, v->n - k, v->n);
++    return v->a + v->n - k;
++}
++
++/* m ranks in one pass. The cuts are sorted so the bucket walk is monotone, one pass over the
++ * boundaries with no search per cut; each touched bucket is marked once whatever number of cuts
++ * share it, and the touched set is forced together. Answers come back in the caller's order. */
++typedef struct { size_t k, i; } VS(cut_t);
++static int VS(cmp_cut)(const void *x, const void *y) { size_t a = ((const VS(cut_t) *)x)->k, b = ((const VS(cut_t) *)y)->k; return (a > b) - (a < b); }
++void VFN(ranks)(VIEW *v, const size_t *ks, size_t m, VT *out) {
++    if (!v || !ks || !out || m == 0) return;
++    VS(cut_t) *c = malloc(m * sizeof *c);
++    if (!c) { for (size_t i = 0; i < m; i++) out[i] = VFN(at)(v, ks[i] < v->n ? ks[i] : v->n - 1); return; }
++    for (size_t i = 0; i < m; i++) { c[i].k = ks[i] < v->n ? ks[i] : v->n - 1; c[i].i = i; }
++    qsort(c, m, sizeof *c, VS(cmp_cut));
++    memset(v->need, 0, (size_t)v->nbk);
++    int b = 0;
++    for (size_t t = 0; t < m; t++) { while (b + 1 < v->nbk && v->start[b + 1] <= c[t].k) b++; v->need[b] = 1; }
++    VS(force_set)(v, v->need);
++    for (size_t t = 0; t < m; t++) out[c[t].i] = v->a[c[t].k];
++    free(c);
++}
++
++/* Quantile q in [0,1] is the element of rank round(q * (n - 1)): q=0 the minimum, q=1 the maximum,
++ * q=0.5 the median (the upper one for even n). Out-of-range and NaN cuts clamp to [0,1]. */
++void VFN(quantiles)(VIEW *v, const double *q, size_t m, VT *out) {
++    if (!v || !q || !out || m == 0) return;
++    size_t *ks = malloc(m * sizeof *ks);
++    if (!ks) return;
++    for (size_t i = 0; i < m; i++) { double x = q[i]; if (!(x > 0.0)) x = 0.0; if (x > 1.0) x = 1.0; ks[i] = (size_t)(x * (double)(v->n - 1) + 0.5); }
++    VFN(ranks)(v, ks, m, out);
++    free(ks);
++}
++
++/* Elements strictly less than x. Every bucket whose max is below x lies wholly below x; the first
++ * bucket whose max reaches x is the only one that can straddle it, and only if its min is below x. */
++size_t VFN(rank)(VIEW *v, VT x) {
++    if (!v) return 0;
++    if (VNAN(x)) return v->n;                           /* NaN sorts last in this engine */
++    int lo = 0, hi = v->nbk;                            /* first b with bmax[b] >= x, or nbk */
++    while (lo < hi) { int mid = (lo + hi) >> 1; if (v->bmax[mid] >= x) hi = mid; else lo = mid + 1; }
++    if (lo == v->nbk) return v->n;
++    if (!(v->bmin[lo] < x)) return v->start[lo];        /* nothing in bucket lo is below x */
++    VS(force)(v, lo);
++    const VT *p = v->a + v->start[lo]; size_t c = v->start[lo + 1] - v->start[lo], l = 0, h = c;
++    while (l < h) { size_t m = (l + h) >> 1; if (p[m] < x) l = m + 1; else h = m; }
++    return v->start[lo] + l;
++}
++
++size_t VFN(count_in_range)(VIEW *v, VT lo, VT hi) {
++    if (!v || !(lo < hi)) return 0;
++    return VFN(rank)(v, hi) - VFN(rank)(v, lo);
++}
++
++void VFN(all)(VIEW *v) {
++    if (!v) return;
++    VSORTB(v->a, v->start, v->nbk, v->done, v->threads);
++    v->materialised = (size_t)v->nbk;
++}
++
++size_t VFN(nbuckets)(const VIEW *v) { return v ? (size_t)v->nbk : 0; }
++size_t VFN(materialised)(const VIEW *v) { return v ? v->materialised : 0; }
++size_t VFN(n)(const VIEW *v) { return v ? v->n : 0; }
++
++void VFN(free)(VIEW *v) {
++    if (!v) return;
++    free(v->start); free(v->bmin); free(v->bmax); free(v->done); free(v->need); free(v->mask); free(v);
++}
++
++#undef VT
++#undef VIEW
++#undef VFN
++#undef VCREATE
++#undef VS
++#undef VPART
++#undef VSORTB
++#undef VSORT
++#undef VLO
++#undef VHI
++#undef VNAN
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/viewbench.c work/engines/c/viewbench.c
+--- pristine/engines/c/viewbench.c	2026-09-12 03:46:36.610655148 -0700
++++ work/engines/c/viewbench.c	2026-09-12 04:17:25.283675977 -0700
+@@ -7,7 +7,13 @@
+  * Outputs are verified against qsort before anything is timed: every selected element must equal the
+  * reference at that rank, and a fully materialised view must be byte-identical to a full sort.
+  *
+- * Usage: ./viewbench [reps] [n]                                     LOGOS_THREADS=N overrides. */
++ * The table is min-of-reps per row, which resolves the large ratios. The two decisive comparisons
++ * for the batch API are then re-measured with bench_paired (both routes live in ONE binary, so there
++ * is no code-layout bias between them and machine drift cancels inside a pair):
++ *   sort-then-index the ten quantiles  vs  view + logos_view_quantiles
++ *   view + ten calls to logos_view_at  vs  view + logos_view_quantiles   (the batch's own mechanism)
++ *
++ * Usage: ./viewbench [reps] [n] [pairs]                            LOGOS_THREADS=N overrides. */
+ #define _GNU_SOURCE
+ #include "logos_psort.h"
+ #include "logos_view.h"
+@@ -34,17 +40,32 @@
+ };
+ #define NSH ((int)(sizeof SH / sizeof SH[0]))
+ 
++/* every verification names its source line and rep when it fails, so a failure is diagnosable */
++static int G_fail_line = 0, G_fail_rep = -1;
++#define CHECK(cond) do { if (!(cond)) { ok = 0; if (!G_fail_line) { G_fail_line = __LINE__; G_fail_rep = r; } } } while (0)
+ #define NQ 16                       /* random rank queries, the "several lookups" workload */
++#define NQT 10                      /* the quantile batch: 0.05, 0.15, ... 0.95 */
++static const double QT[NQT] = { 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95 };
++static size_t q_rank(double q, size_t n) { return (size_t)(q * (double)(n - 1) + 0.5); }
++static double G_out[NQT];           /* the three paired routes write here; verified outside the timing */
++
++/* the paired routes, all with bench_sort_fn's signature */
++static void r_sort_index(double *a, size_t n, int P) { logos_sort_f64(a, n, P); for (int i = 0; i < NQT; i++) G_out[i] = a[q_rank(QT[i], n)]; }
++static void r_view_quant(double *a, size_t n, int P) { logos_view *v = logos_view_create_f64(a, n, P); logos_view_quantiles(v, QT, NQT, G_out); logos_view_free(v); }
++static void r_sort_only(double *a, size_t n, int P) { logos_sort_f64(a, n, P); }
++static void r_view_only(double *a, size_t n, int P) { logos_view *v = logos_view_create_f64(a, n, P); logos_view_free(v); }
++static void r_view_naive(double *a, size_t n, int P) { logos_view *v = logos_view_create_f64(a, n, P); for (int i = 0; i < NQT; i++) G_out[i] = logos_view_at(v, q_rank(QT[i], n)); logos_view_free(v); }
+ 
+ int main(int argc, char **argv) {
+     int reps = argc > 1 ? atoi(argv[1]) : 7; if (reps < 3) reps = 3;
+     size_t n = argc > 2 ? (size_t)atol(argv[2]) : 8000000;
++    int pairs = argc > 3 ? atoi(argv[3]) : 20; if (pairs < 5) pairs = 5;
+     int P = bench_threads(logos_num_cpus());
+     double *base = malloc(n * 8), *w = malloc(n * 8), *ref = malloc(n * 8);
+     if (!base || !w || !ref) return 1;
+     size_t qs[NQ];
+ 
+-    printf("sorted view vs sort-then-look, n=%zu, min of %d, %d threads\n", n, reps, P);
++    printf("sorted view vs sort-then-look, n=%zu, min of %d, %d threads, %d pairs\n", n, reps, P, pairs);
+     printf("a view partitions into ordered buckets and sorts only the ones you touch.\n");
+     printf("Times in ms. 'x' is how many times faster the view route is.\n\n");
+ 
+@@ -54,8 +75,8 @@
+         memcpy(ref, base, n * 8); qsort(ref, n, 8, cmp_d);
+         for (int i = 0; i < NQ; i++) qs[i] = (size_t)(fr() * (double)n) % n;
+ 
+-        double t_sort = 1e30, t_make = 1e30, t_med = 1e30, t_topk = 1e30, t_many = 1e30, t_all = 1e30, t_rank = 1e30, t_cnt = 1e30;
+-        int ok = 1; size_t nbk = 0, touched_med = 0, touched_many = 0, touched_cnt = 0;
++        double t_sort = 1e30, t_make = 1e30, t_med = 1e30, t_topk = 1e30, t_many = 1e30, t_all = 1e30, t_rank = 1e30, t_cnt = 1e30, t_qt = 1e30, t_qn = 1e30;
++        int ok = 1; size_t nbk = 0, touched_med = 0, touched_many = 0, touched_cnt = 0, touched_qt = 0, touched_qn = 0;
+         const double xr = ref[n / 3], xlo = ref[n / 4], xhi = ref[(3 * n) / 4];      /* value-space probes */
+         const size_t want_rank = lower_bound(ref, n, xr), want_cnt = lower_bound(ref, n, xhi) - lower_bound(ref, n, xlo);
+ 
+@@ -64,21 +85,23 @@
+             memcpy(w, base, n * 8);
+             double s = bench_now_(); logos_sort_f64(w, n, P); double d = bench_now_() - s;
+             if (d < t_sort) t_sort = d;
+-            ok &= memcmp(w, ref, n * 8) == 0;
++            CHECK(memcmp(w, ref, n * 8) == 0);
+ 
+             /* (2) build a view and stop */
+             memcpy(w, base, n * 8);
+             s = bench_now_(); logos_view *v = logos_view_create_f64(w, n, P); d = bench_now_() - s;
+             if (!v) { printf("  %-11s view declined\n", SH[k].name); ok = 0; break; }
+-            if (d < t_make) t_make = d; nbk = logos_view_nbuckets(v);
++            if (d < t_make) t_make = d;
++            nbk = logos_view_nbuckets(v);
+             logos_view_free(v);
+ 
+             /* (3) the median */
+             memcpy(w, base, n * 8);
+             s = bench_now_(); v = logos_view_create_f64(w, n, P);
+             double med = logos_view_at(v, n / 2); d = bench_now_() - s;
+-            if (d < t_med) t_med = d; touched_med = logos_view_materialised(v);
+-            ok &= (med == ref[n / 2]);
++            if (d < t_med) t_med = d;
++            touched_med = logos_view_materialised(v);
++            CHECK((med == ref[n / 2]));
+             logos_view_free(v);
+ 
+             /* (4) the top 100, through the topk API */
+@@ -86,7 +109,7 @@
+             s = bench_now_(); v = logos_view_create_f64(w, n, P);
+             const double *top = logos_view_topk(v, 100); d = bench_now_() - s;
+             if (d < t_topk) t_topk = d;
+-            ok &= top && memcmp(top, ref + n - 100, 100 * 8) == 0;
++            CHECK(top && memcmp(top, ref + n - 100, 100 * 8) == 0);
+             logos_view_free(v);
+ 
+             /* (4b) rank of a value: how many elements are below x */
+@@ -94,23 +117,44 @@
+             s = bench_now_(); v = logos_view_create_f64(w, n, P);
+             size_t rk = logos_view_rank(v, xr); d = bench_now_() - s;
+             if (d < t_rank) t_rank = d;
+-            ok &= (rk == want_rank);
++            CHECK((rk == want_rank));
+             logos_view_free(v);
+ 
+             /* (4c) count in a value range */
+             memcpy(w, base, n * 8);
+             s = bench_now_(); v = logos_view_create_f64(w, n, P);
+             size_t ct = logos_view_count_in_range(v, xlo, xhi); d = bench_now_() - s;
+-            if (d < t_cnt) t_cnt = d; touched_cnt = logos_view_materialised(v);
+-            ok &= (ct == want_cnt);
++            if (d < t_cnt) t_cnt = d;
++            touched_cnt = logos_view_materialised(v);
++            CHECK((ct == want_cnt));
++            logos_view_free(v);
++
++            /* (4d) ten quantiles in one batch */
++            memcpy(w, base, n * 8);
++            s = bench_now_(); v = logos_view_create_f64(w, n, P);
++            double qo[NQT]; logos_view_quantiles(v, QT, NQT, qo); d = bench_now_() - s;
++            if (d < t_qt) t_qt = d;
++            touched_qt = logos_view_materialised(v);
++            for (int i = 0; i < NQT; i++) CHECK((qo[i] == ref[q_rank(QT[i], n)]));
++            logos_view_free(v);
++
++            /* (4e) the same ten quantiles as ten single lookups */
++            memcpy(w, base, n * 8);
++            s = bench_now_(); v = logos_view_create_f64(w, n, P);
++            for (int i = 0; i < NQT; i++) qo[i] = logos_view_at(v, q_rank(QT[i], n));
++            d = bench_now_() - s;
++            if (d < t_qn) t_qn = d;
++            touched_qn = logos_view_materialised(v);
++            for (int i = 0; i < NQT; i++) CHECK((qo[i] == ref[q_rank(QT[i], n)]));
+             logos_view_free(v);
+ 
+             /* (5) sixteen random rank queries */
+             memcpy(w, base, n * 8);
+             s = bench_now_(); v = logos_view_create_f64(w, n, P);
+-            for (int i = 0; i < NQ; i++) ok &= (logos_view_at(v, qs[i]) == ref[qs[i]]);
++            for (int i = 0; i < NQ; i++) CHECK((logos_view_at(v, qs[i]) == ref[qs[i]]));
+             d = bench_now_() - s;
+-            if (d < t_many) t_many = d; touched_many = logos_view_materialised(v);
++            if (d < t_many) t_many = d;
++            touched_many = logos_view_materialised(v);
+             logos_view_free(v);
+ 
+             /* (6) materialise the lot: must be byte-identical to the eager sort */
+@@ -118,21 +162,37 @@
+             s = bench_now_(); v = logos_view_create_f64(w, n, P);
+             logos_view_all(v); d = bench_now_() - s;
+             if (d < t_all) t_all = d;
+-            ok &= memcmp(w, ref, n * 8) == 0;
++            CHECK(memcmp(w, ref, n * 8) == 0);
+             logos_view_free(v);
+         }
+ 
+-        printf("  %s  (%zu buckets, %zu elements each)   verify: %s\n",
+-               SH[k].name, nbk, nbk ? n / nbk : 0, ok ? "ok" : "FAILED");
++        if (ok) printf("  %s  (%zu buckets, %zu elements each)   verify: ok\n", SH[k].name, nbk, nbk ? n / nbk : 0);
++        else printf("  %s  (%zu buckets, %zu elements each)   verify: FAILED (first at line %d, rep %d)\n", SH[k].name, nbk, nbk ? n / nbk : 0, G_fail_line, G_fail_rep);
++        G_fail_line = 0; G_fail_rep = -1;
+         printf("    %-34s %9.1f\n", "logos_sort_f64 (the baseline)", t_sort);
+         printf("    %-34s %9.1f   %.2fx   buckets sorted: 0\n", "build a view, look at nothing", t_make, t_sort / t_make);
+         printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + median", t_med, t_sort / t_med, touched_med);
+         printf("    %-34s %9.1f   %.2fx   buckets sorted: 1\n", "view + top 100", t_topk, t_sort / t_topk);
+         printf("    %-34s %9.1f   %.2fx   buckets sorted: 1\n", "view + rank(x)", t_rank, t_sort / t_rank);
+         printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + count in [lo,hi)", t_cnt, t_sort / t_cnt, touched_cnt);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + 10 quantiles (batch)", t_qt, t_sort / t_qt, touched_qt);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + 10 quantiles (10x at)", t_qn, t_sort / t_qn, touched_qn);
+         printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + 16 random ranks", t_many, t_sort / t_many, touched_many);
+-        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu  (the cost of laziness)\n\n",
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu  (the cost of laziness)\n",
+                "view + materialise everything", t_all, t_sort / t_all, nbk);
++
++        /* the paired comparisons: median of the ratio over adjacent pairs, >1 means the second route is faster */
++        {   double p10 = 0, p90 = 0, vq = 0;
++            double m1 = bench_paired(r_sort_index, r_view_quant, base, w, n, P, pairs, &p10, &p90);
++            for (int i = 0; i < NQT; i++) vq += G_out[i] == ref[q_rank(QT[i], n)] ? 0 : 1;
++            printf("    paired  sort+index / view+quantiles(10)   %.3fx   [p10 %.3f  p90 %.3f]%s\n", m1, p10, p90, vq ? "  VERIFY FAILED" : "");
++            double m2 = bench_paired(r_view_naive, r_view_quant, base, w, n, P, pairs, &p10, &p90);
++            for (int i = 0; i < NQT; i++) vq += G_out[i] == ref[q_rank(QT[i], n)] ? 0 : 1;
++            printf("    paired  10x view_at / view+quantiles(10)  %.3fx   [p10 %.3f  p90 %.3f]%s\n", m2, p10, p90, vq ? "  VERIFY FAILED" : "");
++            /* the mechanism: how much of an eager sort is the leaf phase a view defers (1 - 1/ratio) */
++            double m3 = bench_paired(r_sort_only, r_view_only, base, w, n, P, pairs, &p10, &p90);
++            printf("    paired  eager sort / partition only       %.3fx   [p10 %.3f  p90 %.3f]   deferred leaf share %.0f%%\n\n", m3, p10, p90, 100.0 * (1.0 - 1.0 / m3));
++        }
+         fflush(stdout);
+     }
+     free(base); free(w); free(ref);
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x viewbench_i32 -x intbench -x scalebench pristine/engines/c/viewbench_i32.c work/engines/c/viewbench_i32.c
+--- pristine/engines/c/viewbench_i32.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/viewbench_i32.c	2026-09-12 04:17:25.287675929 -0700
+@@ -0,0 +1,201 @@
++/* viewbench_i32.c — the int32 twin of viewbench: what does laziness buy on int32 data?
++ *
++ * Same rows as viewbench over logos_view_*_i32, verified against qsort, and the same two paired
++ * comparisons for the quantile batch. The shapes are chosen for what the int32 dispatcher does with
++ * them: span 1e8 and the full int32 range reach the histogram partition and defer the leaf; span 2e5
++ * fits the counting route's table (2^18 slots), which sorts the array outright, so the view holds one
++ * finished bucket and the prediction is NO gain there; clustered ints (16 clusters 1e5 wide, 1e8 apart)
++ * partition with unequal buckets.
++ *
++ * Usage: ./viewbench_i32 [reps] [n] [pairs]                        LOGOS_THREADS=N overrides. */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include "logos_view.h"
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <stdint.h>
++
++static uint64_t RS = 88172645463325252ULL;
++static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
++static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
++static size_t lower_bound(const int32_t *r, size_t n, int32_t x) { size_t l = 0, h = n; while (l < h) { size_t m = (l + h) >> 1; if (r[m] < x) l = m + 1; else h = m; } return l; }
++
++typedef void (*gen_fn)(int32_t *, size_t);
++static void g_span1e8(int32_t *a, size_t n)   { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 100000000u); }
++static void g_full(int32_t *a, size_t n)      { for (size_t i = 0; i < n; i++) a[i] = (int32_t)nr(); }
++static void g_span2e5(int32_t *a, size_t n)   { for (size_t i = 0; i < n; i++) a[i] = (int32_t)(nr() % 200000u) - 100000; }
++static void g_clustered(int32_t *a, size_t n) { for (size_t i = 0; i < n; i++) a[i] = (int32_t)((nr() % 16) * 100000000u + (nr() % 100000u)); }
++static const struct { const char *name; gen_fn g; } SH[] = {
++    { "span_1e8", g_span1e8 }, { "full_range", g_full }, { "span_2e5", g_span2e5 }, { "clustered", g_clustered },
++};
++#define NSH ((int)(sizeof SH / sizeof SH[0]))
++
++/* every verification names its source line and rep when it fails, so a failure is diagnosable */
++static int G_fail_line = 0, G_fail_rep = -1;
++#define CHECK(cond) do { if (!(cond)) { ok = 0; if (!G_fail_line) { G_fail_line = __LINE__; G_fail_rep = r; } } } while (0)
++#define NQ 16
++#define NQT 10
++static const double QT[NQT] = { 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95 };
++static size_t q_rank(double q, size_t n) { return (size_t)(q * (double)(n - 1) + 0.5); }
++static int32_t G_out[NQT];
++
++typedef void (*route_fn)(int32_t *, size_t, int);
++static void r_sort_index(int32_t *a, size_t n, int P) { logos_sort_i32(a, n, P); for (int i = 0; i < NQT; i++) G_out[i] = a[q_rank(QT[i], n)]; }
++static void r_view_quant(int32_t *a, size_t n, int P) { logos_view_i32 *v = logos_view_create_i32(a, n, P); logos_view_quantiles_i32(v, QT, NQT, G_out); logos_view_free_i32(v); }
++static void r_sort_only(int32_t *a, size_t n, int P) { logos_sort_i32(a, n, P); }
++static void r_view_only(int32_t *a, size_t n, int P) { logos_view_i32 *v = logos_view_create_i32(a, n, P); logos_view_free_i32(v); }
++static void r_view_naive(int32_t *a, size_t n, int P) { logos_view_i32 *v = logos_view_create_i32(a, n, P); for (int i = 0; i < NQT; i++) G_out[i] = logos_view_at_i32(v, q_rank(QT[i], n)); logos_view_free_i32(v); }
++
++/* bench_paired for int32 arrays: identical logic, 4-byte elements (see bench_common.h for the rationale) */
++static double paired_i32(route_fn A, route_fn B, const int32_t *base, int32_t *work, size_t n, int threads, int reps, double *p10, double *p90) {
++    double *r = malloc((size_t)reps * sizeof(double)); if (!r) return 0.0;
++    for (int i = 0; i < reps; i++) {
++        double ta, tb, s;
++        if (i & 1) {
++            memcpy(work, base, n * 4); s = bench_now_(); B(work, n, threads); tb = bench_now_() - s;
++            memcpy(work, base, n * 4); s = bench_now_(); A(work, n, threads); ta = bench_now_() - s;
++        } else {
++            memcpy(work, base, n * 4); s = bench_now_(); A(work, n, threads); ta = bench_now_() - s;
++            memcpy(work, base, n * 4); s = bench_now_(); B(work, n, threads); tb = bench_now_() - s;
++        }
++        r[i] = tb > 0 ? ta / tb : 1.0;
++    }
++    qsort(r, (size_t)reps, sizeof(double), bench_cmp_d_);
++    double med = (reps & 1) ? r[reps / 2] : 0.5 * (r[reps / 2 - 1] + r[reps / 2]);
++    if (p10) *p10 = r[(int)(0.10 * reps)];
++    if (p90) *p90 = r[(int)(0.90 * reps)];
++    free(r); return med;
++}
++
++int main(int argc, char **argv) {
++    int reps = argc > 1 ? atoi(argv[1]) : 7; if (reps < 3) reps = 3;
++    size_t n = argc > 2 ? (size_t)atol(argv[2]) : 8000000;
++    int pairs = argc > 3 ? atoi(argv[3]) : 20; if (pairs < 5) pairs = 5;
++    int P = bench_threads(logos_num_cpus());
++    int32_t *base = malloc(n * 4), *w = malloc(n * 4), *ref = malloc(n * 4);
++    if (!base || !w || !ref) return 1;
++    size_t qs[NQ];
++
++    printf("int32 sorted view vs sort-then-look, n=%zu, min of %d, %d threads, %d pairs\n", n, reps, P, pairs);
++    printf("Times in ms. 'x' is how many times faster the view route is. A 1-bucket view means a route sorted outright.\n\n");
++
++    for (int k = 0; k < NSH; k++) {
++        RS = 88172645463325252ULL;
++        SH[k].g(base, n);
++        memcpy(ref, base, n * 4); qsort(ref, n, 4, cmp_i);
++        for (int i = 0; i < NQ; i++) qs[i] = (size_t)(fr() * (double)n) % n;
++
++        double t_sort = 1e30, t_make = 1e30, t_med = 1e30, t_topk = 1e30, t_many = 1e30, t_all = 1e30, t_rank = 1e30, t_cnt = 1e30, t_qt = 1e30, t_qn = 1e30;
++        int ok = 1; size_t nbk = 0, touched_med = 0, touched_many = 0, touched_cnt = 0, touched_qt = 0, touched_qn = 0;
++        const int32_t xr = ref[n / 3], xlo = ref[n / 4], xhi = ref[(3 * n) / 4];
++        const size_t want_rank = lower_bound(ref, n, xr), want_cnt = lower_bound(ref, n, xhi) - lower_bound(ref, n, xlo);
++
++        for (int r = 0; r < reps; r++) {
++            memcpy(w, base, n * 4);
++            double s = bench_now_(); logos_sort_i32(w, n, P); double d = bench_now_() - s;
++            if (d < t_sort) t_sort = d;
++            CHECK(memcmp(w, ref, n * 4) == 0);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); logos_view_i32 *v = logos_view_create_i32(w, n, P); d = bench_now_() - s;
++            if (!v) { printf("  %-11s view declined\n", SH[k].name); ok = 0; break; }
++            if (d < t_make) t_make = d;
++            nbk = logos_view_nbuckets_i32(v);
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            int32_t med = logos_view_at_i32(v, n / 2); d = bench_now_() - s;
++            if (d < t_med) t_med = d;
++            touched_med = logos_view_materialised_i32(v);
++            CHECK((med == ref[n / 2]));
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            const int32_t *top = logos_view_topk_i32(v, 100); d = bench_now_() - s;
++            if (d < t_topk) t_topk = d;
++            CHECK(top && memcmp(top, ref + n - 100, 100 * 4) == 0);
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            size_t rk = logos_view_rank_i32(v, xr); d = bench_now_() - s;
++            if (d < t_rank) t_rank = d;
++            CHECK((rk == want_rank));
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            size_t ct = logos_view_count_in_range_i32(v, xlo, xhi); d = bench_now_() - s;
++            if (d < t_cnt) t_cnt = d;
++            touched_cnt = logos_view_materialised_i32(v);
++            CHECK((ct == want_cnt));
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            int32_t qo[NQT]; logos_view_quantiles_i32(v, QT, NQT, qo); d = bench_now_() - s;
++            if (d < t_qt) t_qt = d;
++            touched_qt = logos_view_materialised_i32(v);
++            for (int i = 0; i < NQT; i++) CHECK((qo[i] == ref[q_rank(QT[i], n)]));
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            for (int i = 0; i < NQT; i++) qo[i] = logos_view_at_i32(v, q_rank(QT[i], n));
++            d = bench_now_() - s;
++            if (d < t_qn) t_qn = d;
++            touched_qn = logos_view_materialised_i32(v);
++            for (int i = 0; i < NQT; i++) CHECK((qo[i] == ref[q_rank(QT[i], n)]));
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            for (int i = 0; i < NQ; i++) CHECK((logos_view_at_i32(v, qs[i]) == ref[qs[i]]));
++            d = bench_now_() - s;
++            if (d < t_many) t_many = d;
++            touched_many = logos_view_materialised_i32(v);
++            logos_view_free_i32(v);
++
++            memcpy(w, base, n * 4);
++            s = bench_now_(); v = logos_view_create_i32(w, n, P);
++            logos_view_all_i32(v); d = bench_now_() - s;
++            if (d < t_all) t_all = d;
++            CHECK(memcmp(w, ref, n * 4) == 0);
++            logos_view_free_i32(v);
++        }
++
++        if (ok) printf("  %s  (%zu buckets, %zu elements each)   verify: ok\n", SH[k].name, nbk, nbk ? n / nbk : 0);
++        else printf("  %s  (%zu buckets, %zu elements each)   verify: FAILED (first at line %d, rep %d)\n", SH[k].name, nbk, nbk ? n / nbk : 0, G_fail_line, G_fail_rep);
++        G_fail_line = 0; G_fail_rep = -1;
++        printf("    %-34s %9.1f\n", "logos_sort_i32 (the baseline)", t_sort);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: 0\n", "build a view, look at nothing", t_make, t_sort / t_make);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + median", t_med, t_sort / t_med, touched_med);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: 1\n", "view + top 100", t_topk, t_sort / t_topk);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: 1\n", "view + rank(x)", t_rank, t_sort / t_rank);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + count in [lo,hi)", t_cnt, t_sort / t_cnt, touched_cnt);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + 10 quantiles (batch)", t_qt, t_sort / t_qt, touched_qt);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + 10 quantiles (10x at)", t_qn, t_sort / t_qn, touched_qn);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu\n", "view + 16 random ranks", t_many, t_sort / t_many, touched_many);
++        printf("    %-34s %9.1f   %.2fx   buckets sorted: %zu  (the cost of laziness)\n",
++               "view + materialise everything", t_all, t_sort / t_all, nbk);
++        {   double p10 = 0, p90 = 0; int bad = 0;
++            double m1 = paired_i32(r_sort_index, r_view_quant, base, w, n, P, pairs, &p10, &p90);
++            for (int i = 0; i < NQT; i++) bad += G_out[i] != ref[q_rank(QT[i], n)];
++            printf("    paired  sort+index / view+quantiles(10)   %.3fx   [p10 %.3f  p90 %.3f]%s\n", m1, p10, p90, bad ? "  VERIFY FAILED" : "");
++            double m2 = paired_i32(r_view_naive, r_view_quant, base, w, n, P, pairs, &p10, &p90);
++            for (int i = 0; i < NQT; i++) bad += G_out[i] != ref[q_rank(QT[i], n)];
++            printf("    paired  10x view_at / view+quantiles(10)  %.3fx   [p10 %.3f  p90 %.3f]%s\n", m2, p10, p90, bad ? "  VERIFY FAILED" : "");
++            double m3 = paired_i32(r_sort_only, r_view_only, base, w, n, P, pairs, &p10, &p90);
++            printf("    paired  eager sort / partition only       %.3fx   [p10 %.3f  p90 %.3f]   deferred leaf share %.0f%%\n\n", m3, p10, p90, 100.0 * (1.0 - 1.0 / m3));
++        }
++        fflush(stdout);
++    }
++    free(base); free(w); free(ref);
++    return 0;
++}

@@ -1,0 +1,21 @@
+# build artifacts
+*.o
+*.a
+*.so
+*.tar.gz
+engines/c/harness
+engines/c/example-bin
+engines/c/parbench
+engines/c/pfbench
+engines/c/scaling
+engines/c/scaling-report.html
+engines/c/pf*.o
+engines/rust/target/
+engines/js/node_modules/
+engines/js/build/
+tools/sortbench/*.egg-info/
+__pycache__/
+experiments/paradigm/paradigm
+# external deps live as siblings, not in-tree
+x86-simd-sort/
+ips4o/

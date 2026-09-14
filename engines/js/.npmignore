@@ -1,0 +1,6 @@
+# Don't ship the C library in the npm tarball — it's a separate distribution
+c/
+test/
+.gitignore
+*.log
+node_modules/

@@ -1,0 +1,6 @@
+node_modules/
+*.log
+c/*.o
+c/*.a
+c/*.so
+c/test

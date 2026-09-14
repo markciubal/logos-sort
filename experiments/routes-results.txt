@@ -1,0 +1,344 @@
+tail route restricted to sequential sorts
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 57 checks, 0 failures
+  streams route: 51 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== floor ===
+  1000000        0.995     0.925     1.605       15.4%
+  8000000        1.007     0.926     1.399       10.2%
+=== streamsbench ===
+interleaved streams: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_STREAMS)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape          T     ratio       p10       p90  what it is                     verify
+  shard_ids      1     2.634     2.275     3.622  8 shards, the zoo's shape      ok
+  shard_ids     14     1.003     0.850     1.141                                 ok
+  streams_4      1     3.033     2.854     3.669  4 equal streams                ok
+  streams_4     14     1.006     0.889     1.309                                 ok
+  streams_16     1     2.155     1.944     2.432  16 equal streams               ok
+  streams_16    14     0.996     0.884     1.289                                 ok
+  streams_60     1     1.197     1.052     1.408  60 streams, near the cap       ok
+  streams_60    14     1.030     0.910     1.267                                 ok
+  streams_dirty  1     2.353     2.076     2.693  8 streams, 1% perturbed        ok
+  streams_dirty 14     1.002     0.906     1.618                                 ok
+  uniform        1     0.975     0.937     1.080  guard                          ok
+  uniform       14     1.030     0.931     1.185                                 ok
+  bimodal        1     0.965     0.908     1.059  guard: two gulf modes, random  ok
+  bimodal       14     0.990     0.929     1.083                                 ok
+  clustered      1     0.990     0.947     1.027  guard: 16 modes, random        ok
+  clustered     14     1.032     0.933     1.122                                 ok
+  heavy_tail     1     1.019     0.978     1.087  guard                          ok
+  heavy_tail    14     0.990     0.944     1.087                                 ok
+  few_distinct   1     1.009     0.930     1.181  guard: counting route          ok
+  few_distinct  14     0.971     0.903     1.084                                 ok
+  sorted_runs    1     1.016     0.992     1.040  guard: 16 runs, no gulfs       ok
+  sorted_runs   14     0.990     0.938     1.125                                 ok
+=== prefixbench, tail route now sequential only ===
+sorted prefix + tail: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_TAIL)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape        T     ratio       p10       p90  what it is                       verify
+  prefix_99    1     4.291     4.112     4.522  1% tail                          ok
+  prefix_99   14     1.000     0.951     1.071                                   ok
+  prefix_95    1     3.568     3.343     3.808  the zoo's shape                  ok
+  prefix_95   14     0.994     0.891     1.064                                   ok
+  prefix_80    1     2.090     2.039     2.179  20% tail                         ok
+  prefix_80   14     1.019     0.957     1.084                                   ok
+  prefix_50    1     1.121     1.035     1.208  the gate's edge                  ok
+  prefix_50   14     1.020     0.970     1.064                                   ok
+  prefix_49    1     1.007     0.974     1.081  guard: must not fire             ok
+  prefix_49   14     1.010     0.954     1.243                                   ok
+  uniform      1     0.999     0.955     1.043  guard                            ok
+  uniform     14     1.009     0.943     1.096                                   ok
+  near_1pct    1     1.002     0.896     1.047  guard: early first descent       ok
+  near_1pct   14     1.013     0.971     1.128                                   ok
+  sorted       1     1.006     0.976     1.129  guard: returns before the route  ok
+  sorted      14     1.000     0.982     1.138                                   ok
+  reverse      1     0.993     0.912     1.030  guard: returns before the route  ok
+  reverse     14     1.005     0.935     1.115                                   ok
+
+=== streamsbench rerun at 1M, 5 pairs, built with -DLOGOS_TRACE, no floor taken ===
+interleaved streams: route off vs on, n=1048576, 5 pairs, threads 1 and 14, one binary (LOGOS_NO_STREAMS)
+  shard_ids      1     2.241     2.165     3.191  8 shards, the zoo's shape      ok
+  shard_ids     14     1.056     0.923     1.155                                 ok
+  streams_4      1     2.749     2.457     2.828  4 equal streams                ok
+  streams_4     14     1.028     0.896     1.430                                 ok
+  streams_16     1     1.943     1.748     2.045  16 equal streams               ok
+  streams_16    14     0.977     0.910     1.102                                 ok
+  streams_60     1     1.029     0.981     1.068  60 streams, near the cap       ok
+  streams_60    14     0.974     0.974     1.090                                 ok
+  streams_dirty  1     2.313     2.087     2.368  8 streams, 1% perturbed        ok
+  streams_dirty 14     1.022     0.951     1.196                                 ok
+  uniform        1     0.997     0.942     1.010  guard                          ok
+  uniform       14     0.935     0.752     1.291                                 ok
+  bimodal        1     1.069     0.995     1.239  guard: two gulf modes, random  ok
+  bimodal       14     1.142     0.980     1.221                                 ok
+  clustered      1     0.981     0.861     1.049  guard: 16 modes, random        ok
+  clustered     14     1.009     0.916     1.426                                 ok
+  heavy_tail     1     1.001     0.969     1.239  guard                          ok
+  heavy_tail    14     0.969     0.516     1.160                                 ok
+  few_distinct   1     1.007     0.945     1.111  guard: counting route          ok
+  few_distinct  14     1.043     0.663     1.247                                 ok
+  sorted_runs    1     1.009     0.931     1.039  guard: 16 runs, no gulfs       ok
+  sorted_runs   14     0.885     0.830     1.186                                 ok
+
+######## 2026-09-12, round two: stream lookup table (4096 cells) and parallel tail merge, n/8 tail gate ########
+=== harness counts ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== trace: do the new paths fire? ===
+stream route lines (table flag, ambiguous count) by count:
+      6 streams: 8 modes, D descents, 1 buckets needed a sort, table 1, 0 ambiguous lookups
+      6 streams: 8 modes, D descents, 0 buckets needed a sort, table 1, 0 ambiguous lookups
+      6 streams: 60 modes, D descents, 0 buckets needed a sort, table 1, 0 ambiguous lookups
+      6 streams: 4 modes, D descents, 0 buckets needed a sort, table 1, 0 ambiguous lookups
+      6 streams: 16 modes, D descents, 0 buckets needed a sort, table 1, 0 ambiguous lookups
+tail route lines:
+48
+    120 psort_f64 n=1048576 P=10
+    110 psort_f64 n=1048576 P=1
+     12 psort_f64 n=52429 P=1
+     12 psort_f64 n=10486 P=1
+     12 psort_f64 n=104858 P=1
+=== floor ===
+
+  median is what to report; p10/p90 bound a single pair. "resolves" is the rough
+  standard error of the median over these pairs: effects smaller than that are noise.
+=== streamsbench lookup ===
+interleaved streams: compare lookup vs table lookup, route on, n=8388608, 20 pairs, 1 thread, one binary (LOGOS_STREAMS_CMP)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape          T     ratio       p10       p90  what it is                     verify
+  shard_ids      1     1.096     0.989     1.179  8 shards, the zoo's shape      ok
+  streams_4      1     0.810     0.722     0.922  4 equal streams                ok
+  streams_16     1     1.208     1.118     1.280  16 equal streams               ok
+  streams_60     1     2.744     2.570     2.806  60 streams, near the cap       ok
+  streams_dirty  1     0.678     0.646     0.731  8 streams, 1% perturbed        ok
+  uniform        1     1.026     0.976     1.129  guard                          ok
+  bimodal        1     0.984     0.923     1.010  guard: two gulf modes, random  ok
+  clustered      1     1.020     0.982     1.093  guard: 16 modes, random        ok
+  heavy_tail     1     0.998     0.959     1.047  guard                          ok
+  few_distinct   1     1.006     0.975     1.060  guard: counting route          ok
+  sorted_runs    1     1.008     0.995     1.034  guard: 16 runs, no gulfs       ok
+=== streamsbench off vs on ===
+interleaved streams: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_STREAMS)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape          T     ratio       p10       p90  what it is                     verify
+  shard_ids      1     2.858     2.545     3.110  8 shards, the zoo's shape      ok
+  shard_ids     14     0.991     0.911     1.088                                 ok
+  streams_4      1     2.612     2.390     2.942  4 equal streams                ok
+  streams_4     14     1.005     0.944     1.066                                 ok
+  streams_16     1     2.716     2.494     2.995  16 equal streams               ok
+  streams_16    14     1.002     0.950     1.086                                 ok
+  streams_60     1     3.231     3.084     3.504  60 streams, near the cap       ok
+  streams_60    14     0.989     0.955     1.103                                 ok
+  streams_dirty  1     1.548     1.492     1.612  8 streams, 1% perturbed        ok
+  streams_dirty 14     1.003     0.925     1.109                                 ok
+  uniform        1     0.994     0.966     1.055  guard                          ok
+  uniform       14     1.000     0.944     1.084                                 ok
+  bimodal        1     1.001     0.957     1.042  guard: two gulf modes, random  ok
+  bimodal       14     0.983     0.943     1.116                                 ok
+  clustered      1     0.990     0.935     1.036  guard: 16 modes, random        ok
+  clustered     14     1.013     0.928     1.071                                 ok
+  heavy_tail     1     0.968     0.906     1.045  guard                          ok
+  heavy_tail    14     1.005     0.959     1.089                                 ok
+  few_distinct   1     1.014     0.962     1.158  guard: counting route          ok
+  few_distinct  14     0.979     0.855     1.098                                 ok
+  sorted_runs    1     1.011     0.947     1.055  guard: 16 runs, no gulfs       ok
+  sorted_runs   14     1.014     0.954     1.190                                 ok
+=== prefixbench ===
+sorted prefix + tail: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_TAIL)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape        T     ratio       p10       p90  what it is                       verify
+  prefix_99    1     4.224     3.828     4.492  1% tail                          ok
+  prefix_99   14     1.006     0.878     1.141                                   ok
+  prefix_95    1     3.411     3.226     3.604  the zoo's shape                  ok
+  prefix_95   14     1.140     1.031     1.317                                   ok
+  prefix_90    1     2.756     2.613     2.959  10% tail: inside the parallel gate ok
+  prefix_90   14     1.190     1.114     1.292                                   ok
+  prefix_80    1     2.093     2.049     2.213  20% tail                         ok
+  prefix_80   14     1.004     0.967     1.071                                   ok
+  prefix_50    1     1.187     1.143     1.249  the gate's edge                  ok
+  prefix_50   14     0.996     0.940     1.064                                   ok
+  prefix_49    1     1.001     0.971     1.044  guard: must not fire             ok
+  prefix_49   14     0.991     0.951     1.059                                   ok
+  uniform      1     1.005     0.940     1.079  guard                            ok
+  uniform     14     1.011     0.950     1.113                                   ok
+  near_1pct    1     1.001     0.963     1.094  guard: early first descent       ok
+  near_1pct   14     1.020     0.977     1.206                                   ok
+  sorted       1     0.990     0.961     1.041  guard: returns before the route  ok
+  sorted      14     0.995     0.934     1.074                                   ok
+  reverse      1     0.995     0.930     1.056  guard: returns before the route  ok
+  reverse     14     1.023     0.972     1.064                                   ok
+=== prefixbench, LOGOS_TAIL_PAR_ANY=1 ===
+sorted prefix + tail: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_TAIL)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape        T     ratio       p10       p90  what it is                       verify
+  prefix_99    1     4.157     3.907     4.495  1% tail                          ok
+  prefix_99   14     1.014     0.934     1.098                                   ok
+  prefix_95    1     3.486     3.355     3.641  the zoo's shape                  ok
+  prefix_95   14     1.166     1.091     1.298                                   ok
+  prefix_90    1     2.775     2.671     3.163  10% tail: inside the parallel gate ok
+  prefix_90   14     1.227     1.152     1.387                                   ok
+  prefix_80    1     2.072     1.954     2.185  20% tail                         ok
+  prefix_80   14     1.157     1.046     1.312                                   ok
+  prefix_50    1     1.164     1.067     1.265  the gate's edge                  ok
+  prefix_50   14     1.034     0.963     1.181                                   ok
+  prefix_49    1     1.013     0.943     1.065  guard: must not fire             ok
+  prefix_49   14     0.994     0.928     1.105                                   ok
+  uniform      1     1.028     0.968     1.118  guard                            ok
+  uniform     14     1.004     0.951     1.085                                   ok
+  near_1pct    1     0.996     0.947     1.183  guard: early first descent       ok
+  near_1pct   14     1.027     0.973     1.168                                   ok
+  sorted       1     0.981     0.910     1.086  guard: returns before the route  ok
+  sorted      14     1.003     0.965     1.160                                   ok
+  reverse      1     1.001     0.947     1.117  guard: returns before the route  ok
+  reverse     14     1.010     0.979     1.045                                   ok
+
+######## round two, probe: whole-sort wall ms, 1 thread, 8.4M, 8 reps (min / mean) ########
+NORMAL build:  streams_4 compare 62.64/69.29  table 77.16/93.22 | streams_8 compare 78.79/83.75  table 92.69/97.53
+               streams_dirty compare 101.14/112.56  table 109.40/125.17 | shard_ids compare 74.31/203.13  table 86.56/183.60
+TRACE build:   streams_4 compare 126.00/145.40  table 118.11/143.29 | streams_8 compare 129.45/149.25  table 116.17/131.45
+               streams_dirty compare 170.07/182.54  table 129.17/147.40 | shard_ids compare 113.93/132.84  table 116.05/142.64
+TRACE build phase stamps (min ms), lookup pass: streams_dirty compare 21.89 table 14.21; streams_8 compare 22.41 table 15.48;
+               streams_4 compare 16.82 table 15.93; shard_ids compare 21.32 table 23.02. Scatter, bucket check and copy equal.
+=> the trace build inverts the table-vs-compare answer at 8 streams; the normal build is the one that ships.
+
+######## round three: table only from 12 streams, no tail gate ########
+=== harness ===
+  double: 648 checks, 0 failures
+  int32:  306 checks, 0 failures
+  extras: 7 checks, 0 failures
+  tail route: 116 checks, 0 failures
+  streams route: 63 checks, 0 failures
+  dense int: 72 checks, 0 failures
+  view f64: 144 checks, 0 failures
+  view i32: 144 checks, 0 failures
+RESULT: all correctness checks passed
+=== floor ===
+paired null test: identical engine in both halves, n=8000000, 40 pairs, 14 threads
+the true ratio is 1.000; everything below is this machine's measurement error
+
+  size          median       p10       p90    resolves
+  1000000        1.008     0.912     1.164        3.2%
+  8000000        1.003     0.910     1.239        4.7%
+
+  median is what to report; p10/p90 bound a single pair. "resolves" is the rough
+  standard error of the median over these pairs: effects smaller than that are noise.
+=== streamsbench lookup (table forced at every count) ===
+interleaved streams: compare lookup vs table lookup, route on, n=8388608, 20 pairs, 1 thread, one binary (LOGOS_STREAMS_CMP)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape          T     ratio       p10       p90  what it is                     verify
+  shard_ids      1     1.112     0.961     1.391  8 shards, the zoo's shape      ok
+  streams_4      1     0.794     0.690     1.091  4 equal streams                ok
+  streams_12     1     1.013     0.777     1.287  12 streams: table threshold    ok
+  streams_16     1     1.197     0.955     1.510  16 equal streams               ok
+  streams_60     1     2.788     2.218     3.347  60 streams, near the cap       ok
+  streams_dirty  1     0.705     0.642     0.816  8 streams, 1% perturbed        ok
+  uniform        1     1.018     0.778     1.317  guard                          ok
+  bimodal        1     0.984     0.842     1.145  guard: two gulf modes, random  ok
+  clustered      1     1.040     0.872     1.276  guard: 16 modes, random        ok
+  heavy_tail     1     0.980     0.695     1.420  guard                          ok
+  few_distinct   1     0.939     0.496     1.799  guard: counting route          ok
+  sorted_runs    1     1.045     0.736     1.544  guard: 16 runs, no gulfs       ok
+=== streamsbench off vs on (shipped default) ===
+interleaved streams: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_STREAMS)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape          T     ratio       p10       p90  what it is                     verify
+  shard_ids      1     1.889     1.285     2.864  8 shards, the zoo's shape      ok
+  shard_ids     14     0.941     0.636     1.382                                 ok
+  streams_4      1     2.686     1.962     3.113  4 equal streams                ok
+  streams_4     14     1.037     0.775     1.181                                 ok
+  streams_12     1     1.221     0.980     2.686  12 streams: table threshold    ok
+  streams_12    14     0.991     0.826     1.432                                 ok
+  streams_16     1     2.374     2.018     2.778  16 equal streams               ok
+  streams_16    14     1.016     0.877     1.340                                 ok
+  streams_60     1     3.152     3.037     3.432  60 streams, near the cap       ok
+  streams_60    14     0.994     0.936     1.122                                 ok
+  streams_dirty  1     2.351     2.188     2.450  8 streams, 1% perturbed        ok
+  streams_dirty 14     0.991     0.935     1.069                                 ok
+  uniform        1     0.996     0.928     1.090  guard                          ok
+  uniform       14     1.002     0.977     1.037                                 ok
+  bimodal        1     1.001     0.965     1.058  guard: two gulf modes, random  ok
+  bimodal       14     1.019     0.912     1.146                                 ok
+  clustered      1     0.984     0.929     1.074  guard: 16 modes, random        ok
+  clustered     14     0.969     0.858     1.070                                 ok
+  heavy_tail     1     0.992     0.922     1.069  guard                          ok
+  heavy_tail    14     0.974     0.918     1.074                                 ok
+  few_distinct   1     0.984     0.905     1.176  guard: counting route          ok
+  few_distinct  14     0.948     0.877     1.064                                 ok
+  sorted_runs    1     1.018     0.975     1.137  guard: 16 runs, no gulfs       ok
+  sorted_runs   14     0.981     0.935     1.044                                 ok
+=== prefixbench (no tail gate) ===
+sorted prefix + tail: route off vs on, n=8388608, 20 pairs, threads 1 and 14, one binary (LOGOS_NO_TAIL)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape        T     ratio       p10       p90  what it is                       verify
+  prefix_99    1     4.380     3.964     4.641  1% tail                          ok
+  prefix_99   14     1.006     0.889     1.086                                   ok
+  prefix_95    1     3.647     3.396     3.838  the zoo's shape                  ok
+  prefix_95   14     1.172     1.104     1.277                                   ok
+  prefix_90    1     2.888     2.747     3.043  10% tail: inside the parallel gate ok
+  prefix_90   14     1.215     1.132     1.294                                   ok
+  prefix_80    1     2.157     2.073     2.270  20% tail                         ok
+  prefix_80   14     1.170     1.099     1.344                                   ok
+  prefix_50    1     1.188     1.052     1.242  the gate's edge                  ok
+  prefix_50   14     1.047     0.978     1.151                                   ok
+  prefix_49    1     0.984     0.927     1.138  guard: must not fire             ok
+  prefix_49   14     1.024     0.928     1.192                                   ok
+  uniform      1     1.010     0.988     1.092  guard                            ok
+  uniform     14     1.009     0.976     1.052                                   ok
+  near_1pct    1     0.988     0.970     1.077  guard: early first descent       ok
+  near_1pct   14     1.006     0.964     1.156                                   ok
+  sorted       1     0.998     0.982     1.029  guard: returns before the route  ok
+  sorted      14     0.991     0.971     1.032                                   ok
+  reverse      1     1.012     0.984     1.181  guard: returns before the route  ok
+  reverse     14     1.015     0.968     1.064                                   ok
+
+######## round three rerun: streamsbench off vs on at 30 pairs (no floor taken; the round-three floor was 3.2% at 1M, 4.7% at 8M) ########
+=== streamsbench off vs on, rerun at 30 pairs ===
+interleaved streams: route off vs on, n=8388608, 30 pairs, threads 1 and 14, one binary (LOGOS_NO_STREAMS)
+ratio > 1.000 means the route is that much faster. Compare against ./pairprobe.
+
+  shape          T     ratio       p10       p90  what it is                     verify
+  shard_ids      1     2.709     2.405     3.066  8 shards, the zoo's shape      ok
+  shard_ids     14     0.988     0.734     1.313                                 ok
+  streams_4      1     3.209     2.612     3.588  4 equal streams                ok
+  streams_4     14     0.990     0.889     1.066                                 ok
+  streams_12     1     2.636     2.548     2.862  12 streams: table threshold    ok
+  streams_12    14     0.989     0.856     1.145                                 ok
+  streams_16     1     2.646     2.354     2.868  16 equal streams               ok
+  streams_16    14     1.001     0.899     1.078                                 ok
+  streams_60     1     2.866     1.616     3.761  60 streams, near the cap       ok
+  streams_60    14     0.951     0.780     1.146                                 ok
+  streams_dirty  1     2.357     2.008     2.821  8 streams, 1% perturbed        ok
+  streams_dirty 14     0.985     0.928     1.121                                 ok
+  uniform        1     0.993     0.821     1.257  guard                          ok
+  uniform       14     0.990     0.919     1.084                                 ok
+  bimodal        1     0.984     0.773     1.202  guard: two gulf modes, random  ok
+  bimodal       14     0.994     0.838     1.043                                 ok
+  clustered      1     1.017     0.852     1.185  guard: 16 modes, random        ok
+  clustered     14     1.005     0.802     1.278                                 ok
+  heavy_tail     1     1.023     0.836     1.323  guard                          ok
+  heavy_tail    14     0.975     0.874     1.306                                 ok
+  few_distinct   1     0.996     0.899     1.147  guard: counting route          ok
+  few_distinct  14     1.028     0.858     1.350                                 ok
+  sorted_runs    1     1.008     0.853     1.288  guard: 16 runs, no gulfs       ok
+  sorted_runs   14     1.009     0.855     1.132                                 ok

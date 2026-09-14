@@ -1,0 +1,7 @@
+*.o
+*.a
+*.so
+harness
+example-bin
+logos-sort-c-*.tar.gz
+scaling-report.html

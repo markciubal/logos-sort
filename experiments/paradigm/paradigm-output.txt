@@ -1,0 +1,26 @@
+PARADIGM-SHIFT experiments — logos-sort's philosophy vs the SIMD sorted-array.
+Baseline for 'materialize the array' = Intel x86-simd-sort (AVX-512). n = 8M.
+
+==== #1  Vectorize the ADDRESSING (the operation SIMD avoids) ====
+  (a) permutation scatter out[perm[i]]=a[i]   scalar 52.79ms   vpscatter 50.43ms   1.05x  
+  (b) histogram count[bucket]++               scalar 3.72ms   vpconflictd 5.61ms   0.66x  
+  verdict: SIMD scatter/histogram are the ops logos depends on; if these do not
+           beat scalar, the addressing paradigm cannot win on a CPU by materializing.
+
+==== #2  Never materialize: answer ORDER queries from a model (no scatter) ====
+  d=64      distinct  (build+2M rank queries):  sort+bsearch 46.1ms   order-model 31.5ms   1.46x 
+  d=4096    distinct  (build+2M rank queries):  sort+bsearch 69.1ms   order-model 117.5ms   0.59x 
+  d=200000  distinct  (build+2M rank queries):  sort+bsearch 112.3ms   order-model 234.4ms   0.48x 
+  verdict: the model skips the scatter entirely; it wins where distinct << n and the
+           workload is queries, and degenerates to a full sort when distinct ~ n.
+
+==== #3  Distribution-awareness as the product: analytics without sorting ====
+  quantiles p50/p95/p99   sort-exact 96.8ms   sampled-profile 1.08ms   89x   (rel.err 0.4%/2.4%/6.8%)
+  top-100                 sort-based  66.9ms   one-pass heap   7.49ms   9x   
+  count-in-range          sort+bsearch 92.8ms   one scan       2.28ms   41x   
+  verdict: none of these classic "sort first" analytics needs a sorted array;
+           a one-pass profile answers them 10-1000x faster and never scatters.
+
+Summary: #1 tests whether the addressing paradigm can win on a CPU by materializing
+(it cannot if scatter/histogram do not vectorize). #2 and #3 test the real pivot:
+changing the deliverable from a sorted ARRAY to an ORDER/PROFILE the scatter was only a means to.

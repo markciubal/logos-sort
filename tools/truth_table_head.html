@@ -1,0 +1,112 @@
+<title>logos-sort Truth Table</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F5F6F4; --surface:#FFFFFF; --ink:#1C2127; --ink-2:#4B535C; --ink-3:#7A838D;
+  --line:#D9DDD8; --line-2:#E8EBE7; --accent:#3A5A8C; --accent-ink:#2C4670; --accent-soft:#E6ECF5;
+  --ok-bg:#E1F0E4; --ok-ink:#1E5C2E; --ok-line:#9CCBA7;
+  --warn-bg:#FBEFD6; --warn-ink:#7A4E05; --warn-line:#E8C67A;
+  --bad-bg:#F9E1E0; --bad-ink:#8A2521; --bad-line:#E7A19D;
+  --na-bg:#ECEEEC; --na-ink:#4B535C; --na-line:#C9CEC9;
+  --ld-bg:#E9F0E4; --ld-ink:#3D5C1E; --ld-line:#B9CFA0;
+  --code-bg:#EEF0EC;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15181C; --surface:#1C2026; --ink:#E6E8EA; --ink-2:#B4BAC2; --ink-3:#7F8790;
+    --line:#333A42; --line-2:#272D34; --accent:#8FB0E0; --accent-ink:#A9C3EA; --accent-soft:#232C3A;
+    --ok-bg:#1B3122; --ok-ink:#9BD6AA; --ok-line:#2F5B3B;
+    --warn-bg:#3A2D12; --warn-ink:#EAC46F; --warn-line:#6B531F;
+    --bad-bg:#3D1F1E; --bad-ink:#F0A29D; --bad-line:#6E3330;
+    --na-bg:#262B30; --na-ink:#B4BAC2; --na-line:#3E464E;
+    --ld-bg:#26321C; --ld-ink:#BFD69A; --ld-line:#46602C;
+    --code-bg:#242930;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15181C; --surface:#1C2026; --ink:#E6E8EA; --ink-2:#B4BAC2; --ink-3:#7F8790;
+  --line:#333A42; --line-2:#272D34; --accent:#8FB0E0; --accent-ink:#A9C3EA; --accent-soft:#232C3A;
+  --ok-bg:#1B3122; --ok-ink:#9BD6AA; --ok-line:#2F5B3B;
+  --warn-bg:#3A2D12; --warn-ink:#EAC46F; --warn-line:#6B531F;
+  --bad-bg:#3D1F1E; --bad-ink:#F0A29D; --bad-line:#6E3330;
+  --na-bg:#262B30; --na-ink:#B4BAC2; --na-line:#3E464E;
+  --ld-bg:#26321C; --ld-ink:#BFD69A; --ld-line:#46602C;
+  --code-bg:#242930;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:15px;line-height:1.55;margin:0;padding-block:0 4rem;padding-inline:clamp(16px,4vw,40px)}
+.wrap{max-width:1080px;margin:0 auto}
+header.top{padding-block:2.5rem 1.5rem;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+h1{font-family:Archivo,"IBM Plex Sans",system-ui,sans-serif;font-weight:700;font-size:clamp(1.9rem,4vw,2.7rem);line-height:1.1;margin:.35rem 0 .8rem;letter-spacing:-.01em;text-wrap:balance}
+.lede{max-width:68ch;color:var(--ink-2);margin:0 0 1.2rem;font-size:1.02rem}
+.verdict{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);margin:1.4rem 0 0}
+.verdict div{background:var(--surface);padding:.9rem 1rem}
+.verdict .k{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:.3rem}
+.verdict .v{font-family:Archivo,system-ui,sans-serif;font-weight:600;font-size:1.05rem;line-height:1.3}
+nav.toc{display:flex;flex-wrap:wrap;gap:.4rem .9rem;padding-block:1rem;border-bottom:1px solid var(--line-2);font-size:.86rem}
+nav.toc a{color:var(--accent);text-decoration:none;border-bottom:1px solid transparent}
+nav.toc a:hover,nav.toc a:focus-visible{border-bottom-color:var(--accent);outline:none}
+nav.toc a .sec-letter{margin-right:.3rem}
+section{padding-block:2rem 0}
+h2{font-family:Archivo,system-ui,sans-serif;font-weight:600;font-size:1.35rem;margin:0 0 .9rem;letter-spacing:-.005em;text-wrap:balance;display:flex;align-items:baseline;gap:.6rem}
+.sec-letter{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.8rem;font-weight:500;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:.05rem .4rem;letter-spacing:.04em}
+h3{font-family:Archivo,system-ui,sans-serif;font-weight:600;font-size:1.08rem;margin:0 0 .6rem;display:flex;gap:.6rem;align-items:baseline;text-wrap:balance}
+.hid{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.78rem;font-weight:500;color:var(--accent-ink);background:var(--accent-soft);padding:.1rem .45rem;border-radius:3px;flex:none}
+p{max-width:72ch;margin:0 0 .9rem}
+code{font-family:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;font-size:.88em;background:var(--code-bg);padding:.05em .35em;border-radius:3px}
+.tw{overflow-x:auto;margin:0 0 1.2rem;border:1px solid var(--line);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th{text-align:left;font-family:"IBM Plex Mono",ui-monospace,monospace;font-weight:500;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);padding:.55rem .7rem;border-bottom:1px solid var(--line);background:var(--surface);white-space:nowrap}
+td{padding:.5rem .7rem;border-bottom:1px solid var(--line-2);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.id{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.8rem;color:var(--ink-3);white-space:nowrap}
+td.num{font-variant-numeric:tabular-nums;color:var(--ink-2)}
+td.st{white-space:nowrap}
+.pill{display:inline-block;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;padding:.15rem .5rem;border-radius:999px;border:1px solid;line-height:1.5;white-space:normal}
+.pill-measured{background:var(--ok-bg);color:var(--ok-ink);border-color:var(--ok-line)}
+.pill-loaded{background:var(--ld-bg);color:var(--ld-ink);border-color:var(--ld-line)}
+.pill-false{background:var(--bad-bg);color:var(--bad-ink);border-color:var(--bad-line)}
+.pill-inferred,.pill-partial{background:var(--warn-bg);color:var(--warn-ink);border-color:var(--warn-line)}
+.pill-untested,.pill-known{background:var(--na-bg);color:var(--na-ink);border-color:var(--na-line)}
+.avenue{border-left:3px solid var(--accent);padding:.2rem 0 .4rem 1rem;margin:0 0 1.6rem}
+.avenue.closed{border-left-color:var(--bad-line)}
+.avenue.closed p{color:var(--ink-2)}
+dl.fields{margin:0;display:grid;gap:.45rem}
+dl.fields > div{display:grid;grid-template-columns:7.5rem 1fr;gap:.6rem;max-width:80ch}
+dl.fields dt{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.72rem;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);padding-top:.2rem}
+dl.fields dd{margin:0}
+dl.fields div.pred{background:var(--accent-soft);padding:.5rem .6rem;border-radius:4px;margin-inline:-.6rem}
+dl.fields div.pred dt{color:var(--accent-ink)}
+h3.tier{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.78rem;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:1.6rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--line)}
+ol.order{max-width:72ch;padding-left:1.4rem;display:grid;gap:.4rem}
+ol.order li::marker{font-family:"IBM Plex Mono",ui-monospace,monospace;color:var(--accent)}
+@media (max-width:560px){ dl.fields > div{grid-template-columns:1fr;gap:.15rem} .avenue{padding-left:.7rem} }
+@media (prefers-reduced-motion: no-preference){ html{scroll-behavior:smooth} }
+</style>
+<div class="wrap">
+<header class="top">
+  <div class="eyebrow">logos-sort · engines/c 3.6.0 · compiled 2026-09-10</div>
+  <h1>logos-sort Truth Table</h1>
+  <p class="lede">Every claim in the repository, graded by how it was established, followed by the avenues the measurements still leave open. Nothing was re-run; each status is a reading of the project's own record (CLAUDE.md, FINDINGS.md, the C changelog and parity matrix, the paradigm experiments, and the engine source).</p>
+  <div class="verdict">
+    <div><div class="k">Beats</div><div class="v">std::sort, __gnu_parallel::sort, IPS⁴o on every shape</div></div>
+    <div><div class="k">Loses to</div><div class="v">x86-simd-sort (AVX-512) on all unstructured data</div></div>
+    <div><div class="k">Wins only where</div><div class="v">it avoids both comparing and scattering: few_distinct, quantized</div></div>
+    <div><div class="k">Floor is</div><div class="v">per-core scatter latency + pass overhead, not bandwidth</div></div>
+  </div>
+</header>
+<nav class="toc" aria-label="Sections">
+  <a href="#sec-A"><span class="sec-letter">A</span>Position</a>
+  <a href="#sec-B"><span class="sec-letter">B</span>Cost model</a>
+  <a href="#sec-C"><span class="sec-letter">C</span>Negative ledger</a>
+  <a href="#sec-D"><span class="sec-letter">D</span>Positive results</a>
+  <a href="#sec-E"><span class="sec-letter">E</span>Thesis graded</a>
+  <a href="#sec-F"><span class="sec-letter">F</span>Envelope</a>
+  <a href="#sec-G"><span class="sec-letter">G</span>Repo state</a>
+  <a href="#sec-H"><span class="sec-letter">H</span>Avenues</a>
+  <a href="#sec-I"><span class="sec-letter">I</span>Order</a>
+  <a href="#sec-J"><span class="sec-letter">J</span>Speculative</a>
+  <a href="#sec-K"><span class="sec-letter">K</span>Theory vs optimum</a>
+  <a href="#sec-L"><span class="sec-letter">L</span>Literature</a>
+</nav>

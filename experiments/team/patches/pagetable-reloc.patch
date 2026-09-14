@@ -1,0 +1,1074 @@
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x pagebench -x pagerbench -x mmprobe pristine/engines/c/Makefile work/engines/c/Makefile
+--- pristine/engines/c/Makefile	2026-09-12 07:43:39.058111595 -0700
++++ work/engines/c/Makefile	2026-09-12 08:58:39.758656609 -0700
+@@ -356,3 +356,19 @@
+ 
+ clean:
+ 	rm -f $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o logos-sort-c-*.tar.gz
++
++# D1 census (experiments/team/pagetable-reloc.md): a traced engine prints, per relocation, the
++# run-length histogram and the bytes that could move by page-table edit. Run: make pagebench && ./pagebench
++pagebench: pagebench.c $(SRC) $(HDR)
++	$(CC) $(CFLAGS) -DLOGOS_TRACE $(call RENAME,pt) -c $(SRC) -o pt.o
++	$(CC) $(CFLAGS) $(BENCHFLAGS) pagebench.c pt.o -o $@ $(LDLIBS) -lm
++
++# D1 step 2 A/B (experiments/team/pagetable-reloc.md): ONE engine built with -DLOGOS_PAGE_RELOC, whose page path
++# is a runtime toggle (LOGOS_PAGE_RELOC=1), so the two variants share every byte of code. Run: make pagerbench && ./pagerbench
++pagerbench: pagerbench.c $(SRC) $(HDR)
++	$(CC) $(CFLAGS) -DLOGOS_PAGE_RELOC -c $(SRC) -o pr.o
++	$(CC) $(CFLAGS) $(BENCHFLAGS) pagerbench.c pr.o -o $@ $(LDLIBS) -lm
++
++# D1 mechanism probe (no engine): mremap vs memcpy per run, with and without spinning threads and 2 MB alignment. Run: make mmprobe && ./mmprobe 14
++mmprobe: mmprobe.c
++	$(CC) -O2 -pthread mmprobe.c -o $@
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x pagebench -x pagerbench -x mmprobe pristine/engines/c/harness.c work/engines/c/harness.c
+--- pristine/engines/c/harness.c	2026-09-12 07:43:39.254109404 -0700
++++ work/engines/c/harness.c	2026-09-12 08:16:55.095022369 -0700
+@@ -1,265 +1,300 @@
+-/* harness.c — correctness + benchmark harness: logos_psort vs C stdlib qsort.
+- *
+- * Build:  make harness            (or: cc -O3 -pthread logos_psort.c harness.c -o harness -lm)
+- * Run:    ./harness               exit code 0 = every correctness check passed
+- *
+- * CORRECTNESS: for every (distribution x size x thread count), the data is sorted
+- * by logos_sort* and, independently, by qsort. The two outputs must agree
+- * element-for-element, and an XOR checksum proves the output is a permutation
+- * of the input (nothing lost, nothing invented). qsort is the oracle.
+- *
+- * BENCHMARK: best-of-k wall time of qsort vs logos at 1 thread and at N
+- * threads, across data shapes that exercise different paths (uniform, nearly
+- * sorted, clustered, heavy-tailed, low-cardinality).
+- */
+-#define _GNU_SOURCE
+-#include "logos_psort.h"
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <math.h>
+-#include <time.h>
+-
+-/* ---- deterministic RNG (xorshift64) ---- */
+-static uint64_t RS;
+-static void seed(uint64_t s) { RS = s ? s : 1; }
+-static uint64_t nextr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
+-static double frand(void) { return (double)(nextr() >> 11) / (double)(1ULL << 53); }
+-
+-static double now_ms(void) {
+-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+-    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+-}
+-
+-/* ---- qsort comparators (the reference) ---- */
+-static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+-static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
+-
+-/* ---- data shapes ---- */
+-enum { D_UNIFORM, D_SORTED, D_REVERSE, D_NEARSORT, D_FEWDIST, D_EQUAL, D_NEG, D_SKEWED, D_CLUSTER,
+-       D_SEGMENTED, D_FEWRUNS, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER, D_N };
+-static const char *DNAME[D_N] = { "uniform", "sorted", "reverse", "near_sorted", "few_distinct",
+-                                  "all_equal", "negatives", "heavy_tail", "clustered",
+-                                  "segmented", "few_runs", "prefix_shuffle", "bimodal", "quantized", "int_wide", "mod_card_30k",
+-                                  "block_perm", "block_overlap" };
+-
+-static void gen(double *a, size_t n, int d) {
+-    size_t i;
+-    switch (d) {
+-    case D_UNIFORM:  for (i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9; break;
+-    case D_SORTED:   for (i = 0; i < n; i++) a[i] = (double)i; break;
+-    case D_REVERSE:  for (i = 0; i < n; i++) a[i] = (double)(n - i); break;
+-    case D_NEARSORT: for (i = 0; i < n; i++) a[i] = (double)i;
+-                     for (i = 0; n > 0 && i < n / 100; i++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
+-                     break;
+-    case D_FEWDIST:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 5) * 1e6; break;
+-    case D_EQUAL:    for (i = 0; i < n; i++) a[i] = 42.0; break;
+-    case D_NEG:      for (i = 0; i < n; i++) a[i] = frand() * 2e6 - 1e6; break;
+-    case D_SKEWED:   for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); break; /* Pareto tail */
+-    case D_CLUSTER:  for (i = 0; i < n; i++) { double s = 0; int k; for (k = 0; k < 4; k++) s += frand(); a[i] = (s - 2.0) * 1e6; } break;
+-    /* many (>=16) sorted blocks -> 4-way merge path */
+-    case D_SEGMENTED: { size_t blk = n / 64 ? n / 64 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 64.0 + (double)(i / blk); } break;
+-    /* 2-8 long runs -> galloping 2-way merge */
+-    case D_FEWRUNS:  { size_t blk = n / 4 ? n / 4 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 4.0 + (double)(i / blk); } break;
+-    /* sorted with the first 10% shuffled -> momentum insertion must ABORT and fall through */
+-    case D_PREFIXSHUF: for (i = 0; i < n; i++) a[i] = (double)i;
+-                       { size_t m = n / 10; for (i = m; i > 1; i--) { size_t j = nextr() % i; double t = a[i - 1]; a[i - 1] = a[j]; a[j] = t; } } break;
+-    /* two tight clusters far apart -> gap-split partition */
+-    case D_BIMODAL:  for (i = 0; i < n; i++) a[i] = (nextr() & 1 ? 1e9 : -1e9) + frand() * 10.0; break;
+-    /* dyadic fractions (few active mantissa bytes) -> quantized float radix */
+-    case D_QUANTIZED: for (i = 0; i < n; i++) a[i] = (double)(nextr() % 4096) / 64.0; break;
+-    /* integer-valued doubles across the full int32 range -> byte-skip int32 radix */
+-    case D_INTWIDE:  for (i = 0; i < n; i++) a[i] = (double)(int32_t)nextr(); break;
+-    /* ~30k distinct non-integer values -> moderate-cardinality hash-map counting */
+-    case D_MODCARD:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 30000) * 1.5; break;
+-    /* 64 sorted blocks with DISJOINT value ranges, concatenated in shuffled order (merged log
+-     * partitions) -> disjoint-run relocation (J5): memcpy, no merge. Fractional values so the
+-     * quantized-radix probe does not claim them first. block_overlap: every value-block whose
+-     * index is 1 mod 8 starts 10% inside its predecessor, so a quarter of the data sits in
+-     * two-run chains and the chain-merge path runs. */
+-    case D_BLOCKPERM: case D_BLOCKOVER: {
+-        size_t nb = 64, blk = (n + nb - 1) / nb; if (blk < 1) blk = 1;
+-        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
+-        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
+-        for (i = 0; i < n; i++) {
+-            size_t b = perm[i / blk]; double base = (double)b * (double)blk;
+-            if (d == D_BLOCKOVER && (b & 7) == 1) base -= (double)blk * 0.1;
+-            a[i] = base + (double)(i % blk) + frand() * 0.5;
+-        }
+-    } break;
+-    }
+-}
+-
+-/* XOR of raw bits: invariant under permutation, so equal-before/after proves
+-   the output is a rearrangement of the input. */
+-static uint64_t xsum(const double *a, size_t n) {
+-    uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x;
+-}
+-
+-/* ================= correctness ================= */
+-static int correctness(void) {
+-    const size_t sizes[] = { 0, 1, 2, 63, 64, 65, 1000, 50000, 1000000 };
+-    const int threads[] = { 1, 2, 4, 8 };
+-    int checks = 0, fails = 0;
+-    seed(0x9E3779B97F4A7C15ULL);
+-
+-    printf("== correctness: logos vs qsort (double) ==\n");
+-    for (int d = 0; d < D_N; d++) {
+-        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+-            size_t n = sizes[si];
+-            double *orig = malloc((n ? n : 1) * sizeof(double));
+-            double *ref  = malloc((n ? n : 1) * sizeof(double));
+-            gen(orig, n, d);
+-            memcpy(ref, orig, n * sizeof(double));
+-            qsort(ref, n, sizeof(double), cmp_d);              /* the oracle */
+-            uint64_t before = xsum(orig, n);
+-            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+-                double *a = malloc((n ? n : 1) * sizeof(double));
+-                memcpy(a, orig, n * sizeof(double));
+-                logos_sort_f64(a, n, threads[ti]);
+-                int ok = xsum(a, n) == before;
+-                for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
+-                checks++;
+-                if (!ok) { fails++; printf("  FAIL  shape=%-12s n=%-8zu threads=%d\n", DNAME[d], n, threads[ti]); }
+-                free(a);
+-            }
+-            free(orig); free(ref);
+-        }
+-    }
+-    printf("  double: %d checks, %d failures\n", checks, fails);
+-
+-    printf("== correctness: logos vs qsort (int32) ==\n");
+-    int ichecks = 0, ifails = 0;
+-    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
+-    /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
+-       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
+-       INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
+-       narrow bulk. See FINDINGS 3w. */
+-    for (int mode = 0; mode < 12; mode++) {
+-        for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
+-            size_t n = isz[si];
+-            int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
+-            int32_t *ref  = malloc((n ? n : 1) * sizeof(int32_t));
+-            for (size_t i = 0; i < n; i++) {
+-                uint64_t r = nextr();
+-                switch (mode) {
+-                case 0:  orig[i] = (int32_t)r;                  break;   /* full range */
+-                case 1:  orig[i] = (int32_t)(r % 7) - 3;        break;   /* few distinct, signed */
+-                case 2:  orig[i] = (int32_t)i;                  break;   /* already sorted */
+-                case 3:  orig[i] = 42;                          break;   /* span 1: route declines */
+-                case 4:  orig[i] = (int32_t)(r & 1);            break;   /* span 2: smallest accepted */
+-                case 5:  orig[i] = (int32_t)(r % 262144);       break;   /* span == the table cap */
+-                case 6:  orig[i] = (int32_t)(r % 262145);       break;   /* one past the cap: declines */
+-                case 7:  orig[i] = -(int32_t)(r % 100) - 1;     break;   /* all negative */
+-                case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
+-                case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
+-                case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
+-                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
+-                }
+-            }
+-            if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
+-            memcpy(ref, orig, n * sizeof(int32_t));
+-            qsort(ref, n, sizeof(int32_t), cmp_i);
+-            for (int t = 1; t <= 16; t *= 4) {
+-                int32_t *a = malloc((n ? n : 1) * sizeof(int32_t));
+-                memcpy(a, orig, n * sizeof(int32_t));
+-                logos_sort_i32(a, n, t);
+-                int ok = memcmp(a, ref, n * sizeof(int32_t)) == 0;
+-                ichecks++;
+-                if (!ok) { ifails++; printf("  FAIL  int32 mode=%d n=%zu threads=%d\n", mode, n, t); }
+-                free(a);
+-            }
+-            free(orig); free(ref);
+-        }
+-    }
+-    printf("  int32:  %d checks, %d failures\n\n", ichecks, ifails);
+-    return fails + ifails;
+-}
+-
+-/* ================= benchmark ================= */
+-static double best_qsort(const double *base, size_t n, int reps) {
+-    double best = 1e300; double *a = malloc(n * sizeof(double));
+-    for (int r = 0; r < reps; r++) { memcpy(a, base, n * sizeof(double)); double t = now_ms(); qsort(a, n, sizeof(double), cmp_d); t = now_ms() - t; if (t < best) best = t; }
+-    free(a); return best;
+-}
+-static double best_logos(const double *base, size_t n, int threads, int reps) {
+-    double best = 1e300; double *a = malloc(n * sizeof(double));
+-    for (int r = 0; r < reps; r++) {
+-        memcpy(a, base, n * sizeof(double)); double t = now_ms(); logos_sort_f64(a, n, threads); t = now_ms() - t;
+-        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { printf("  !! unsorted output in benchmark\n"); break; }
+-        if (t < best) best = t;
+-    }
+-    free(a); return best;
+-}
+-
+-static void benchmark(void) {
+-    int cpus = logos_num_cpus();
+-    int P = cpus > 1 ? cpus : 4;            /* on a 1-core box, P=4 shows overhead honestly */
+-    const size_t sizes[] = { 1000000, 8000000 };
+-    const int dists[] = { D_UNIFORM, D_NEARSORT, D_CLUSTER, D_FEWDIST, D_SKEWED, D_SEGMENTED, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER };
+-
+-    printf("== benchmark: double, best-of-k wall time (online CPUs: %d) ==\n", cpus);
+-    printf("  %-12s %6s   %9s   %11s %7s   %11s %7s\n", "shape", "n", "qsort", "logos t=1", "x", "logos t=" , "x");
+-    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+-        size_t n = sizes[si]; int reps = n >= 8000000 ? 2 : 3;
+-        double *base = malloc(n * sizeof(double));
+-        for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
+-            seed(7); gen(base, n, dists[di]);
+-            double tq = best_qsort(base, n, reps);
+-            double t1 = best_logos(base, n, 1, reps);
+-            double tp = best_logos(base, n, P, reps);
+-            printf("  %-12s %5zuM   %7.1fms   %9.1fms %6.2fx   %7.1fms(%d) %6.2fx\n",
+-                   DNAME[dists[di]], n / 1000000, tq, t1, tq / t1, tp, P, tq / tp);
+-        }
+-        free(base);
+-    }
+-
+-    /* int32 */
+-    size_t n = 8000000; int32_t *bi = malloc(n * sizeof(int32_t));
+-    seed(11); for (size_t i = 0; i < n; i++) bi[i] = (int32_t)nextr();
+-    double tq = 1e300, tl = 1e300; int32_t *a = malloc(n * sizeof(int32_t));
+-    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); qsort(a, n, 4, cmp_i); t = now_ms() - t; if (t < tq) tq = t; }
+-    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); logos_sort_i32(a, n, 1); t = now_ms() - t; if (t < tl) tl = t; }
+-    printf("\n== benchmark: int32 8M uniform ==\n  qsort %7.1fms   logos t=1 %7.1fms   %.2fx\n", tq, tl, tq / tl);
+-    free(a); free(bi);
+-
+-    if (cpus == 1)
+-        printf("\n  note: this machine has ONE core. The t=%d column measures thread-coordination\n"
+-               "  overhead, not parallel speedup; on real cores it drops toward t=1 / cores.\n", P);
+-}
+-
+-
+-/* ---- parity extras: argSort family, findOutliers, strings ---- */
+-static int extras_checks(void) {
+-    int fails = 0, checks = 0;
+-    seed(0xC0FFEE);
+-    for (size_t n = 1; n <= 200000; n = n * 17 + 1) {
+-        double *a = malloc(n * 8); uint32_t *p = malloc(n * 4);
+-        for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 40);
+-        logos_argsort_f64(a, n, p);
+-        int ok = 1; char *seen = calloc(n, 1);
+-        for (size_t i = 0; i < n; i++) { if (p[i] >= n || seen[p[i]]) { ok = 0; break; } seen[p[i]] = 1; }
+-        for (size_t i = 1; ok && i < n; i++) { if (a[p[i-1]] > a[p[i]]) ok = 0; else if (a[p[i-1]] == a[p[i]] && p[i-1] > p[i]) ok = 0; }
+-        free(seen); checks++; if (!ok) { fails++; printf("  FAIL argsort_f64 n=%zu\n", n); }
+-        free(a); free(p);
+-    }
+-    { size_t n = 200000; double *a = malloc(n * 8); for (size_t i = 0; i < n; i++) a[i] = (double)i;
+-      a[7] = 1e18; a[n - 4] = -1e18; uint32_t out[16]; size_t c = logos_find_outliers_f64(a, n, out, 16, 0);
+-      int f7 = 0, fn = 0; for (size_t i = 0; i < c && i < 16; i++) { if (out[i] == 7) f7 = 1; if (out[i] == n - 4) fn = 1; }
+-      checks++; if (!(c >= 2 && f7 && fn)) { fails++; printf("  FAIL findOutliers\n"); } free(a); }
+-    { const char *s[] = {"delta","alpha","charlie","alpha","","bravo","al"}; size_t n = 7; logos_sort_strings(s, n);
+-      int ok = 1; for (size_t i = 1; i < n; i++) if (strcmp(s[i-1], s[i]) > 0) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL strings\n"); } }
+-    printf("  extras: %d checks, %d failures\n", checks, fails);
+-    return fails;
+-}
+-
+-int main(void) {
+-    printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
+-    int fails = correctness();
+-    printf("== parity extras ==\n");
+-    fails += extras_checks();
+-    printf("\n");
+-    benchmark();
+-    printf("\n%s\n", fails ? "RESULT: CORRECTNESS FAILURES — do not ship" : "RESULT: all correctness checks passed");
+-    return fails ? 1 : 0;
+-}
++/* harness.c — correctness + benchmark harness: logos_psort vs C stdlib qsort.
++ *
++ * Build:  make harness            (or: cc -O3 -pthread logos_psort.c harness.c -o harness -lm)
++ * Run:    ./harness               exit code 0 = every correctness check passed
++ *
++ * CORRECTNESS: for every (distribution x size x thread count), the data is sorted
++ * by logos_sort* and, independently, by qsort. The two outputs must agree
++ * element-for-element, and an XOR checksum proves the output is a permutation
++ * of the input (nothing lost, nothing invented). qsort is the oracle.
++ *
++ * BENCHMARK: best-of-k wall time of qsort vs logos at 1 thread and at N
++ * threads, across data shapes that exercise different paths (uniform, nearly
++ * sorted, clustered, heavy-tailed, low-cardinality).
++ */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <time.h>
++
++/* ---- deterministic RNG (xorshift64) ---- */
++static uint64_t RS;
++static void seed(uint64_t s) { RS = s ? s : 1; }
++static uint64_t nextr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double frand(void) { return (double)(nextr() >> 11) / (double)(1ULL << 53); }
++
++static double now_ms(void) {
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++/* ---- qsort comparators (the reference) ---- */
++static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
++static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
++
++/* ---- data shapes ---- */
++enum { D_UNIFORM, D_SORTED, D_REVERSE, D_NEARSORT, D_FEWDIST, D_EQUAL, D_NEG, D_SKEWED, D_CLUSTER,
++       D_SEGMENTED, D_FEWRUNS, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER, D_BLOCKPAGE, D_N };
++static const char *DNAME[D_N] = { "uniform", "sorted", "reverse", "near_sorted", "few_distinct",
++                                  "all_equal", "negatives", "heavy_tail", "clustered",
++                                  "segmented", "few_runs", "prefix_shuffle", "bimodal", "quantized", "int_wide", "mod_card_30k",
++                                  "block_perm", "block_overlap", "block_4MB" };
++
++/* sorted blocks of blk elements with disjoint value ranges, concatenated in shuffled order (the last one ragged) */
++static void gen_fixed_blocks(double *a, size_t n, size_t blk) {
++    size_t nb = (n + blk - 1) / blk; if (nb < 1) nb = 1;
++    size_t *perm = malloc(nb * sizeof(size_t)); for (size_t k = 0; k < nb; k++) perm[k] = k;
++    for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
++    for (size_t i = 0; i < n; i++) { size_t b = perm[i / blk]; a[i] = (double)b * (double)blk + (double)(i % blk) + frand() * 0.5; }
++    free(perm);
++}
++static void gen(double *a, size_t n, int d) {
++    size_t i;
++    switch (d) {
++    case D_UNIFORM:  for (i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9; break;
++    case D_SORTED:   for (i = 0; i < n; i++) a[i] = (double)i; break;
++    case D_REVERSE:  for (i = 0; i < n; i++) a[i] = (double)(n - i); break;
++    case D_NEARSORT: for (i = 0; i < n; i++) a[i] = (double)i;
++                     for (i = 0; n > 0 && i < n / 100; i++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
++                     break;
++    case D_FEWDIST:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 5) * 1e6; break;
++    case D_EQUAL:    for (i = 0; i < n; i++) a[i] = 42.0; break;
++    case D_NEG:      for (i = 0; i < n; i++) a[i] = frand() * 2e6 - 1e6; break;
++    case D_SKEWED:   for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); break; /* Pareto tail */
++    case D_CLUSTER:  for (i = 0; i < n; i++) { double s = 0; int k; for (k = 0; k < 4; k++) s += frand(); a[i] = (s - 2.0) * 1e6; } break;
++    /* many (>=16) sorted blocks -> 4-way merge path */
++    case D_SEGMENTED: { size_t blk = n / 64 ? n / 64 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 64.0 + (double)(i / blk); } break;
++    /* 2-8 long runs -> galloping 2-way merge */
++    case D_FEWRUNS:  { size_t blk = n / 4 ? n / 4 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 4.0 + (double)(i / blk); } break;
++    /* sorted with the first 10% shuffled -> momentum insertion must ABORT and fall through */
++    case D_PREFIXSHUF: for (i = 0; i < n; i++) a[i] = (double)i;
++                       { size_t m = n / 10; for (i = m; i > 1; i--) { size_t j = nextr() % i; double t = a[i - 1]; a[i - 1] = a[j]; a[j] = t; } } break;
++    /* two tight clusters far apart -> gap-split partition */
++    case D_BIMODAL:  for (i = 0; i < n; i++) a[i] = (nextr() & 1 ? 1e9 : -1e9) + frand() * 10.0; break;
++    /* dyadic fractions (few active mantissa bytes) -> quantized float radix */
++    case D_QUANTIZED: for (i = 0; i < n; i++) a[i] = (double)(nextr() % 4096) / 64.0; break;
++    /* integer-valued doubles across the full int32 range -> byte-skip int32 radix */
++    case D_INTWIDE:  for (i = 0; i < n; i++) a[i] = (double)(int32_t)nextr(); break;
++    /* ~30k distinct non-integer values -> moderate-cardinality hash-map counting */
++    case D_MODCARD:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 30000) * 1.5; break;
++    /* 64 sorted blocks with DISJOINT value ranges, concatenated in shuffled order (merged log
++     * partitions) -> disjoint-run relocation (J5): memcpy, no merge. Fractional values so the
++     * quantized-radix probe does not claim them first. block_overlap: every value-block whose
++     * index is 1 mod 8 starts 10% inside its predecessor, so a quarter of the data sits in
++     * two-run chains and the chain-merge path runs. */
++    case D_BLOCKPERM: case D_BLOCKOVER: {
++        size_t nb = 64, blk = (n + nb - 1) / nb; if (blk < 1) blk = 1;
++        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
++        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
++        for (i = 0; i < n; i++) {
++            size_t b = perm[i / blk]; double base = (double)b * (double)blk;
++            if (d == D_BLOCKOVER && (b & 7) == 1) base -= (double)blk * 0.1;
++            a[i] = base + (double)(i % blk) + frand() * 0.5;
++        }
++    } break;
++    /* sorted blocks of a FIXED 4 MB (524288 elements), shuffled: the block size is a 2 MB multiple, so
++     * with -DLOGOS_PAGE_RELOC and LOGOS_PAGE_RELOC=1 the relocation route moves whole 2 MB units by
++     * page table (experiments/team/pagetable-reloc.md). Below one block it is simply sorted data;
++     * at 1M it is two runs of unequal length with a ragged last block. */
++    case D_BLOCKPAGE: gen_fixed_blocks(a, n, 524288); break;
++    }
++}
++
++/* XOR of raw bits: invariant under permutation, so equal-before/after proves
++   the output is a rearrangement of the input. */
++static uint64_t xsum(const double *a, size_t n) {
++    uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x;
++}
++
++/* ================= correctness ================= */
++static int correctness(void) {
++    const size_t sizes[] = { 0, 1, 2, 63, 64, 65, 1000, 50000, 1000000 };
++    const int threads[] = { 1, 2, 4, 8 };
++    int checks = 0, fails = 0;
++    seed(0x9E3779B97F4A7C15ULL);
++
++    printf("== correctness: logos vs qsort (double) ==\n");
++    for (int d = 0; d < D_N; d++) {
++        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++            size_t n = sizes[si];
++            double *orig = malloc((n ? n : 1) * sizeof(double));
++            double *ref  = malloc((n ? n : 1) * sizeof(double));
++            gen(orig, n, d);
++            memcpy(ref, orig, n * sizeof(double));
++            qsort(ref, n, sizeof(double), cmp_d);              /* the oracle */
++            uint64_t before = xsum(orig, n);
++            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
++                double *a = malloc((n ? n : 1) * sizeof(double));
++                memcpy(a, orig, n * sizeof(double));
++                logos_sort_f64(a, n, threads[ti]);
++                int ok = xsum(a, n) == before;
++                for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
++                checks++;
++                if (!ok) { fails++; printf("  FAIL  shape=%-12s n=%-8zu threads=%d\n", DNAME[d], n, threads[ti]); }
++                free(a);
++            }
++            free(orig); free(ref);
++        }
++    }
++    /* Page-table relocation edges (-DLOGOS_PAGE_RELOC; a no-op toggle otherwise): 4 MB blocks on a 32 MB
++       array (8 runs, one whole 2 MB unit each once the malloc'd base's 16-byte page offset is accounted
++       for), and 6 MB blocks (5 whole runs and a 2 MB ragged tail, two units each, phase match by 6 MB
++       being a 2 MB multiple). The toggle is set and cleared here so `make test` covers both. */
++    { const size_t blks[] = { 524288, 786432 }; const int pthr[] = { 1, 8 }; const size_t n = (size_t)1 << 22;
++      for (int on = 0; on < 2; on++) for (size_t bi = 0; bi < 2; bi++) {
++          double *orig = malloc(n * sizeof(double)), *ref = malloc(n * sizeof(double));
++          gen_fixed_blocks(orig, n, blks[bi]); memcpy(ref, orig, n * sizeof(double)); qsort(ref, n, sizeof(double), cmp_d);
++          uint64_t before = xsum(orig, n);
++          for (int ti = 0; ti < 2; ti++) {
++              double *a = malloc(n * sizeof(double)); memcpy(a, orig, n * sizeof(double));
++              if (on) setenv("LOGOS_PAGE_RELOC", "1", 1); else unsetenv("LOGOS_PAGE_RELOC");
++              logos_sort_f64(a, n, pthr[ti]);
++              unsetenv("LOGOS_PAGE_RELOC");
++              int ok = xsum(a, n) == before;
++              for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
++              checks++;
++              if (!ok) { fails++; printf("  FAIL  shape=block_%zu(page toggle %s) n=%zu threads=%d\n", blks[bi] * 8 >> 20, on ? "on" : "off", n, pthr[ti]); }
++              free(a);
++          }
++          free(orig); free(ref);
++      } }
++    printf("  double: %d checks, %d failures\n", checks, fails);
++
++    printf("== correctness: logos vs qsort (int32) ==\n");
++    int ichecks = 0, ifails = 0;
++    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
++    /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
++       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
++       INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
++       narrow bulk. See FINDINGS 3w. */
++    for (int mode = 0; mode < 12; mode++) {
++        for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
++            size_t n = isz[si];
++            int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
++            int32_t *ref  = malloc((n ? n : 1) * sizeof(int32_t));
++            for (size_t i = 0; i < n; i++) {
++                uint64_t r = nextr();
++                switch (mode) {
++                case 0:  orig[i] = (int32_t)r;                  break;   /* full range */
++                case 1:  orig[i] = (int32_t)(r % 7) - 3;        break;   /* few distinct, signed */
++                case 2:  orig[i] = (int32_t)i;                  break;   /* already sorted */
++                case 3:  orig[i] = 42;                          break;   /* span 1: route declines */
++                case 4:  orig[i] = (int32_t)(r & 1);            break;   /* span 2: smallest accepted */
++                case 5:  orig[i] = (int32_t)(r % 262144);       break;   /* span == the table cap */
++                case 6:  orig[i] = (int32_t)(r % 262145);       break;   /* one past the cap: declines */
++                case 7:  orig[i] = -(int32_t)(r % 100) - 1;     break;   /* all negative */
++                case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
++                case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
++                case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
++                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
++                }
++            }
++            if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
++            memcpy(ref, orig, n * sizeof(int32_t));
++            qsort(ref, n, sizeof(int32_t), cmp_i);
++            for (int t = 1; t <= 16; t *= 4) {
++                int32_t *a = malloc((n ? n : 1) * sizeof(int32_t));
++                memcpy(a, orig, n * sizeof(int32_t));
++                logos_sort_i32(a, n, t);
++                int ok = memcmp(a, ref, n * sizeof(int32_t)) == 0;
++                ichecks++;
++                if (!ok) { ifails++; printf("  FAIL  int32 mode=%d n=%zu threads=%d\n", mode, n, t); }
++                free(a);
++            }
++            free(orig); free(ref);
++        }
++    }
++    printf("  int32:  %d checks, %d failures\n\n", ichecks, ifails);
++    return fails + ifails;
++}
++
++/* ================= benchmark ================= */
++static double best_qsort(const double *base, size_t n, int reps) {
++    double best = 1e300; double *a = malloc(n * sizeof(double));
++    for (int r = 0; r < reps; r++) { memcpy(a, base, n * sizeof(double)); double t = now_ms(); qsort(a, n, sizeof(double), cmp_d); t = now_ms() - t; if (t < best) best = t; }
++    free(a); return best;
++}
++static double best_logos(const double *base, size_t n, int threads, int reps) {
++    double best = 1e300; double *a = malloc(n * sizeof(double));
++    for (int r = 0; r < reps; r++) {
++        memcpy(a, base, n * sizeof(double)); double t = now_ms(); logos_sort_f64(a, n, threads); t = now_ms() - t;
++        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { printf("  !! unsorted output in benchmark\n"); break; }
++        if (t < best) best = t;
++    }
++    free(a); return best;
++}
++
++static void benchmark(void) {
++    int cpus = logos_num_cpus();
++    int P = cpus > 1 ? cpus : 4;            /* on a 1-core box, P=4 shows overhead honestly */
++    const size_t sizes[] = { 1000000, 8000000 };
++    const int dists[] = { D_UNIFORM, D_NEARSORT, D_CLUSTER, D_FEWDIST, D_SKEWED, D_SEGMENTED, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER };
++
++    printf("== benchmark: double, best-of-k wall time (online CPUs: %d) ==\n", cpus);
++    printf("  %-12s %6s   %9s   %11s %7s   %11s %7s\n", "shape", "n", "qsort", "logos t=1", "x", "logos t=" , "x");
++    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++        size_t n = sizes[si]; int reps = n >= 8000000 ? 2 : 3;
++        double *base = malloc(n * sizeof(double));
++        for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
++            seed(7); gen(base, n, dists[di]);
++            double tq = best_qsort(base, n, reps);
++            double t1 = best_logos(base, n, 1, reps);
++            double tp = best_logos(base, n, P, reps);
++            printf("  %-12s %5zuM   %7.1fms   %9.1fms %6.2fx   %7.1fms(%d) %6.2fx\n",
++                   DNAME[dists[di]], n / 1000000, tq, t1, tq / t1, tp, P, tq / tp);
++        }
++        free(base);
++    }
++
++    /* int32 */
++    size_t n = 8000000; int32_t *bi = malloc(n * sizeof(int32_t));
++    seed(11); for (size_t i = 0; i < n; i++) bi[i] = (int32_t)nextr();
++    double tq = 1e300, tl = 1e300; int32_t *a = malloc(n * sizeof(int32_t));
++    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); qsort(a, n, 4, cmp_i); t = now_ms() - t; if (t < tq) tq = t; }
++    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); logos_sort_i32(a, n, 1); t = now_ms() - t; if (t < tl) tl = t; }
++    printf("\n== benchmark: int32 8M uniform ==\n  qsort %7.1fms   logos t=1 %7.1fms   %.2fx\n", tq, tl, tq / tl);
++    free(a); free(bi);
++
++    if (cpus == 1)
++        printf("\n  note: this machine has ONE core. The t=%d column measures thread-coordination\n"
++               "  overhead, not parallel speedup; on real cores it drops toward t=1 / cores.\n", P);
++}
++
++
++/* ---- parity extras: argSort family, findOutliers, strings ---- */
++static int extras_checks(void) {
++    int fails = 0, checks = 0;
++    seed(0xC0FFEE);
++    for (size_t n = 1; n <= 200000; n = n * 17 + 1) {
++        double *a = malloc(n * 8); uint32_t *p = malloc(n * 4);
++        for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 40);
++        logos_argsort_f64(a, n, p);
++        int ok = 1; char *seen = calloc(n, 1);
++        for (size_t i = 0; i < n; i++) { if (p[i] >= n || seen[p[i]]) { ok = 0; break; } seen[p[i]] = 1; }
++        for (size_t i = 1; ok && i < n; i++) { if (a[p[i-1]] > a[p[i]]) ok = 0; else if (a[p[i-1]] == a[p[i]] && p[i-1] > p[i]) ok = 0; }
++        free(seen); checks++; if (!ok) { fails++; printf("  FAIL argsort_f64 n=%zu\n", n); }
++        free(a); free(p);
++    }
++    { size_t n = 200000; double *a = malloc(n * 8); for (size_t i = 0; i < n; i++) a[i] = (double)i;
++      a[7] = 1e18; a[n - 4] = -1e18; uint32_t out[16]; size_t c = logos_find_outliers_f64(a, n, out, 16, 0);
++      int f7 = 0, fn = 0; for (size_t i = 0; i < c && i < 16; i++) { if (out[i] == 7) f7 = 1; if (out[i] == n - 4) fn = 1; }
++      checks++; if (!(c >= 2 && f7 && fn)) { fails++; printf("  FAIL findOutliers\n"); } free(a); }
++    { const char *s[] = {"delta","alpha","charlie","alpha","","bravo","al"}; size_t n = 7; logos_sort_strings(s, n);
++      int ok = 1; for (size_t i = 1; i < n; i++) if (strcmp(s[i-1], s[i]) > 0) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL strings\n"); } }
++    printf("  extras: %d checks, %d failures\n", checks, fails);
++    return fails;
++}
++
++int main(void) {
++    printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
++    int fails = correctness();
++    printf("== parity extras ==\n");
++    fails += extras_checks();
++    printf("\n");
++    benchmark();
++    printf("\n%s\n", fails ? "RESULT: CORRECTNESS FAILURES — do not ship" : "RESULT: all correctness checks passed");
++    return fails ? 1 : 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x pagebench -x pagerbench -x mmprobe pristine/engines/c/logos_psort.c work/engines/c/logos_psort.c
+--- pristine/engines/c/logos_psort.c	2026-09-12 07:43:38.886113525 -0700
++++ work/engines/c/logos_psort.c	2026-09-12 09:45:08.486093052 -0700
+@@ -3187,7 +3187,8 @@
+     free(w); free(th); *n_runs = R; return runs;
+ }
+ 
+-typedef struct { double *a, *dst; size_t n, R, nc; int P, t; const rdesc_t *d; const size_t *off, *ch, *rl; atomic_size_t *next; barrier_t *bar; } reloc_arg_t;
++typedef struct { double *a, *dst; size_t n, R, nc; int P, t; const rdesc_t *d; const size_t *off, *ch, *rl; atomic_size_t *next; barrier_t *bar;
++                 const size_t *mlo, *mhi; } reloc_arg_t;   /* mlo/mhi: per run, the dst element window already moved by page table (LOGOS_PAGE_RELOC), else NULL */
+ static void *reloc_worker(void *p) {
+     reloc_arg_t *w = p; size_t n = w->n; int P = w->P;
+     size_t lo = (size_t)w->t * n / P, hi = (size_t)(w->t + 1) * n / P;
+@@ -3196,7 +3197,10 @@
+     { size_t q = 0; while (q < w->R && w->off[q] + w->d[q].len <= lo) q++;
+       for (; q < w->R && w->off[q] < hi; q++) {
+           size_t ds = w->off[q] > lo ? w->off[q] : lo, de = w->off[q] + w->d[q].len < hi ? w->off[q] + w->d[q].len : hi;
+-          memcpy(w->dst + ds, w->a + w->d[q].start + (ds - w->off[q]), (de - ds) * sizeof(double)); } }
++          if (!w->mlo) { memcpy(w->dst + ds, w->a + w->d[q].start + (ds - w->off[q]), (de - ds) * sizeof(double)); continue; }
++          { size_t ml = w->mlo[q], mh = w->mhi[q];                                   /* page mode: the window [ml, mh) is already in dst and a hole in a[] */
++            if (ds < ml) { size_t e1 = de < ml ? de : ml; memcpy(w->dst + ds, w->a + w->d[q].start + (ds - w->off[q]), (e1 - ds) * sizeof(double)); }
++            if (de > mh) { size_t s2 = ds > mh ? ds : mh; memcpy(w->dst + s2, w->a + w->d[q].start + (s2 - w->off[q]), (de - s2) * sizeof(double)); } } } }
+     PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s0); double t1 = prof_now();)
+     if (P > 1) barrier_wait(w->bar);
+     PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t1); prof_stamp_t s2 = prof_stamp();)
+@@ -3209,15 +3213,178 @@
+     PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s2); double t3 = prof_now();)
+     if (P > 1) barrier_wait(w->bar);
+     PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t3); prof_stamp_t s4 = prof_stamp();)
+-    /* phase 3: copy back */
+-    memcpy(w->a + lo, w->dst + lo, (hi - lo) * sizeof(double));
++    /* phase 3: copy back (page mode: the caller moves the units back after the join) */
++    if (!w->mlo) memcpy(w->a + lo, w->dst + lo, (hi - lo) * sizeof(double));
+     PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s4);)
+     return NULL;
+ }
+ 
++/* ---- D1 census (-DLOGOS_TRACE): could the runs move by page-table edit instead of memcpy? ----
++ * A run can be relocated with mremap only if its source and destination byte offsets share the
++ * same phase modulo the page size; then the whole pages strictly inside it move by PTE (4 KB) or,
++ * when the phase also matches modulo 2 MB, by PMD. Reported per sort: run-length histogram, the
++ * bytes whose phase matches, the bytes that would actually move at each granularity, and the
++ * absolute alignment of both arrays (malloc's mmap'd chunks start 16 bytes into a page).
++ * "dst at a's phase" counts as if the scratch were placed at a's page phase, which an
++ * implementation would do; "actual ptrs" uses the pointers as they are.
++ * See experiments/team/pagetable-reloc.md. */
++#ifdef LOGOS_TRACE
++static size_t reloc_movable_bytes(uintptr_t s, uintptr_t t, size_t len, uintptr_t G) {
++    if ((s - t) % G != 0) return 0;
++    uintptr_t lo = (s + G - 1) / G * G, hi = (s + len) / G * G;
++    return hi > lo ? (size_t)(hi - lo) : 0;
++}
++static void reloc_align_census(const double *a, const double *dst, const rdesc_t *d, const size_t *off, size_t R, size_t n) {
++    static const char *HN[] = { "<4K", "4K-64K", "64K-256K", "256K-1M", "1M-4M", "4M-16M", ">=16M" };
++    size_t hc[7] = { 0 }, hb[7] = { 0 };
++    size_t ph4 = 0, ph2m = 0, mv4 = 0, mv2m = 0, mv4_act = 0, mv2m_act = 0, fixed = 0, fixed_b = 0, rmax = 0, rmin = (size_t)-1;
++    uintptr_t A = (uintptr_t)a, D = (uintptr_t)dst; const uintptr_t M2 = (uintptr_t)2 << 20;
++    for (size_t q = 0; q < R; q++) {
++        size_t L = d[q].len * sizeof(double);
++        uintptr_t s = A + d[q].start * sizeof(double), t_rel = A + off[q] * sizeof(double), t_act = D + off[q] * sizeof(double);
++        int h = L < 4096 ? 0 : L < 65536 ? 1 : L < 262144 ? 2 : L < 1048576 ? 3 : L < 4194304 ? 4 : L < 16777216 ? 5 : 6; hc[h]++; hb[h] += L;
++        if (L > rmax) rmax = L; if (L < rmin) rmin = L;
++        if (d[q].start == off[q]) { fixed++; fixed_b += L; }
++        if ((s - t_rel) % 4096 == 0) ph4 += L; if ((s - t_rel) % M2 == 0) ph2m += L;
++        mv4 += reloc_movable_bytes(s, t_rel, L, 4096); mv2m += reloc_movable_bytes(s, t_rel, L, M2);
++        mv4_act += reloc_movable_bytes(s, t_act, L, 4096); mv2m_act += reloc_movable_bytes(s, t_act, L, M2);
++    }
++    double nb = (double)n * sizeof(double);
++    fprintf(stderr, "  [census] n=%zu runs=%zu run bytes min=%zu max=%zu  a%%4K=%zu a%%2M=%zu dst%%4K=%zu dst%%2M=%zu\n", n, R, rmin, rmax,
++            (size_t)(A % 4096), (size_t)(A % M2), (size_t)(D % 4096), (size_t)(D % M2));
++    fprintf(stderr, "  [census] run-length histogram:");
++    for (int h = 0; h < 7; h++) if (hc[h]) fprintf(stderr, "  %s: %zu runs %.1f%%", HN[h], hc[h], 100.0 * (double)hb[h] / nb);
++    fputc('\n', stderr);
++    fprintf(stderr, "  [census] fixed-point runs %zu (%.1f%% bytes) | phase-matched bytes 4K %.1f%% 2M %.1f%% | movable (dst at a's phase) 4K %.1f%% 2M %.1f%% | movable (actual ptrs) 4K %.1f%% 2M %.1f%%\n",
++            fixed, 100.0 * (double)fixed_b / nb, 100.0 * (double)ph4 / nb, 100.0 * (double)ph2m / nb, 100.0 * (double)mv4 / nb, 100.0 * (double)mv2m / nb,
++            100.0 * (double)mv4_act / nb, 100.0 * (double)mv2m_act / nb);
++}
++#define RELOC_ALIGN_CENSUS(a, dst, d, off, R, n) reloc_align_census(a, dst, d, off, R, n)
++#else
++#define RELOC_ALIGN_CENSUS(a, dst, d, off, R, n) ((void)0)
++#endif
++
++/* ---- D1 prototype: relocation by page table (experiments/team/pagetable-reloc.md) ------------
++ * OPT-IN twice over: compile with -DLOGOS_PAGE_RELOC, then set LOGOS_PAGE_RELOC=1 in the environment
++ * (read per call, so one binary A/Bs both variants with no code-layout bias; make pagerbench).
++ * A run whose source and destination byte offsets agree modulo 2 MB has its 2 MB-aligned interior
++ * moved by mremap(MREMAP_FIXED) into a scratch mapping placed at a[]'s 2 MB phase: one PMD entry
++ * per 2 MB, no bytes copied. The ragged ends and every other run are memcpy'd as before. The
++ * scratch then goes back into a[] the same way, piece by piece in dst order (a moved span and the
++ * memcpy'd gap after it are each one VMA, and mremap needs one), the sub-unit head and tail by
++ * memcpy. Fires only when every chain is a single run and at least PR_MIN_FRACTION_PCT of the
++ * bytes would move. mmprobe measured the PMD move at 16-30x cheaper per run than the parallel
++ * two-way copy, and the PTE-level (4 KB-aligned) move at no gain below 16 MB runs, so nothing
++ * below a 2 MB unit is tried. Costs a caller must accept: a[]'s middle ends up as up to 2R+1
++ * anonymous private VMAs (freed normally by free/munmap), the frames that end up in a[] are the
++ * scratch's, and the memcpy'd fraction of the scratch is faulted fresh on every call
++ * (MADV_HUGEPAGE keeps that to one fault per 2 MB). Linux only. */
++#ifdef LOGOS_PAGE_RELOC
++#define PR_UNIT ((uintptr_t)2 << 20)
++#ifndef PR_MIN_FRACTION_PCT
++#define PR_MIN_FRACTION_PCT 25
++#endif
++size_t logos_page_reloc_bytes = 0, logos_page_reloc_calls = 0;   /* last logos_sort_f64: bytes moved by page table, mremap calls (0: did not fire) */
++typedef struct { void *map; size_t map_len; double *dst; size_t *mlo, *mhi; size_t moved, calls; } pr_t;
++static int page_reloc_on(void) { return getenv("LOGOS_PAGE_RELOC") != NULL; }
++static int pr_move(void *from, void *to, size_t len) { return mremap(from, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, to) != MAP_FAILED; }
++/* A range whose pages just moved away is a HOLE, and any mmap in the process (a thread stack, a malloc
++   arena) may land in it; the first cut crashed exactly so: 100% of a[] moved out, the workers' stacks
++   were placed in the hole, phase 3 mapped data over the cached stacks, the next pthread_create died.
++   So every vacated range is re-reserved at once, PROT_NONE and page-free (an accidental touch faults
++   loudly), and the later MREMAP_FIXED into it replaces the reservation. */
++static int pr_reserve(void *at, size_t len) { return mmap(at, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) != MAP_FAILED; }
++/* mremap needs its old range inside ONE VMA, and after a page-mode sort a[] is a set of VMAs laid out
++   in that sort's destination order, so a later call whose run straddles two of them fails (seen: an
++   8 MB fused run over two 4 MB pieces, EFAULT, every later call declined). Try the span whole, then
++   one 2 MB unit at a time; a unit never straddles a piece since pieces are unit-multiples. Returns
++   the number of units moved (all, or 0 with the moved ones put back), and counts the syscalls. */
++static size_t pr_move_span(void *from, void *to, size_t len, size_t *calls) {
++    if (pr_move(from, to, len)) { (*calls)++; return len / PR_UNIT; }
++    size_t u, nu = len / PR_UNIT;
++    for (u = 0; u < nu; u++) { if (!pr_move((char *)from + u * PR_UNIT, (char *)to + u * PR_UNIT, PR_UNIT)) break; (*calls)++; }
++    if (u == nu) return nu;
++    for (size_t r = 0; r < u; r++) { pr_move((char *)to + r * PR_UNIT, (char *)from + r * PR_UNIT, PR_UNIT); (*calls)++; }
++    return 0;
++}
++static void pr_free(pr_t *pr) { if (pr->map) munmap(pr->map, pr->map_len); free(pr->mlo); free(pr->mhi); pr->map = NULL; pr->mlo = pr->mhi = NULL; }
++/* phase 1: plan the movable units and move them out of a[] into the scratch. 1 = page mode (pr->dst is
++   the scratch, a[] has holes where the units were), 0 = declined with nothing touched. */
++static int page_reloc_out(double *a, size_t n, const rdesc_t *d, const size_t *off, size_t R, pr_t *pr) {
++    memset(pr, 0, sizeof *pr);
++    uintptr_t A = (uintptr_t)a; size_t movable = 0;
++    pr->mlo = malloc(R * sizeof(size_t)); pr->mhi = malloc(R * sizeof(size_t));
++    if (!pr->mlo || !pr->mhi) { pr_free(pr); return 0; }
++    for (size_t q = 0; q < R; q++) {
++        uintptr_t s = A + d[q].start * sizeof(double), e = s + d[q].len * sizeof(double);
++        pr->mlo[q] = pr->mhi[q] = off[q] + d[q].len;                                     /* empty window: nothing of this run moves */
++        if (((d[q].start - off[q]) * sizeof(double)) & (PR_UNIT - 1)) continue;         /* phase differs mod 2 MB: no unit can move */
++        uintptr_t lo = (s + PR_UNIT - 1) & ~(PR_UNIT - 1), hi = e & ~(PR_UNIT - 1);     /* whole units strictly inside the run */
++        if (hi <= lo) continue;
++        pr->mlo[q] = off[q] + (lo - s) / sizeof(double); pr->mhi[q] = off[q] + (hi - s) / sizeof(double); movable += hi - lo;
++    }
++    if (movable < n * sizeof(double) / 100 * PR_MIN_FRACTION_PCT) { pr_free(pr); return 0; }
++    pr->map_len = n * sizeof(double) + 2 * PR_UNIT;
++    pr->map = mmap(NULL, pr->map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    if (pr->map == MAP_FAILED) { pr->map = NULL; pr_free(pr); return 0; }
++#if defined(MADV_HUGEPAGE) && !defined(PR_NO_THP)
++    (void)madvise(pr->map, pr->map_len, MADV_HUGEPAGE);   /* one fault per 2 MB for the memcpy'd fraction; -DPR_NO_THP to compare */
++#endif
++    uintptr_t M = (uintptr_t)pr->map, D = M + ((A - M) & (PR_UNIT - 1));               /* D == A (mod 2 MB), D + n*8 <= M + map_len */
++    pr->dst = (double *)D;
++    for (size_t q = 0; q < R; q++) {
++        if (pr->mlo[q] == pr->mhi[q]) continue;
++        size_t len = (pr->mhi[q] - pr->mlo[q]) * sizeof(double);
++        void *from = a + d[q].start + (pr->mlo[q] - off[q]), *to = pr->dst + pr->mlo[q];
++        int moved_q = pr_move_span(from, to, len, &pr->calls) != 0;
++        if (!moved_q || !pr_reserve(from, len)) {                                          /* undo what moved, decline */
++            if (moved_q) { pr_move_span(to, from, len, &pr->calls); pr_reserve(to, len); }
++            for (size_t r = 0; r < q; r++) if (pr->mlo[r] != pr->mhi[r]) {
++                void *f2 = a + d[r].start + (pr->mlo[r] - off[r]), *t2 = pr->dst + pr->mlo[r]; size_t l2 = (pr->mhi[r] - pr->mlo[r]) * sizeof(double);
++                pr_move_span(t2, f2, l2, &pr->calls); pr_reserve(t2, l2);
++            }
++            pr_free(pr); return 0;
++        }
++        pr->moved += len;
++    }
++    return 1;
++}
++/* one piece of the scratch's unit-aligned middle back into a[]; a piece whose move fails is copied
++   instead, after giving a[] fresh pages there (its own may have moved out) */
++static void pr_piece(pr_t *pr, uintptr_t A, uintptr_t D, uintptr_t lo, uintptr_t hi) {
++    if (hi <= lo) return;
++    size_t len = hi - lo; void *to = (void *)(A + (lo - D));
++    if (pr_move_span((void *)lo, to, len, &pr->calls)) { pr_reserve((void *)lo, len); return; }
++    if (mmap(to, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) abort();   /* cannot leave a[] holed */
++    memcpy(to, (void *)lo, len);
++}
++/* phase 3: the scratch's whole 2 MB units go back into a[] by page table, in dst order; head and tail
++   below unit size by memcpy. Every byte of dst[0, n) was written in phase 1, so nothing here is a
++   never-touched page. */
++static void page_reloc_back(double *a, size_t n, size_t R, pr_t *pr) {
++    uintptr_t A = (uintptr_t)a, D = (uintptr_t)pr->dst, N = n * sizeof(double);
++    uintptr_t U0 = (A + PR_UNIT - 1) & ~(PR_UNIT - 1), U1 = (A + N) & ~(PR_UNIT - 1);
++    if (U1 <= U0) { memcpy(a, pr->dst, N); return; }                                       /* cannot happen once phase 1 fired; kept as the safe form */
++    memcpy(a, pr->dst, U0 - A); memcpy((char *)a + (U1 - A), (char *)pr->dst + (U1 - A), A + N - U1);
++    uintptr_t cur = D + (U0 - A), end = D + (U1 - A);
++    for (size_t q = 0; q < R; q++) {
++        if (pr->mlo[q] == pr->mhi[q]) continue;
++        uintptr_t sl = D + pr->mlo[q] * sizeof(double), sh = D + pr->mhi[q] * sizeof(double);
++        pr_piece(pr, A, D, cur, sl); pr_piece(pr, A, D, sl, sh); cur = sh;
++    }
++    pr_piece(pr, A, D, cur, end);
++}
++#define PR_WINDOWS(pm, pr) (pm) ? (pr).mlo : NULL, (pm) ? (pr).mhi : NULL
++#else
++#define PR_WINDOWS(pm, pr) NULL, NULL
++#endif
++
+ /* Returns 1 with a[] sorted, or 0 (a[] still a permutation of the input; the
+  * caller continues on the normal path). dst: n-element scratch. */
+ static int relocate_try_f64(double *a, size_t n, int P, double *dst) {
++#ifdef LOGOS_PAGE_RELOC
++    logos_page_reloc_bytes = 0; logos_page_reloc_calls = 0;
++#endif
+     if (!reloc_sample_gate(a, n)) { TRACE("reloc: sample gate declined"); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
+     size_t R = 0; size_t *runs = detect_runs_parallel(a, n, P, &R);
+     TRACE("reloc: detect_runs_parallel -> %s, R=%zu", runs ? "runs" : "bail", R);
+@@ -3232,19 +3399,31 @@
+     size_t *off = malloc(R * sizeof(size_t)), *rl = malloc(2 * R * sizeof(size_t));
+     if (!off || !rl) { free(d); free(ch); free(off); free(rl); return 0; }
+     for (size_t q = 0, o = 0; q < R; q++) { off[q] = o; rl[2 * q] = o; rl[2 * q + 1] = o + d[q].len - 1; o += d[q].len; }
++    RELOC_ALIGN_CENSUS(a, dst, d, off, R, n);
+     /* Relocation's parallel form has a serial middle (plan) and a spawn; below RELOC_MIN_PER_THREAD elements
+        per thread it lost to the sequential form (block_perm 316k: 1.4 vs 1.0 ms with 3 threads; 1M: 2.5 vs 2.7
+        with 10, scale-full). Use at most one thread per that many elements. A/B: make smallbench. */
+     if (n < MIN_PARALLEL) P = 1;
+     { size_t pm = n / RELOC_MIN_PER_THREAD; if (pm < 1) pm = 1; if ((size_t)P > pm) P = (int)pm; }
++#ifdef LOGOS_PAGE_RELOC
++    pr_t pr; int page_mode = 0;
++    if (page_reloc_on() && nc == R) {
++        page_mode = page_reloc_out(a, n, d, off, R, &pr);
++        if (page_mode) { dst = pr.dst; TRACE("page-reloc: %zu bytes (%.1f%%) moved out by page table in %zu mremaps", pr.moved, 100.0 * (double)pr.moved / ((double)n * 8), pr.calls); }
++        else TRACE("page-reloc: declined (too few movable bytes, or mmap/mremap failed)");
++    } else TRACE("page-reloc: not tried (%s)", nc == R ? "off" : "multi-run chains");
++#endif
+     barrier_t bar; atomic_size_t next; atomic_init(&next, 0);
+     reloc_arg_t *wa = malloc((size_t)P * sizeof *wa); pthread_t *th = malloc((size_t)P * sizeof *th);
+     if (!wa || !th) { free(wa); free(th); free(off); free(rl); free(d); free(ch); return 0; }
+     if (P > 1) barrier_init(&bar, P);
+-    for (int t = 0; t < P; t++) { reloc_arg_t w = { a, dst, n, R, nc, P, t, d, off, ch, rl, &next, &bar }; wa[t] = w; }
++    for (int t = 0; t < P; t++) { reloc_arg_t w = { a, dst, n, R, nc, P, t, d, off, ch, rl, &next, &bar, PR_WINDOWS(page_mode, pr) }; wa[t] = w; }
+     for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, reloc_worker, &wa[t]);   /* same assumption as psort_f64 */
+     reloc_worker(&wa[0]);
+     for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
++#ifdef LOGOS_PAGE_RELOC
++    if (page_mode) { page_reloc_back(a, n, R, &pr); logos_page_reloc_bytes = pr.moved; logos_page_reloc_calls = pr.calls; TRACE("page-reloc: back in a[], %zu mremaps in all", pr.calls); pr_free(&pr); }
++#endif
+     TRACE("reloc: copy+merge+copyback done (P=%d)", P);
+     if (P > 1) barrier_destroy(&bar);
+     free(wa); free(th); free(off); free(rl); free(d); free(ch);
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x pagebench -x pagerbench -x mmprobe pristine/engines/c/mmprobe.c work/engines/c/mmprobe.c
+--- pristine/engines/c/mmprobe.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/mmprobe.c	2026-09-12 07:58:40.431606004 -0700
+@@ -0,0 +1,84 @@
++/* mmprobe.c — D1 mechanism probe: what does moving a run by page table cost on THIS box?
++ *
++ * Two 64 MB anonymous regions A and B. For run sizes 64 KB .. 16 MB, and with 0 or 13 helper
++ * threads spinning on other CPUs (so every mremap must shoot down their TLBs, as it would with the
++ * engine's workers alive), time per run:
++ *   memcpy1   : one memcpy A->B                     (one direction, one thread)
++ *   memcpy2   : A->B then B->A                       (what the route does: out to scratch, back)
++ *   pmemcpy2  : the same two copies over P threads   (what the parallel route does)
++ *   mremap2   : mremap A[run]->B[run] then back      (page path: two syscalls per run, no bytes)
++ * hugepage=1 rows madvise(MADV_HUGEPAGE) both regions and align runs to 2 MB, so a run whose
++ * length is a 2 MB multiple moves by PMD. Every mremap'd page is checked afterwards to hold the
++ * value it was filled with (the region is refilled with its page index).
++ * Usage: ./mmprobe [threads]   times are the minimum of 5 reps, printed as microseconds per run. */
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
++
++static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e6 + t.tv_nsec / 1e3; }
++static atomic_int g_stop, g_go;
++static void *spinner(void *p) { (void)p; while (!atomic_load(&g_stop)) { for (volatile int i = 0; i < 1000; i++); } return NULL; }
++
++typedef struct { char *src, *dst; size_t lo, hi; } cp_t;
++static void *copier(void *p) { cp_t *c = p; memcpy(c->dst + c->lo, c->src + c->lo, c->hi - c->lo); return NULL; }
++static void pcopy(char *dst, char *src, size_t bytes, int P) {
++    pthread_t th[64]; cp_t c[64];
++    for (int t = 0; t < P; t++) { c[t].src = src; c[t].dst = dst; c[t].lo = bytes * t / P; c[t].hi = bytes * (t + 1) / P; pthread_create(&th[t], NULL, copier, &c[t]); }
++    for (int t = 0; t < P; t++) pthread_join(th[t], NULL);
++}
++static void fill(char *r, size_t bytes) { for (size_t i = 0; i < bytes; i += 4096) memset(r + i, (int)((i / 4096) & 0xFF), 4096); }
++static int check(const char *r, size_t bytes) { for (size_t i = 0; i < bytes; i += 4096) if ((unsigned char)r[i] != ((i / 4096) & 0xFF) || (unsigned char)r[i + 4095] != ((i / 4096) & 0xFF)) return 0; return 1; }
++
++int main(int argc, char **argv) {
++    int P = argc > 1 ? atoi(argv[1]) : 14; if (P > 64) P = 64;
++    const size_t TOTAL = 64u << 20;
++    printf("mmprobe: mremap vs memcpy per run, 64 MB regions, P=%d for the parallel copy, min of 5 reps, microseconds per run\n", P);
++    printf("%-8s %-6s %-9s %9s %9s %9s %9s   %s\n", "hugepage", "spin", "run", "memcpy1", "memcpy2", "pmemcpy2", "mremap2", "mremap2/pmemcpy2");
++    for (int huge = 0; huge < 2; huge++) {
++        size_t align = huge ? (2u << 20) : 4096;
++        char *rawA = mmap(NULL, TOTAL + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        char *rawB = mmap(NULL, TOTAL + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (rawA == MAP_FAILED || rawB == MAP_FAILED) return 1;
++        char *A = (char *)(((uintptr_t)rawA + align - 1) & ~(uintptr_t)(align - 1)), *B = (char *)(((uintptr_t)rawB + align - 1) & ~(uintptr_t)(align - 1));
++        if (huge) { madvise(A, TOTAL, MADV_HUGEPAGE); madvise(B, TOTAL, MADV_HUGEPAGE); }
++        fill(A, TOTAL); fill(B, TOTAL);
++        for (int spin = 0; spin < 2; spin++) {
++            pthread_t sp[64]; int ns = spin ? P - 1 : 0; atomic_store(&g_stop, 0);
++            for (int t = 0; t < ns; t++) pthread_create(&sp[t], NULL, spinner, NULL);
++            usleep(20000);
++            size_t runs[] = { 64u << 10, 256u << 10, 1u << 20, 4u << 20, 16u << 20 };
++            for (int ri = 0; ri < 5; ri++) {
++                size_t L = runs[ri], nruns = TOTAL / L; double b1 = 1e300, b2 = 1e300, bp = 1e300, bm = 1e300;
++                for (int rep = 0; rep < 5; rep++) {
++                    double s = now(); for (size_t q = 0; q < nruns; q++) memcpy(B + q * L, A + q * L, L); double t = (now() - s) / nruns; if (t < b1) b1 = t;
++                    s = now(); for (size_t q = 0; q < nruns; q++) { memcpy(B + q * L, A + q * L, L); memcpy(A + q * L, B + q * L, L); } t = (now() - s) / nruns; if (t < b2) b2 = t;
++                    s = now(); pcopy(B, A, TOTAL, P); pcopy(A, B, TOTAL, P); t = (now() - s) / nruns; if (t < bp) bp = t;
++                    s = now();
++                    for (size_t q = 0; q < nruns; q++) {
++                        /* move the run's pages to B's slot (B's pages there are discarded), then back */
++                        if (mremap(A + q * L, L, L, MREMAP_MAYMOVE | MREMAP_FIXED, B + q * L) == MAP_FAILED) { perror("mremap out"); return 1; }
++                        if (mremap(B + q * L, L, L, MREMAP_MAYMOVE | MREMAP_FIXED, A + q * L) == MAP_FAILED) { perror("mremap back"); return 1; }
++                    }
++                    t = (now() - s) / nruns; if (t < bm) bm = t;
++                    if (!check(A, TOTAL)) { printf("A corrupted after mremap round trip\n"); return 1; }
++                    /* B's slots are now holes: the round trip left B unmapped there; map and refill so the next rep's memcpy has a target */
++                    if (mmap(B, TOTAL, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return 1;
++                    if (huge) madvise(B, TOTAL, MADV_HUGEPAGE);
++                    fill(B, TOTAL);
++                }
++                printf("%-8d %-6d %-9zu %9.1f %9.1f %9.1f %9.1f   %6.2fx\n", huge, ns, L, b1, b2, bp, bm, bm / bp);
++            }
++            atomic_store(&g_stop, 1); for (int t = 0; t < ns; t++) pthread_join(sp[t], NULL);
++        }
++        munmap(rawA, TOTAL + align); munmap(rawB, TOTAL + align);
++    }
++    printf("mremap2/pmemcpy2 < 1 means the page path beats the parallel two-way copy at that run size\n");
++    return 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x pagebench -x pagerbench -x mmprobe pristine/engines/c/pagebench.c work/engines/c/pagebench.c
+--- pristine/engines/c/pagebench.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/pagebench.c	2026-09-12 07:56:10.385359108 -0700
+@@ -0,0 +1,60 @@
++/* pagebench.c — D1 step 1: what do the relocation route's runs look like in page terms?
++ *
++ * Links an engine built with -DLOGOS_TRACE, whose relocation route prints a census of its run
++ * descriptors: run-length histogram, and the bytes that could move by page-table edit (mremap)
++ * at 4 KB and 2 MB granularity. Not a timing benchmark; there is nothing to time yet.
++ *
++ * Shapes: the bench generator's block_perm / block_overlap (64 blocks) at 8M and 30M, then block
++ * sizes chosen so 8*blk IS a page multiple (the only case the arithmetic allows), at power-of-two n.
++ * Usage: ./pagebench [threads]                                        LOGOS_THREADS=N overrides. */
++#define _GNU_SOURCE
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++void pt_sort_f64(double *, size_t, int); int pt_num_cpus(void);
++
++static uint64_t RS = 88172645463325252ULL;
++static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
++
++/* same construction as parbench.cpp / j5bench.c: nb sorted blocks with disjoint value ranges,
++   shuffled; overlap_every > 0 makes every such value-block start 10% inside its predecessor */
++static void gen_blocks(double *a, size_t n, size_t nb, int overlap_every) {
++    size_t blk = (n + nb - 1) / nb; size_t *perm = malloc(nb * sizeof(size_t));
++    for (size_t k = 0; k < nb; k++) perm[k] = k;
++    for (size_t k = nb - 1; k > 0; k--) { size_t j = nr() % (k + 1); size_t t = perm[k]; perm[k] = perm[j]; perm[j] = t; }
++    for (size_t i = 0; i < n; i++) { size_t b = perm[i / blk]; double base = (double)b * (double)blk;
++        if (overlap_every && (b % overlap_every) == 1) base -= (double)blk * 0.1;
++        a[i] = base + (double)(i % blk) + fr() * 0.5; }
++    free(perm);
++}
++
++int main(int argc, char **argv) {
++    int P = argc > 1 ? atoi(argv[1]) : bench_threads(pt_num_cpus());
++    struct { const char *name; size_t n, nb; int ov; } S[] = {
++        { "block_perm 8M/64 (bench)",        8000000, 64, 0 }, { "block_overlap 8M/64 (bench)",   8000000, 64, 8 },
++        { "block_perm 30M/64 (bench)",      30000000, 64, 0 }, { "block_overlap 30M/64 (bench)", 30000000, 64, 8 },
++        { "block_perm 8M/blk4096 (32 KB)",   8000000, 8000000 / 4096 + 1, 0 },
++        { "block_perm 8M/blk65536 (512 KB)", 8000000, 8000000 / 65536 + 1, 0 },
++        { "block_perm 2^23/64 (1 MB)",     1u << 23, 64, 0 }, { "block_overlap 2^23/64 (1 MB)", 1u << 23, 64, 8 },
++        { "block_perm 2^23/16 (4 MB)",     1u << 23, 16, 0 },
++        { "block_perm 2^25/64 (4 MB)",     1u << 25, 64, 0 }, { "block_overlap 2^25/64 (4 MB)", 1u << 25, 64, 8 },
++        { "block_perm 2^25/16 (16 MB)",    1u << 25, 16, 0 },
++    };
++    int NS = (int)(sizeof S / sizeof S[0]);
++    for (int s = 0; s < NS; s++) {
++        size_t n = S[s].n; double *a = malloc(n * sizeof(double)); if (!a) return 1;
++        for (int seed = 0; seed < 2; seed++) {
++            RS = 88172645463325252ULL + (uint64_t)seed * 7919; gen_blocks(a, n, S[s].nb, S[s].ov);
++            fprintf(stderr, "== %s seed %d, %d threads\n", S[s].name, seed, P);
++            pt_sort_f64(a, n, P);
++            for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { fprintf(stderr, "UNSORTED\n"); return 1; }
++        }
++        free(a);
++    }
++    fprintf(stderr, "all outputs verified sorted\n");
++    return 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x pagebench -x pagerbench -x mmprobe pristine/engines/c/pagerbench.c work/engines/c/pagerbench.c
+--- pristine/engines/c/pagerbench.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/pagerbench.c	2026-09-12 09:49:22.023427023 -0700
+@@ -0,0 +1,86 @@
++/* pagerbench.c — D1 step 2 A/B: relocation by memcpy (shipped) vs by page table (LOGOS_PAGE_RELOC).
++ *
++ * ONE engine, built with -DLOGOS_PAGE_RELOC, whose page path is a runtime toggle (the environment
++ * variable LOGOS_PAGE_RELOC, read per call): both variants share every byte of code, so the
++ * code-layout bias of two compiled copies (methodology rule 3) does not exist here, and
++ * bench_paired's adjacent pairs cancel the machine's drift. Ratio > 1 means the page path is faster.
++ *
++ * Every row first runs the page path once and checks the output is sorted and a permutation of the
++ * input (xor of raw bits), and reports whether the path FIRED (bytes moved by page table): a row
++ * that never fired is a null by construction and must read 1.00.
++ * Rows: the bench shapes (64 blocks at 8M: cannot fire, fixed points only), then block sizes that
++ * are 2 MB multiples on a malloc'd array (base 16 bytes into a page, so a 4 MB run holds one whole
++ * 2 MB unit, a 16 MB run seven) and the same on a 2 MB-aligned array the caller aligned itself.
++ * Usage: ./pagerbench [pairs] [rows]     LOGOS_THREADS=N overrides the parallel thread count. */
++#define _GNU_SOURCE
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++extern size_t logos_page_reloc_bytes, logos_page_reloc_calls;
++
++static uint64_t RS = 88172645463325252ULL;
++static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
++static uint64_t xsum(const double *a, size_t n) { uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x; }
++
++static void gen_blocks(double *a, size_t n, size_t nb, int overlap_every) {
++    size_t blk = (n + nb - 1) / nb; size_t *perm = malloc(nb * sizeof(size_t));
++    for (size_t k = 0; k < nb; k++) perm[k] = k;
++    for (size_t k = nb - 1; k > 0; k--) { size_t j = nr() % (k + 1); size_t t = perm[k]; perm[k] = perm[j]; perm[j] = t; }
++    for (size_t i = 0; i < n; i++) { size_t b = perm[i / blk]; double base = (double)b * (double)blk;
++        if (overlap_every && (b % overlap_every) == 1) base -= (double)blk * 0.1;
++        a[i] = base + (double)(i % blk) + fr() * 0.5; }
++    free(perm);
++}
++static void sort_base(double *a, size_t n, int t) { unsetenv("LOGOS_PAGE_RELOC"); logos_sort_f64(a, n, t); }
++static size_t g_page_calls, g_page_fired, g_page_syscalls;   /* every page-path call inside bench_paired: did it fire, and how many syscalls */
++static void sort_page(double *a, size_t n, int t) { setenv("LOGOS_PAGE_RELOC", "1", 1); logos_sort_f64(a, n, t); g_page_calls++; if (logos_page_reloc_bytes) { g_page_fired++; g_page_syscalls += logos_page_reloc_calls; } }
++
++int main(int argc, char **argv) {
++    int reps = argc > 1 ? atoi(argv[1]) : 20; if (reps < 6) reps = 6;
++    int P = bench_threads(logos_num_cpus());
++    struct { const char *name; size_t n, nb; int ov, aligned; } S[] = {
++        { "block_perm 8M/64 (bench)",       8000000, 64, 0, 0 },
++        { "block_overlap 8M/64 (bench)",    8000000, 64, 8, 0 },
++        { "block_perm 2^23/64 (1 MB)",     1u << 23, 64, 0, 0 },
++        { "block_perm 2^23/16 (4 MB)",     1u << 23, 16, 0, 0 },
++        { "block_perm 2^25/64 (4 MB)",     1u << 25, 64, 0, 0 },
++        { "block_perm 2^25/16 (16 MB)",    1u << 25, 16, 0, 0 },
++        { "block_perm 2^23/16 (4 MB) 2MB-aligned array",  1u << 23, 16, 0, 1 },
++        { "block_perm 2^25/64 (4 MB) 2MB-aligned array",  1u << 25, 64, 0, 1 },
++        { "block_perm 2^25/16 (16 MB) 2MB-aligned array", 1u << 25, 16, 0, 1 },
++    };
++    int NS = (int)(sizeof S / sizeof S[0]);
++    int only = argc > 2 ? atoi(argv[2]) : 0;   /* bitmask of rows, 0 = all */
++    printf("pagerbench: memcpy relocation vs page-table relocation, one binary, runtime toggle; %d pairs, threads %d and 1\n", reps, P);
++    printf("ratio = t(memcpy) / t(page table), median of pairs [p10, p90]; > 1 favours the page path\n");
++    printf("  %-48s %-3s %10s %11s %6s   %s\n", "shape", "thr", "moved", "mremaps", "ratio", "[p10, p90]");
++    for (int s = 0; s < NS; s++) {
++        if (only && !(only & (1 << s))) continue;
++        size_t n = S[s].n; double *base = malloc(n * 8), *work;
++        if (S[s].aligned) { if (posix_memalign((void **)&work, 2u << 20, n * 8)) return 1; } else work = malloc(n * 8);
++        if (!base || !work) return 1;
++        RS = 88172645463325252ULL + (uint64_t)s * 7919; gen_blocks(base, n, S[s].nb, S[s].ov); uint64_t before = xsum(base, n);
++        for (int ti = 0; ti < 2; ti++) {
++            int t = ti ? 1 : P;
++            /* verify both variants, and see whether the page path fired at this thread count */
++            memcpy(work, base, n * 8); sort_page(work, n, t); size_t moved = logos_page_reloc_bytes, calls = logos_page_reloc_calls;
++            if (xsum(work, n) != before) { printf("NOT A PERMUTATION (page path, %s, %d thr)\n", S[s].name, t); return 1; }
++            for (size_t i = 1; i < n; i++) if (work[i - 1] > work[i]) { printf("UNSORTED (page path, %s, %d thr, i=%zu)\n", S[s].name, t, i); return 1; }
++            memcpy(work, base, n * 8); sort_base(work, n, t);
++            if (xsum(work, n) != before) { printf("NOT A PERMUTATION (memcpy path, %s, %d thr)\n", S[s].name, t); return 1; }
++            for (size_t i = 1; i < n; i++) if (work[i - 1] > work[i]) { printf("UNSORTED (memcpy path, %s, %d thr)\n", S[s].name, t); return 1; }
++            g_page_calls = g_page_fired = g_page_syscalls = 0;
++            double p10, p90, med = bench_paired(sort_base, sort_page, base, work, n, t, reps, &p10, &p90);
++            printf("  %-48s %-3d %9.1f%% %11zu %6.3f   [%.3f, %.3f]   fired %zu/%zu calls, %.0f mremaps/call%s\n", S[s].name, t, 100.0 * (double)moved / ((double)n * 8), calls, med, p10, p90,
++                   g_page_fired, g_page_calls, g_page_fired ? (double)g_page_syscalls / (double)g_page_fired : 0.0, moved ? "" : "   (did not fire: null row)");
++            fflush(stdout);
++        }
++        free(base); free(work);
++    }
++    printf("all outputs verified sorted and permutation-exact\n");
++    return 0;
++}
+Binary files pristine/engines/c/scalebench and work/engines/c/scalebench differ

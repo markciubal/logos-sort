@@ -1,0 +1,74 @@
+zroute: does a quadtree over (index, value) know the route? n=2^23, best of 3, threads 1 and 14
+gap = logos / informed ceiling within a row. The rule and predictions were fixed before this ran.
+
+  shape              thr     logos  informed    gap  engine route/leaf            profile          ideal      o[1..7]
+  uniform              1   246.4ms         -      -  sequential leaf/simd leaf    random dsc       random     2.00 4.00 8.00 16.00 31.69 41.08 28.55
+  uniform             14    40.2ms         -      -  sample-sort partition/flash  random dsc       random    
+  hash_order           1    44.0ms    65.1ms  0.68x  lowcard counting             random dsc       random     2.00 4.00 8.00 16.00 32.00 41.09 30.11
+  hash_order          14    23.7ms    29.9ms  0.79x  sample-sort partition/counting random dsc       random    
+  gray_code            1    41.9ms    49.7ms  0.84x  lowcard counting             tail             random     1.00 1.00 2.00 2.00 2.12 2.11 2.07
+  gray_code           14    17.8ms    24.7ms  0.72x  sample-sort partition/counting tail             random    
+  event_ts_latency     1   198.7ms   715.9ms  0.28x  sequential leaf/coarse       unknown          bounded    1.00 1.00 1.00 1.38 1.25 1.31 1.25
+  event_ts_latency    14    22.8ms   113.2ms  0.20x  sample-sort partition/flash  unknown          bounded   
+  window_shuffle       1   202.6ms   622.2ms  0.33x  sequential leaf/coarse       sorted           bounded    1.00 1.00 1.00 1.00 1.06 1.09 1.06
+  window_shuffle      14    20.8ms   116.2ms  0.18x  sample-sort partition/flash  sorted           bounded   
+  shard_ids_disjoint   1   236.8ms    40.1ms  5.91x  sequential leaf/simd leaf    k-overlap k=9.0  k-overlap  2.00 3.75 6.00 8.25 8.97 8.69 8.12
+  shard_ids_disjoint  14    31.3ms    41.1ms  0.76x  sample-sort partition/counting k-overlap k=9.0  k-overlap 
+  shard_ids_blocks     1    37.1ms    43.1ms  0.86x  lowcard counting             tail             bounded    1.00 1.00 1.25 1.75 1.94 2.00 2.12
+  shard_ids_blocks    14    17.7ms    14.8ms  1.19x  sample-sort partition/counting tail             bounded   
+  sorted_runs_16       1   207.3ms   318.9ms  0.65x  sequential leaf/simd leaf    k-overlap k=16.5 dsc k-overlap  2.00 4.00 8.00 16.00 16.50 16.50 16.41
+  sorted_runs_16      14    28.6ms    52.4ms  0.55x  sample-sort partition/flash  k-overlap k=16.5 dsc k-overlap 
+  sorted_runs_256      1   237.3ms   594.4ms  0.40x  sequential leaf/simd leaf    random dsc       k-overlap  2.00 4.00 8.00 16.00 32.00 49.69 31.98
+  sorted_runs_256     14    27.2ms    90.2ms  0.30x  sample-sort partition/flash  random dsc       k-overlap 
+  sorted_plus_tail     1   233.9ms    25.0ms  9.36x  sequential leaf/coarse       tail             tail       2.00 2.50 2.75 2.88 3.81 4.11 3.37
+  sorted_plus_tail    14    40.7ms    22.8ms  1.79x  near-sorted merge/run merge  tail             tail      
+  reverse_near_sort    1   159.4ms   160.5ms  0.99x  sequential leaf/flash        bounded dsc      bounded    2.00 4.00 5.88 5.12 3.81 2.86 2.35
+  reverse_near_sort   14    21.8ms    33.6ms  0.65x  sample-sort partition/flash  bounded dsc      bounded   
+  prices_cents         1   514.9ms   490.2ms  1.05x  sequential leaf/quant radix  random dsc       random     2.00 4.00 8.00 16.00 31.34 40.52 28.53
+  prices_cents        14   292.3ms   157.6ms  1.86x  modcard counting             random dsc       random    
+  epoch_ms             1   799.9ms   761.7ms  1.05x  sequential leaf/simd leaf    random           random     2.00 4.00 8.00 16.00 31.44 41.34 28.64
+  epoch_ms            14   134.4ms   460.7ms  0.29x  sample-sort partition/flash  random           random    
+  sensor_adc           1   198.1ms   121.6ms  1.63x  lattice counting             unknown dsc      unknown    2.00 4.00 6.12 7.50 9.53 12.31 15.06
+  sensor_adc          14    47.6ms    57.5ms  0.83x  lattice counting             unknown dsc      unknown   
+  sensor_f64           1   208.5ms         -      -  sequential leaf/simd leaf    unknown dsc      unknown    2.00 4.00 6.12 8.06 10.78 14.55 17.67
+  sensor_f64          14    28.6ms         -      -  sample-sort partition/flash  unknown dsc      unknown   
+  geo_lat              1   139.5ms         -      -  sequential leaf/simd leaf    random           random     2.00 4.00 8.00 16.00 31.69 40.31 28.48
+  geo_lat             14    27.9ms         -      -  sample-sort partition/flash  random           random    
+  user_ids_zipf        1    78.5ms   114.8ms  0.68x  sequential leaf/simd leaf    random dsc       random     2.00 4.00 8.00 16.00 31.38 41.25 28.77
+  user_ids_zipf       14    53.0ms    61.1ms  0.87x  sample-sort partition/int32 radix random dsc       random    
+  yyyymmdd             1    46.5ms    28.0ms  1.66x  lattice counting             random           random     2.00 4.00 8.00 16.00 31.41 40.17 28.47
+  yyyymmdd            14    24.3ms    15.0ms  1.62x  lattice counting             random           random    
+  mantissa16           1    92.3ms    27.2ms  3.39x  sequential leaf/quant radix  random dsc       random     2.00 4.00 8.00 16.00 31.47 41.00 28.47
+  mantissa16          14    16.1ms    10.3ms  1.57x  lattice counting             random dsc       random    
+  small_ratios         1    73.9ms    75.1ms  0.98x  modcard counting             random dsc       random     2.00 4.00 8.00 16.00 31.41 41.11 28.61
+  small_ratios        14    17.4ms    25.3ms  0.69x  modcard counting             random dsc       random    
+
+== scoring (rule and predictions fixed before this ran) ==
+  the probe's own output matched the prediction on 17 of 20 shapes
+  arrangement shapes classified correctly:           4 of 8   (predicted about 4)
+  value-set shapes where the probe rightly abstained: 9 of 10   (predicted 10)
+
+  1 thread, arrangement shapes (engine ok = within 1.20x of the informed ceiling):
+    event_ts_latency   gap  0.28x   engine ok   profile no   -> moot
+    window_shuffle     gap  0.33x   engine ok   profile no   -> moot
+    shard_ids_disjoint gap  5.91x   engine no   profile ok   -> OPPORTUNITY
+    shard_ids_blocks   gap  0.86x   engine ok   profile no   -> moot
+    sorted_runs_16     gap  0.65x   engine ok   profile ok   -> redundant
+    sorted_runs_256    gap  0.40x   engine ok   profile no   -> moot
+    sorted_plus_tail   gap  9.36x   engine no   profile ok   -> OPPORTUNITY
+    reverse_near_sort  gap  0.99x   engine ok   profile ok   -> redundant
+    opportunity 2   blind 0   redundant 2   moot 4
+
+  14 threads, arrangement shapes (engine ok = within 1.20x of the informed ceiling):
+    event_ts_latency   gap  0.20x   engine ok   profile no   -> moot
+    window_shuffle     gap  0.18x   engine ok   profile no   -> moot
+    shard_ids_disjoint gap  0.76x   engine ok   profile ok   -> redundant
+    shard_ids_blocks   gap  1.19x   engine ok   profile no   -> moot
+    sorted_runs_16     gap  0.55x   engine ok   profile ok   -> redundant
+    sorted_runs_256    gap  0.30x   engine ok   profile no   -> moot
+    sorted_plus_tail   gap  1.79x   engine no   profile ok   -> OPPORTUNITY
+    reverse_near_sort  gap  0.65x   engine ok   profile ok   -> redundant
+    opportunity 1   blind 0   redundant 3   moot 4
+
+  curves (a non-monotone trend no route exploits; reported, not scored):  sensor_adc=unknown  sensor_f64=unknown
+exit=0

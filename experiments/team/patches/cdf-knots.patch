@@ -1,0 +1,991 @@
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x knotbench -x knotprobe -x parbench -x __pycache__ pristine/engines/c/Makefile work/engines/c/Makefile
+--- pristine/engines/c/Makefile	2026-09-12 07:43:37.778125049 -0700
++++ work/engines/c/Makefile	2026-09-12 08:03:53.595986915 -0700
+@@ -253,6 +253,18 @@
+ 	$(CC) $(CFLAGS) $(TB3) $(call RENAME,tb3) -c $(SRC) -o tb3.o
+ 	$(CC) $(CFLAGS) $(BENCHFLAGS) tailbench.c tb0.o tb1.o tb2.o tb3.o -o $@ $(LDLIBS)
+ 
++# CDF-knot map A/B (cdf-knots): ONE engine built with -DLOGOS_CDF_KNOTS, the map switched off per call
++# through LOGOS_KNOTS=0, so the paired ratio carries no code-layout bias at all. knotprobe is the same
++# engine with -DLOGOS_TRACE: which map the trial picked, knots, sample and leaf imbalance, spills.
++# Run: make knotbench && flock /tmp/logos-bench.lock ./knotbench [pairs] [n] [shape] [threads]
++KN0 ?= -DLOGOS_CDF_KNOTS
++knotbench: knotbench.c $(SRC) $(HDR) bench_common.h
++	$(CC) $(CFLAGS) $(KN0) $(call RENAME,kn0) -c $(SRC) -o kn0.o
++	$(CC) $(CFLAGS) $(BENCHFLAGS) knotbench.c kn0.o -o $@ $(LDLIBS) -lm
++knotprobe: knotprobe.c $(SRC) $(HDR) bench_common.h
++	$(CC) $(CFLAGS) $(KN0) -DLOGOS_TRACE -c $(SRC) -o kp_trace.o
++	$(CC) $(CFLAGS) $(BENCHFLAGS) knotprobe.c kp_trace.o -o $@ $(LDLIBS) -lm
++
+ # What can this machine resolve today? Paired null test; read it before trusting any A/B under 1.25x.
+ pairprobe: pairprobe.c $(LIB).a $(HDR)
+ 	$(CC) $(CFLAGS) $(BENCHFLAGS) pairprobe.c $(LIB).a -o $@ $(LDLIBS)
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x knotbench -x knotprobe -x parbench -x __pycache__ pristine/engines/c/harness.c work/engines/c/harness.c
+--- pristine/engines/c/harness.c	2026-09-12 07:43:37.930123547 -0700
++++ work/engines/c/harness.c	2026-09-12 08:03:53.595986915 -0700
+@@ -1,265 +1,275 @@
+-/* harness.c — correctness + benchmark harness: logos_psort vs C stdlib qsort.
+- *
+- * Build:  make harness            (or: cc -O3 -pthread logos_psort.c harness.c -o harness -lm)
+- * Run:    ./harness               exit code 0 = every correctness check passed
+- *
+- * CORRECTNESS: for every (distribution x size x thread count), the data is sorted
+- * by logos_sort* and, independently, by qsort. The two outputs must agree
+- * element-for-element, and an XOR checksum proves the output is a permutation
+- * of the input (nothing lost, nothing invented). qsort is the oracle.
+- *
+- * BENCHMARK: best-of-k wall time of qsort vs logos at 1 thread and at N
+- * threads, across data shapes that exercise different paths (uniform, nearly
+- * sorted, clustered, heavy-tailed, low-cardinality).
+- */
+-#define _GNU_SOURCE
+-#include "logos_psort.h"
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <math.h>
+-#include <time.h>
+-
+-/* ---- deterministic RNG (xorshift64) ---- */
+-static uint64_t RS;
+-static void seed(uint64_t s) { RS = s ? s : 1; }
+-static uint64_t nextr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
+-static double frand(void) { return (double)(nextr() >> 11) / (double)(1ULL << 53); }
+-
+-static double now_ms(void) {
+-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+-    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+-}
+-
+-/* ---- qsort comparators (the reference) ---- */
+-static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+-static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
+-
+-/* ---- data shapes ---- */
+-enum { D_UNIFORM, D_SORTED, D_REVERSE, D_NEARSORT, D_FEWDIST, D_EQUAL, D_NEG, D_SKEWED, D_CLUSTER,
+-       D_SEGMENTED, D_FEWRUNS, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER, D_N };
+-static const char *DNAME[D_N] = { "uniform", "sorted", "reverse", "near_sorted", "few_distinct",
+-                                  "all_equal", "negatives", "heavy_tail", "clustered",
+-                                  "segmented", "few_runs", "prefix_shuffle", "bimodal", "quantized", "int_wide", "mod_card_30k",
+-                                  "block_perm", "block_overlap" };
+-
+-static void gen(double *a, size_t n, int d) {
+-    size_t i;
+-    switch (d) {
+-    case D_UNIFORM:  for (i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9; break;
+-    case D_SORTED:   for (i = 0; i < n; i++) a[i] = (double)i; break;
+-    case D_REVERSE:  for (i = 0; i < n; i++) a[i] = (double)(n - i); break;
+-    case D_NEARSORT: for (i = 0; i < n; i++) a[i] = (double)i;
+-                     for (i = 0; n > 0 && i < n / 100; i++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
+-                     break;
+-    case D_FEWDIST:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 5) * 1e6; break;
+-    case D_EQUAL:    for (i = 0; i < n; i++) a[i] = 42.0; break;
+-    case D_NEG:      for (i = 0; i < n; i++) a[i] = frand() * 2e6 - 1e6; break;
+-    case D_SKEWED:   for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); break; /* Pareto tail */
+-    case D_CLUSTER:  for (i = 0; i < n; i++) { double s = 0; int k; for (k = 0; k < 4; k++) s += frand(); a[i] = (s - 2.0) * 1e6; } break;
+-    /* many (>=16) sorted blocks -> 4-way merge path */
+-    case D_SEGMENTED: { size_t blk = n / 64 ? n / 64 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 64.0 + (double)(i / blk); } break;
+-    /* 2-8 long runs -> galloping 2-way merge */
+-    case D_FEWRUNS:  { size_t blk = n / 4 ? n / 4 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 4.0 + (double)(i / blk); } break;
+-    /* sorted with the first 10% shuffled -> momentum insertion must ABORT and fall through */
+-    case D_PREFIXSHUF: for (i = 0; i < n; i++) a[i] = (double)i;
+-                       { size_t m = n / 10; for (i = m; i > 1; i--) { size_t j = nextr() % i; double t = a[i - 1]; a[i - 1] = a[j]; a[j] = t; } } break;
+-    /* two tight clusters far apart -> gap-split partition */
+-    case D_BIMODAL:  for (i = 0; i < n; i++) a[i] = (nextr() & 1 ? 1e9 : -1e9) + frand() * 10.0; break;
+-    /* dyadic fractions (few active mantissa bytes) -> quantized float radix */
+-    case D_QUANTIZED: for (i = 0; i < n; i++) a[i] = (double)(nextr() % 4096) / 64.0; break;
+-    /* integer-valued doubles across the full int32 range -> byte-skip int32 radix */
+-    case D_INTWIDE:  for (i = 0; i < n; i++) a[i] = (double)(int32_t)nextr(); break;
+-    /* ~30k distinct non-integer values -> moderate-cardinality hash-map counting */
+-    case D_MODCARD:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 30000) * 1.5; break;
+-    /* 64 sorted blocks with DISJOINT value ranges, concatenated in shuffled order (merged log
+-     * partitions) -> disjoint-run relocation (J5): memcpy, no merge. Fractional values so the
+-     * quantized-radix probe does not claim them first. block_overlap: every value-block whose
+-     * index is 1 mod 8 starts 10% inside its predecessor, so a quarter of the data sits in
+-     * two-run chains and the chain-merge path runs. */
+-    case D_BLOCKPERM: case D_BLOCKOVER: {
+-        size_t nb = 64, blk = (n + nb - 1) / nb; if (blk < 1) blk = 1;
+-        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
+-        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
+-        for (i = 0; i < n; i++) {
+-            size_t b = perm[i / blk]; double base = (double)b * (double)blk;
+-            if (d == D_BLOCKOVER && (b & 7) == 1) base -= (double)blk * 0.1;
+-            a[i] = base + (double)(i % blk) + frand() * 0.5;
+-        }
+-    } break;
+-    }
+-}
+-
+-/* XOR of raw bits: invariant under permutation, so equal-before/after proves
+-   the output is a rearrangement of the input. */
+-static uint64_t xsum(const double *a, size_t n) {
+-    uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x;
+-}
+-
+-/* ================= correctness ================= */
+-static int correctness(void) {
+-    const size_t sizes[] = { 0, 1, 2, 63, 64, 65, 1000, 50000, 1000000 };
+-    const int threads[] = { 1, 2, 4, 8 };
+-    int checks = 0, fails = 0;
+-    seed(0x9E3779B97F4A7C15ULL);
+-
+-    printf("== correctness: logos vs qsort (double) ==\n");
+-    for (int d = 0; d < D_N; d++) {
+-        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+-            size_t n = sizes[si];
+-            double *orig = malloc((n ? n : 1) * sizeof(double));
+-            double *ref  = malloc((n ? n : 1) * sizeof(double));
+-            gen(orig, n, d);
+-            memcpy(ref, orig, n * sizeof(double));
+-            qsort(ref, n, sizeof(double), cmp_d);              /* the oracle */
+-            uint64_t before = xsum(orig, n);
+-            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+-                double *a = malloc((n ? n : 1) * sizeof(double));
+-                memcpy(a, orig, n * sizeof(double));
+-                logos_sort_f64(a, n, threads[ti]);
+-                int ok = xsum(a, n) == before;
+-                for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
+-                checks++;
+-                if (!ok) { fails++; printf("  FAIL  shape=%-12s n=%-8zu threads=%d\n", DNAME[d], n, threads[ti]); }
+-                free(a);
+-            }
+-            free(orig); free(ref);
+-        }
+-    }
+-    printf("  double: %d checks, %d failures\n", checks, fails);
+-
+-    printf("== correctness: logos vs qsort (int32) ==\n");
+-    int ichecks = 0, ifails = 0;
+-    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
+-    /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
+-       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
+-       INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
+-       narrow bulk. See FINDINGS 3w. */
+-    for (int mode = 0; mode < 12; mode++) {
+-        for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
+-            size_t n = isz[si];
+-            int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
+-            int32_t *ref  = malloc((n ? n : 1) * sizeof(int32_t));
+-            for (size_t i = 0; i < n; i++) {
+-                uint64_t r = nextr();
+-                switch (mode) {
+-                case 0:  orig[i] = (int32_t)r;                  break;   /* full range */
+-                case 1:  orig[i] = (int32_t)(r % 7) - 3;        break;   /* few distinct, signed */
+-                case 2:  orig[i] = (int32_t)i;                  break;   /* already sorted */
+-                case 3:  orig[i] = 42;                          break;   /* span 1: route declines */
+-                case 4:  orig[i] = (int32_t)(r & 1);            break;   /* span 2: smallest accepted */
+-                case 5:  orig[i] = (int32_t)(r % 262144);       break;   /* span == the table cap */
+-                case 6:  orig[i] = (int32_t)(r % 262145);       break;   /* one past the cap: declines */
+-                case 7:  orig[i] = -(int32_t)(r % 100) - 1;     break;   /* all negative */
+-                case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
+-                case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
+-                case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
+-                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
+-                }
+-            }
+-            if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
+-            memcpy(ref, orig, n * sizeof(int32_t));
+-            qsort(ref, n, sizeof(int32_t), cmp_i);
+-            for (int t = 1; t <= 16; t *= 4) {
+-                int32_t *a = malloc((n ? n : 1) * sizeof(int32_t));
+-                memcpy(a, orig, n * sizeof(int32_t));
+-                logos_sort_i32(a, n, t);
+-                int ok = memcmp(a, ref, n * sizeof(int32_t)) == 0;
+-                ichecks++;
+-                if (!ok) { ifails++; printf("  FAIL  int32 mode=%d n=%zu threads=%d\n", mode, n, t); }
+-                free(a);
+-            }
+-            free(orig); free(ref);
+-        }
+-    }
+-    printf("  int32:  %d checks, %d failures\n\n", ichecks, ifails);
+-    return fails + ifails;
+-}
+-
+-/* ================= benchmark ================= */
+-static double best_qsort(const double *base, size_t n, int reps) {
+-    double best = 1e300; double *a = malloc(n * sizeof(double));
+-    for (int r = 0; r < reps; r++) { memcpy(a, base, n * sizeof(double)); double t = now_ms(); qsort(a, n, sizeof(double), cmp_d); t = now_ms() - t; if (t < best) best = t; }
+-    free(a); return best;
+-}
+-static double best_logos(const double *base, size_t n, int threads, int reps) {
+-    double best = 1e300; double *a = malloc(n * sizeof(double));
+-    for (int r = 0; r < reps; r++) {
+-        memcpy(a, base, n * sizeof(double)); double t = now_ms(); logos_sort_f64(a, n, threads); t = now_ms() - t;
+-        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { printf("  !! unsorted output in benchmark\n"); break; }
+-        if (t < best) best = t;
+-    }
+-    free(a); return best;
+-}
+-
+-static void benchmark(void) {
+-    int cpus = logos_num_cpus();
+-    int P = cpus > 1 ? cpus : 4;            /* on a 1-core box, P=4 shows overhead honestly */
+-    const size_t sizes[] = { 1000000, 8000000 };
+-    const int dists[] = { D_UNIFORM, D_NEARSORT, D_CLUSTER, D_FEWDIST, D_SKEWED, D_SEGMENTED, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER };
+-
+-    printf("== benchmark: double, best-of-k wall time (online CPUs: %d) ==\n", cpus);
+-    printf("  %-12s %6s   %9s   %11s %7s   %11s %7s\n", "shape", "n", "qsort", "logos t=1", "x", "logos t=" , "x");
+-    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+-        size_t n = sizes[si]; int reps = n >= 8000000 ? 2 : 3;
+-        double *base = malloc(n * sizeof(double));
+-        for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
+-            seed(7); gen(base, n, dists[di]);
+-            double tq = best_qsort(base, n, reps);
+-            double t1 = best_logos(base, n, 1, reps);
+-            double tp = best_logos(base, n, P, reps);
+-            printf("  %-12s %5zuM   %7.1fms   %9.1fms %6.2fx   %7.1fms(%d) %6.2fx\n",
+-                   DNAME[dists[di]], n / 1000000, tq, t1, tq / t1, tp, P, tq / tp);
+-        }
+-        free(base);
+-    }
+-
+-    /* int32 */
+-    size_t n = 8000000; int32_t *bi = malloc(n * sizeof(int32_t));
+-    seed(11); for (size_t i = 0; i < n; i++) bi[i] = (int32_t)nextr();
+-    double tq = 1e300, tl = 1e300; int32_t *a = malloc(n * sizeof(int32_t));
+-    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); qsort(a, n, 4, cmp_i); t = now_ms() - t; if (t < tq) tq = t; }
+-    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); logos_sort_i32(a, n, 1); t = now_ms() - t; if (t < tl) tl = t; }
+-    printf("\n== benchmark: int32 8M uniform ==\n  qsort %7.1fms   logos t=1 %7.1fms   %.2fx\n", tq, tl, tq / tl);
+-    free(a); free(bi);
+-
+-    if (cpus == 1)
+-        printf("\n  note: this machine has ONE core. The t=%d column measures thread-coordination\n"
+-               "  overhead, not parallel speedup; on real cores it drops toward t=1 / cores.\n", P);
+-}
+-
+-
+-/* ---- parity extras: argSort family, findOutliers, strings ---- */
+-static int extras_checks(void) {
+-    int fails = 0, checks = 0;
+-    seed(0xC0FFEE);
+-    for (size_t n = 1; n <= 200000; n = n * 17 + 1) {
+-        double *a = malloc(n * 8); uint32_t *p = malloc(n * 4);
+-        for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 40);
+-        logos_argsort_f64(a, n, p);
+-        int ok = 1; char *seen = calloc(n, 1);
+-        for (size_t i = 0; i < n; i++) { if (p[i] >= n || seen[p[i]]) { ok = 0; break; } seen[p[i]] = 1; }
+-        for (size_t i = 1; ok && i < n; i++) { if (a[p[i-1]] > a[p[i]]) ok = 0; else if (a[p[i-1]] == a[p[i]] && p[i-1] > p[i]) ok = 0; }
+-        free(seen); checks++; if (!ok) { fails++; printf("  FAIL argsort_f64 n=%zu\n", n); }
+-        free(a); free(p);
+-    }
+-    { size_t n = 200000; double *a = malloc(n * 8); for (size_t i = 0; i < n; i++) a[i] = (double)i;
+-      a[7] = 1e18; a[n - 4] = -1e18; uint32_t out[16]; size_t c = logos_find_outliers_f64(a, n, out, 16, 0);
+-      int f7 = 0, fn = 0; for (size_t i = 0; i < c && i < 16; i++) { if (out[i] == 7) f7 = 1; if (out[i] == n - 4) fn = 1; }
+-      checks++; if (!(c >= 2 && f7 && fn)) { fails++; printf("  FAIL findOutliers\n"); } free(a); }
+-    { const char *s[] = {"delta","alpha","charlie","alpha","","bravo","al"}; size_t n = 7; logos_sort_strings(s, n);
+-      int ok = 1; for (size_t i = 1; i < n; i++) if (strcmp(s[i-1], s[i]) > 0) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL strings\n"); } }
+-    printf("  extras: %d checks, %d failures\n", checks, fails);
+-    return fails;
+-}
+-
+-int main(void) {
+-    printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
+-    int fails = correctness();
+-    printf("== parity extras ==\n");
+-    fails += extras_checks();
+-    printf("\n");
+-    benchmark();
+-    printf("\n%s\n", fails ? "RESULT: CORRECTNESS FAILURES — do not ship" : "RESULT: all correctness checks passed");
+-    return fails ? 1 : 0;
+-}
++/* harness.c — correctness + benchmark harness: logos_psort vs C stdlib qsort.
++ *
++ * Build:  make harness            (or: cc -O3 -pthread logos_psort.c harness.c -o harness -lm)
++ * Run:    ./harness               exit code 0 = every correctness check passed
++ *
++ * CORRECTNESS: for every (distribution x size x thread count), the data is sorted
++ * by logos_sort* and, independently, by qsort. The two outputs must agree
++ * element-for-element, and an XOR checksum proves the output is a permutation
++ * of the input (nothing lost, nothing invented). qsort is the oracle.
++ *
++ * BENCHMARK: best-of-k wall time of qsort vs logos at 1 thread and at N
++ * threads, across data shapes that exercise different paths (uniform, nearly
++ * sorted, clustered, heavy-tailed, low-cardinality).
++ */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <time.h>
++
++/* ---- deterministic RNG (xorshift64) ---- */
++static uint64_t RS;
++static void seed(uint64_t s) { RS = s ? s : 1; }
++static uint64_t nextr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double frand(void) { return (double)(nextr() >> 11) / (double)(1ULL << 53); }
++
++static double now_ms(void) {
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++/* ---- qsort comparators (the reference) ---- */
++static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
++static int cmp_i(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
++
++/* ---- data shapes ---- */
++enum { D_UNIFORM, D_SORTED, D_REVERSE, D_NEARSORT, D_FEWDIST, D_EQUAL, D_NEG, D_SKEWED, D_CLUSTER,
++       D_SEGMENTED, D_FEWRUNS, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER,
++       D_PARETONEG, D_LOGNORM, D_TAILDUP, D_TAILSENT, D_N };
++static const char *DNAME[D_N] = { "uniform", "sorted", "reverse", "near_sorted", "few_distinct",
++                                  "all_equal", "negatives", "heavy_tail", "clustered",
++                                  "segmented", "few_runs", "prefix_shuffle", "bimodal", "quantized", "int_wide", "mod_card_30k",
++                                  "block_perm", "block_overlap",
++                                  "pareto_signed", "lognormal", "tail_dups", "tail_sentinels" };
++
++static void gen(double *a, size_t n, int d) {
++    size_t i;
++    switch (d) {
++    case D_UNIFORM:  for (i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9; break;
++    case D_SORTED:   for (i = 0; i < n; i++) a[i] = (double)i; break;
++    case D_REVERSE:  for (i = 0; i < n; i++) a[i] = (double)(n - i); break;
++    case D_NEARSORT: for (i = 0; i < n; i++) a[i] = (double)i;
++                     for (i = 0; n > 0 && i < n / 100; i++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
++                     break;
++    case D_FEWDIST:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 5) * 1e6; break;
++    case D_EQUAL:    for (i = 0; i < n; i++) a[i] = 42.0; break;
++    case D_NEG:      for (i = 0; i < n; i++) a[i] = frand() * 2e6 - 1e6; break;
++    case D_SKEWED:   for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); break; /* Pareto tail */
++    case D_CLUSTER:  for (i = 0; i < n; i++) { double s = 0; int k; for (k = 0; k < 4; k++) s += frand(); a[i] = (s - 2.0) * 1e6; } break;
++    /* many (>=16) sorted blocks -> 4-way merge path */
++    case D_SEGMENTED: { size_t blk = n / 64 ? n / 64 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 64.0 + (double)(i / blk); } break;
++    /* 2-8 long runs -> galloping 2-way merge */
++    case D_FEWRUNS:  { size_t blk = n / 4 ? n / 4 : 1; for (i = 0; i < n; i++) a[i] = (double)(i % blk) * 4.0 + (double)(i / blk); } break;
++    /* sorted with the first 10% shuffled -> momentum insertion must ABORT and fall through */
++    case D_PREFIXSHUF: for (i = 0; i < n; i++) a[i] = (double)i;
++                       { size_t m = n / 10; for (i = m; i > 1; i--) { size_t j = nextr() % i; double t = a[i - 1]; a[i - 1] = a[j]; a[j] = t; } } break;
++    /* two tight clusters far apart -> gap-split partition */
++    case D_BIMODAL:  for (i = 0; i < n; i++) a[i] = (nextr() & 1 ? 1e9 : -1e9) + frand() * 10.0; break;
++    /* dyadic fractions (few active mantissa bytes) -> quantized float radix */
++    case D_QUANTIZED: for (i = 0; i < n; i++) a[i] = (double)(nextr() % 4096) / 64.0; break;
++    /* integer-valued doubles across the full int32 range -> byte-skip int32 radix */
++    case D_INTWIDE:  for (i = 0; i < n; i++) a[i] = (double)(int32_t)nextr(); break;
++    /* ~30k distinct non-integer values -> moderate-cardinality hash-map counting */
++    case D_MODCARD:  for (i = 0; i < n; i++) a[i] = (double)(nextr() % 30000) * 1.5; break;
++    /* 64 sorted blocks with DISJOINT value ranges, concatenated in shuffled order (merged log
++     * partitions) -> disjoint-run relocation (J5): memcpy, no merge. Fractional values so the
++     * quantized-radix probe does not claim them first. block_overlap: every value-block whose
++     * index is 1 mod 8 starts 10% inside its predecessor, so a quarter of the data sits in
++     * two-run chains and the chain-merge path runs. */
++    /* CDF-knot map edges (-DLOGOS_CDF_KNOTS, mode 10): a heavy tail on both sides of zero (a knot
++     * segment crossing the sign boundary of the key space, span near 2^64); a lognormal (bent both
++     * ways); a tail with three dominant duplicates (runs in the sample, knots on steps); and a tail with
++     * far sentinels (the bulk falls into one or two index cells, so the multi-knot loop runs). */
++    case D_PARETONEG: for (i = 0; i < n; i++) { double p = 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); a[i] = (nextr() & 1) ? p : -p; } break;
++    case D_LOGNORM:   for (i = 0; i < n; i++) { double u = frand() + 1e-12, v = frand(); a[i] = exp(3.0 * sqrt(-2.0 * log(u)) * cos(6.283185307 * v)); } break;
++    case D_TAILDUP:   for (i = 0; i < n; i++) { uint64_t r = nextr() % 10; a[i] = r < 3 ? (double)(r + 1) * 1234.5 : 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); } break;
++    case D_TAILSENT:  for (i = 0; i < n; i++) { uint64_t r = nextr() % 1000; a[i] = r == 0 ? 1e300 : r == 1 ? -1e300 : 1000.0 * pow(1.0 - frand() * 0.999999, -1.0 / 1.2); } break;
++    case D_BLOCKPERM: case D_BLOCKOVER: {
++        size_t nb = 64, blk = (n + nb - 1) / nb; if (blk < 1) blk = 1;
++        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
++        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t t = perm[k]; perm[k] = perm[r]; perm[r] = t; }
++        for (i = 0; i < n; i++) {
++            size_t b = perm[i / blk]; double base = (double)b * (double)blk;
++            if (d == D_BLOCKOVER && (b & 7) == 1) base -= (double)blk * 0.1;
++            a[i] = base + (double)(i % blk) + frand() * 0.5;
++        }
++    } break;
++    }
++}
++
++/* XOR of raw bits: invariant under permutation, so equal-before/after proves
++   the output is a rearrangement of the input. */
++static uint64_t xsum(const double *a, size_t n) {
++    uint64_t x = 0; for (size_t i = 0; i < n; i++) { uint64_t u; memcpy(&u, &a[i], 8); x ^= u; } return x;
++}
++
++/* ================= correctness ================= */
++static int correctness(void) {
++    const size_t sizes[] = { 0, 1, 2, 63, 64, 65, 1000, 50000, 1000000 };
++    const int threads[] = { 1, 2, 4, 8 };
++    int checks = 0, fails = 0;
++    seed(0x9E3779B97F4A7C15ULL);
++
++    printf("== correctness: logos vs qsort (double) ==\n");
++    for (int d = 0; d < D_N; d++) {
++        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++            size_t n = sizes[si];
++            double *orig = malloc((n ? n : 1) * sizeof(double));
++            double *ref  = malloc((n ? n : 1) * sizeof(double));
++            gen(orig, n, d);
++            memcpy(ref, orig, n * sizeof(double));
++            qsort(ref, n, sizeof(double), cmp_d);              /* the oracle */
++            uint64_t before = xsum(orig, n);
++            for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
++                double *a = malloc((n ? n : 1) * sizeof(double));
++                memcpy(a, orig, n * sizeof(double));
++                logos_sort_f64(a, n, threads[ti]);
++                int ok = xsum(a, n) == before;
++                for (size_t i = 0; ok && i < n; i++) if (a[i] != ref[i]) ok = 0;
++                checks++;
++                if (!ok) { fails++; printf("  FAIL  shape=%-12s n=%-8zu threads=%d\n", DNAME[d], n, threads[ti]); }
++                free(a);
++            }
++            free(orig); free(ref);
++        }
++    }
++    printf("  double: %d checks, %d failures\n", checks, fails);
++
++    printf("== correctness: logos vs qsort (int32) ==\n");
++    int ichecks = 0, ifails = 0;
++    const size_t isz[] = { 0, 1, 1000, 200000, 1000000 };
++    /* Modes 3..11 exercise the parallel counting route (count_try_i32) and its edges: the span-1 and
++       span-2 ends, the table cap and one past it, all-negative and zero-straddling data, the
++       INT32_MIN/INT32_MAX pair whose span overflows 32-bit arithmetic, and far sentinels mixed into a
++       narrow bulk. See FINDINGS 3w. */
++    for (int mode = 0; mode < 12; mode++) {
++        for (size_t si = 0; si < sizeof isz / sizeof *isz; si++) {
++            size_t n = isz[si];
++            int32_t *orig = malloc((n ? n : 1) * sizeof(int32_t));
++            int32_t *ref  = malloc((n ? n : 1) * sizeof(int32_t));
++            for (size_t i = 0; i < n; i++) {
++                uint64_t r = nextr();
++                switch (mode) {
++                case 0:  orig[i] = (int32_t)r;                  break;   /* full range */
++                case 1:  orig[i] = (int32_t)(r % 7) - 3;        break;   /* few distinct, signed */
++                case 2:  orig[i] = (int32_t)i;                  break;   /* already sorted */
++                case 3:  orig[i] = 42;                          break;   /* span 1: route declines */
++                case 4:  orig[i] = (int32_t)(r & 1);            break;   /* span 2: smallest accepted */
++                case 5:  orig[i] = (int32_t)(r % 262144);       break;   /* span == the table cap */
++                case 6:  orig[i] = (int32_t)(r % 262145);       break;   /* one past the cap: declines */
++                case 7:  orig[i] = -(int32_t)(r % 100) - 1;     break;   /* all negative */
++                case 8:  orig[i] = (int32_t)(r % 100) - 50;     break;   /* straddles zero */
++                case 9:  orig[i] = (r & 1) ? INT32_MIN : INT32_MAX; break; /* span overflows in 32-bit */
++                case 10: orig[i] = (int32_t)(r % 100);          break;   /* narrow bulk + sentinels below */
++                default: orig[i] = INT32_MIN;                   break;   /* every element the minimum */
++                }
++            }
++            if (mode == 10 && n > 3) { orig[n / 2] = INT32_MIN; orig[n / 3] = INT32_MAX; }
++            memcpy(ref, orig, n * sizeof(int32_t));
++            qsort(ref, n, sizeof(int32_t), cmp_i);
++            for (int t = 1; t <= 16; t *= 4) {
++                int32_t *a = malloc((n ? n : 1) * sizeof(int32_t));
++                memcpy(a, orig, n * sizeof(int32_t));
++                logos_sort_i32(a, n, t);
++                int ok = memcmp(a, ref, n * sizeof(int32_t)) == 0;
++                ichecks++;
++                if (!ok) { ifails++; printf("  FAIL  int32 mode=%d n=%zu threads=%d\n", mode, n, t); }
++                free(a);
++            }
++            free(orig); free(ref);
++        }
++    }
++    printf("  int32:  %d checks, %d failures\n\n", ichecks, ifails);
++    return fails + ifails;
++}
++
++/* ================= benchmark ================= */
++static double best_qsort(const double *base, size_t n, int reps) {
++    double best = 1e300; double *a = malloc(n * sizeof(double));
++    for (int r = 0; r < reps; r++) { memcpy(a, base, n * sizeof(double)); double t = now_ms(); qsort(a, n, sizeof(double), cmp_d); t = now_ms() - t; if (t < best) best = t; }
++    free(a); return best;
++}
++static double best_logos(const double *base, size_t n, int threads, int reps) {
++    double best = 1e300; double *a = malloc(n * sizeof(double));
++    for (int r = 0; r < reps; r++) {
++        memcpy(a, base, n * sizeof(double)); double t = now_ms(); logos_sort_f64(a, n, threads); t = now_ms() - t;
++        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { printf("  !! unsorted output in benchmark\n"); break; }
++        if (t < best) best = t;
++    }
++    free(a); return best;
++}
++
++static void benchmark(void) {
++    int cpus = logos_num_cpus();
++    int P = cpus > 1 ? cpus : 4;            /* on a 1-core box, P=4 shows overhead honestly */
++    const size_t sizes[] = { 1000000, 8000000 };
++    const int dists[] = { D_UNIFORM, D_NEARSORT, D_CLUSTER, D_FEWDIST, D_SKEWED, D_SEGMENTED, D_PREFIXSHUF, D_BIMODAL, D_QUANTIZED, D_INTWIDE, D_MODCARD, D_BLOCKPERM, D_BLOCKOVER };
++
++    printf("== benchmark: double, best-of-k wall time (online CPUs: %d) ==\n", cpus);
++    printf("  %-12s %6s   %9s   %11s %7s   %11s %7s\n", "shape", "n", "qsort", "logos t=1", "x", "logos t=" , "x");
++    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
++        size_t n = sizes[si]; int reps = n >= 8000000 ? 2 : 3;
++        double *base = malloc(n * sizeof(double));
++        for (size_t di = 0; di < sizeof dists / sizeof *dists; di++) {
++            seed(7); gen(base, n, dists[di]);
++            double tq = best_qsort(base, n, reps);
++            double t1 = best_logos(base, n, 1, reps);
++            double tp = best_logos(base, n, P, reps);
++            printf("  %-12s %5zuM   %7.1fms   %9.1fms %6.2fx   %7.1fms(%d) %6.2fx\n",
++                   DNAME[dists[di]], n / 1000000, tq, t1, tq / t1, tp, P, tq / tp);
++        }
++        free(base);
++    }
++
++    /* int32 */
++    size_t n = 8000000; int32_t *bi = malloc(n * sizeof(int32_t));
++    seed(11); for (size_t i = 0; i < n; i++) bi[i] = (int32_t)nextr();
++    double tq = 1e300, tl = 1e300; int32_t *a = malloc(n * sizeof(int32_t));
++    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); qsort(a, n, 4, cmp_i); t = now_ms() - t; if (t < tq) tq = t; }
++    for (int r = 0; r < 2; r++) { memcpy(a, bi, n * 4); double t = now_ms(); logos_sort_i32(a, n, 1); t = now_ms() - t; if (t < tl) tl = t; }
++    printf("\n== benchmark: int32 8M uniform ==\n  qsort %7.1fms   logos t=1 %7.1fms   %.2fx\n", tq, tl, tq / tl);
++    free(a); free(bi);
++
++    if (cpus == 1)
++        printf("\n  note: this machine has ONE core. The t=%d column measures thread-coordination\n"
++               "  overhead, not parallel speedup; on real cores it drops toward t=1 / cores.\n", P);
++}
++
++
++/* ---- parity extras: argSort family, findOutliers, strings ---- */
++static int extras_checks(void) {
++    int fails = 0, checks = 0;
++    seed(0xC0FFEE);
++    for (size_t n = 1; n <= 200000; n = n * 17 + 1) {
++        double *a = malloc(n * 8); uint32_t *p = malloc(n * 4);
++        for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 40);
++        logos_argsort_f64(a, n, p);
++        int ok = 1; char *seen = calloc(n, 1);
++        for (size_t i = 0; i < n; i++) { if (p[i] >= n || seen[p[i]]) { ok = 0; break; } seen[p[i]] = 1; }
++        for (size_t i = 1; ok && i < n; i++) { if (a[p[i-1]] > a[p[i]]) ok = 0; else if (a[p[i-1]] == a[p[i]] && p[i-1] > p[i]) ok = 0; }
++        free(seen); checks++; if (!ok) { fails++; printf("  FAIL argsort_f64 n=%zu\n", n); }
++        free(a); free(p);
++    }
++    { size_t n = 200000; double *a = malloc(n * 8); for (size_t i = 0; i < n; i++) a[i] = (double)i;
++      a[7] = 1e18; a[n - 4] = -1e18; uint32_t out[16]; size_t c = logos_find_outliers_f64(a, n, out, 16, 0);
++      int f7 = 0, fn = 0; for (size_t i = 0; i < c && i < 16; i++) { if (out[i] == 7) f7 = 1; if (out[i] == n - 4) fn = 1; }
++      checks++; if (!(c >= 2 && f7 && fn)) { fails++; printf("  FAIL findOutliers\n"); } free(a); }
++    { const char *s[] = {"delta","alpha","charlie","alpha","","bravo","al"}; size_t n = 7; logos_sort_strings(s, n);
++      int ok = 1; for (size_t i = 1; i < n; i++) if (strcmp(s[i-1], s[i]) > 0) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL strings\n"); } }
++    printf("  extras: %d checks, %d failures\n", checks, fails);
++    return fails;
++}
++
++int main(void) {
++    printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
++    int fails = correctness();
++    printf("== parity extras ==\n");
++    fails += extras_checks();
++    printf("\n");
++    benchmark();
++    printf("\n%s\n", fails ? "RESULT: CORRECTNESS FAILURES — do not ship" : "RESULT: all correctness checks passed");
++    return fails ? 1 : 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x knotbench -x knotprobe -x parbench -x __pycache__ pristine/engines/c/knotbench.c work/engines/c/knotbench.c
+--- pristine/engines/c/knotbench.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/knotbench.c	2026-09-12 08:03:52.999994314 -0700
+@@ -0,0 +1,84 @@
++/* knotbench.c — CDF-knot map A/B in ONE binary (cdf-knots, 2026-09-12).
++ *
++ * The engine is built once with -DLOGOS_CDF_KNOTS. The map is switched off per call through the
++ * environment (LOGOS_KNOTS=0, read once per partition in cd_build), so the two halves of every pair
++ * run the SAME machine code and the paired ratio carries no code-layout bias (CLAUDE.md rule 3; the
++ * hf_lpt_on / LOGOS_LPT pattern). bench_paired returns t(off)/t(on): above 1.000 means the map is
++ * faster. Every output is verified against qsort before timing.
++ *
++ * Usage: ./knotbench [pairs] [n] [shape] [threads]     LOGOS_THREADS=N overrides the parallel count. */
++#define _GNU_SOURCE
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <stdint.h>
++
++void kn0_sort_f64(double *, size_t, int); int kn0_num_cpus(void);
++
++static void knots_off(double *a, size_t n, int P) { setenv("LOGOS_KNOTS", "0", 1); kn0_sort_f64(a, n, P); }
++static void knots_on(double *a, size_t n, int P)  { setenv("LOGOS_KNOTS", "1", 1); kn0_sort_f64(a, n, P); }
++
++static uint64_t RS = 88172645463325252ULL;
++static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
++
++typedef void (*gen_fn)(double *, size_t);
++static void g_heavy(double *a, size_t n)     { for (size_t i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - fr() * 0.999999, -1.0 / 1.2); }   /* parbench's heavy_tail */
++static void g_pareto25(double *a, size_t n)  { for (size_t i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - fr() * 0.999999, -1.0 / 2.5); }
++static void g_lognorm(double *a, size_t n)   { for (size_t i = 0; i < n; i++) { double u = fr() + 1e-12, v = fr(); a[i] = exp(3.0 * sqrt(-2.0 * log(u)) * cos(6.283185307 * v)); } }
++static void g_expon(double *a, size_t n)     { for (size_t i = 0; i < n; i++) a[i] = -1e6 * log(1.0 - fr() * 0.999999); }
++static void g_uniform(double *a, size_t n)   { for (size_t i = 0; i < n; i++) a[i] = fr() * 2e9 - 1e9; }
++static void g_bimodal(double *a, size_t n)   { for (size_t i = 0; i < n; i++) a[i] = ((nr() & 1) ? 1e9 : -1e9) + fr() * 1e6; }
++static void g_quant(double *a, size_t n)     { for (size_t i = 0; i < n; i++) a[i] = (double)(nr() % 4096) / 64.0; }
++static void g_clustered(double *a, size_t n) { for (size_t i = 0; i < n; i++) a[i] = (double)(nr() % 16) * 1e8 + fr() * 1e5; }
++static void g_intwide(double *a, size_t n)   { for (size_t i = 0; i < n; i++) a[i] = (double)(int32_t)(uint32_t)nr(); }
++static void g_gauss(double *a, size_t n)     { for (size_t i = 0; i < n; i++) { double u = fr() + 1e-12, v = fr(); a[i] = 1e6 * sqrt(-2.0 * log(u)) * cos(6.283185307 * v); } }
++
++static const struct { const char *name; gen_fn g; } SH[] = {
++    { "heavy_tail", g_heavy }, { "pareto_2.5", g_pareto25 }, { "lognormal", g_lognorm }, { "exponential", g_expon },
++    { "gaussian", g_gauss }, { "clustered", g_clustered },
++    { "uniform", g_uniform }, { "bimodal", g_bimodal }, { "quantized", g_quant }, { "int_wide", g_intwide },
++};
++#define NSH ((int)(sizeof SH / sizeof SH[0]))
++
++static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
++
++int main(int argc, char **argv) {
++    int reps = argc > 1 ? atoi(argv[1]) : 40; if (reps < 8) reps = 8;
++    size_t n = argc > 2 ? (size_t)atol(argv[2]) : 8000000;
++    const char *only = argc > 3 && argv[3][0] ? argv[3] : NULL;
++    int onlyT = argc > 4 ? atoi(argv[4]) : 0;
++    int P = bench_threads(kn0_num_cpus());
++    double *base = malloc(n * 8), *work = malloc(n * 8), *ref = malloc(n * 8);
++    if (!base || !work || !ref) return 1;
++
++    printf("CDF-knot map A/B: one binary, LOGOS_KNOTS=0 vs on, n=%zu, %d pairs, threads %d and %d\n", n, reps, P, P / 2 > 0 ? P / 2 : 1);
++    printf("ratio = t(off)/t(on): > 1.000 means the knot map is faster. Same code both halves: no layout bias.\n\n");
++    printf("  %-12s %2s %9s %9s %9s  %s\n", "shape", "T", "ratio", "p10", "p90", "verify");
++
++    for (int k = 0; k < NSH; k++) {
++        if (only && strcmp(only, SH[k].name) != 0) continue;
++        RS = 88172645463325252ULL;
++        SH[k].g(base, n);
++        memcpy(ref, base, n * 8); qsort(ref, n, 8, cmp_d);      /* rule 1: verify before timing */
++        int tc[3] = { P, P / 2 > 0 ? P / 2 : 1, 1 };
++        int ok = 1;
++        for (int ti = 0; ti < 3; ti++) {
++            memcpy(work, base, n * 8); knots_off(work, n, tc[ti]); ok &= memcmp(work, ref, n * 8) == 0;
++            memcpy(work, base, n * 8); knots_on(work, n, tc[ti]);  ok &= memcmp(work, ref, n * 8) == 0;
++        }
++        for (int ti = 0; ti < 3; ti++) {
++            if (onlyT && tc[ti] != onlyT) continue;
++            if (!onlyT && ti == 2 && k != 0) continue;              /* 1 thread never partitions: one row as the identity check */
++            double p10 = 0, p90 = 0;
++            double med = bench_paired(knots_off, knots_on, base, work, n, tc[ti], reps, &p10, &p90);
++            printf("  %-12s %2d %9.3f %9.3f %9.3f  %s\n", SH[k].name, tc[ti], med, p10, p90, ok ? "ok" : "FAILED");
++            printf("ROW\t%s\t%d\t%.5f\t%.5f\t%.5f\t%d\n", SH[k].name, tc[ti], med, p10, p90, ok);
++            fflush(stdout);
++        }
++    }
++    free(base); free(work); free(ref);
++    return 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x knotbench -x knotprobe -x parbench -x __pycache__ pristine/engines/c/knotprobe.c work/engines/c/knotprobe.c
+--- pristine/engines/c/knotprobe.c	1969-12-31 16:00:00.000000000 -0800
++++ work/engines/c/knotprobe.c	2026-09-12 07:54:22.142631867 -0700
+@@ -0,0 +1,41 @@
++/* knotprobe.c — one traced sort per shape at P threads: which map the trial picked, the leaf
++ * imbalance the sample produced, spills. Built with -DLOGOS_TRACE. Usage: ./knotprobe [shape] [threads] [n] */
++#define _GNU_SOURCE
++#include "logos_psort.h"
++#include "bench_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++static uint64_t RS = 7; static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
++static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
++static const char *NM[] = { "heavy_tail", "pareto_2.5", "lognormal", "uniform", "bimodal", "quantized", "exponential", "clustered", "int_wide" };
++#define NS 9
++static void gen(double *a, size_t n, int d) {
++    size_t i;
++    switch (d) {
++    case 0: for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - fr() * 0.999999, -1.0 / 1.2); break;
++    case 1: for (i = 0; i < n; i++) a[i] = 1000.0 * pow(1.0 - fr() * 0.999999, -1.0 / 2.5); break;
++    case 2: for (i = 0; i < n; i++) { double u = fr() + 1e-12, v = fr(); a[i] = exp(3.0 * sqrt(-2.0 * log(u)) * cos(6.283185307 * v)); } break;
++    case 3: for (i = 0; i < n; i++) a[i] = fr() * 2e9 - 1e9; break;
++    case 4: for (i = 0; i < n; i++) a[i] = ((nr() & 1) ? 1e9 : -1e9) + fr() * 1e6; break;
++    case 5: for (i = 0; i < n; i++) a[i] = (double)(nr() % 4096) / 64.0; break;
++    case 6: for (i = 0; i < n; i++) a[i] = -1e6 * log(1.0 - fr() * 0.999999); break;
++    case 7: for (i = 0; i < n; i++) a[i] = (double)(nr() % 16) * 1e8 + fr() * 1e5; break;
++    default: for (i = 0; i < n; i++) a[i] = (double)(int32_t)(uint32_t)nr(); break;
++    }
++}
++int main(int argc, char **argv) {
++    const char *only = argc > 1 && argv[1][0] && strcmp(argv[1], "all") ? argv[1] : NULL;
++    int P = argc > 2 ? atoi(argv[2]) : bench_threads(logos_num_cpus());
++    size_t n = argc > 3 ? (size_t)atol(argv[3]) : 8000000;
++    double *a = malloc(n * 8);
++    for (int d = 0; d < NS; d++) {
++        if (only && strcmp(only, NM[d])) continue;
++        RS = 7; gen(a, n, d);
++        fprintf(stderr, "== %s, %d threads, n=%zu\n", NM[d], P, n);
++        logos_sort_f64(a, n, P);
++        for (size_t i = 1; i < n; i++) if (a[i - 1] > a[i]) { fprintf(stderr, "UNSORTED\n"); return 1; }
++    }
++    return 0;
++}
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x knotbench -x knotprobe -x parbench -x __pycache__ pristine/engines/c/logos_psort.c work/engines/c/logos_psort.c
+--- pristine/engines/c/logos_psort.c	2026-09-12 07:43:37.622126588 -0700
++++ work/engines/c/logos_psort.c	2026-09-12 08:55:14.212548830 -0700
+@@ -1815,6 +1815,9 @@
+     int ks_key_ok; uint64_t kk_lo, kk_hi; double kk_scale;   /* the same test in KEY space: log-uniform data (Benford) certifies here */
+     int ex_ok; uint64_t ex_e0; double dup_frac; ex_ent_t ex[256];   /* exponent map (ex_e0 = the lowest binade sampled) and the largest single-value share */
+     int md_ok, md_nm, md_first[8], md_last[8]; double md_lo[8], md_hi[8], md_scale[8];   /* per-mode linear map: certified uniform INSIDE each mode */
++#ifdef LOGOS_CDF_KNOTS
++    int cd_ok, cd_shift, cd_nseg, cd_nk; uint64_t cd_klo, cd_khi, cd_mask; double cd_tol, cd_bal; struct cd_cell *cd_cells; struct cd_flat *cd_flat; struct cd_seg *cd_seg; void *cd_mem;   /* CDF-knot map (mode 10) */
++#endif
+ } job_t;
+ typedef struct { job_t *j; int t; ctx_t *ctx; } warg_t;
+ 
+@@ -1859,6 +1862,155 @@
+     if (en->span) { double f = (double)(k & EX_MASK) * en->slope; off = f > 0 ? (unsigned)f : 0; if (off >= en->span) off = en->span - 1; }
+     return (int)(en->base + off);
+ }
++
++/* ---- CDF-knot map (cdf-knots, 2026-09-12; OUTSIDE_THE_BOX B1): knots placed by CURVATURE ----
++ * Every other map places its knots by position (the certified equi-width grids, the exponent map's
++ * binades, the splitter tables' cells) or by count (the splitters themselves). This one runs
++ * Douglas-Peucker over the sorted sample's rank-against-key curve: the chord between the two ends,
++ * split at the point of largest vertical deviation while that deviation exceeds CD_TOL buckets. Knots
++ * land where the CDF bends and nowhere else. The x axis is the order-preserving KEY, not the value:
++ * a Pareto is exponential in key space and bent like a hockey stick in value space, and the cell index
++ * below has to be equi-width in something.
++ *
++ * Two lookups were built. The FIRST (opt-in -DCD_SEGMENT_LOOKUP) indexes a cell by key, the cell names
++ * the segment containing its start plus the key of the first knot inside it (branch-free +1), and the
++ * segment is one multiply-add: two dependent loads. Measured with the trace: built on every target
++ * shape (heavy_tail 78 knots, sample imbalance 1.31x) and NEVER chosen by the trial, because the key
++ * splitter table resolves a Pareto head in about the same two loads without the float conversions.
++ * The SECOND, the default, rasterises the fitted piecewise-linear function into CD_CELLS flat cells
++ * of the key range: each cell holds the fit's value at its start, its slope across the cell (the
++ * segment's own slope, or the chord of the fit when a knot falls inside the cell) and the bucket
++ * range the fit spans there. Lookup: one shift, one 16-byte load, one multiply-add, two clamps -- the
++ * exponent map's shape, at 16x its resolution and with the DP's knots deciding what each cell holds.
++ * The clamps make the map monotone whatever the arithmetic rounds to: cell c never returns above
++ * floor(fit at its end), cell c+1 never below the same number. The fit is redone with the tolerance
++ * halved while the sample imbalance exceeds CD_BAL_MAX, the trial times it against the splitter
++ * tables like every other candidate, and BAL_OK vets it like every other map. Approximate maps are
++ * only legal in the histogram-free partition, which counts and places with the same map; the
++ * histogram path never sees mode 10.
++ * OPT-IN: -DLOGOS_CDF_KNOTS; LOGOS_KNOTS=0 in the environment turns it off inside one binary so the
++ * A/B carries no code-layout bias (make knotbench). Measured: see experiments/team/cdf-knots.md. */
++#ifdef LOGOS_CDF_KNOTS
++#ifndef CD_TOL
++#define CD_TOL 0.5               /* Douglas-Peucker tolerance, in buckets */
++#endif
++#ifndef CD_CELLS
++#define CD_CELLS 4096
++#endif
++#ifndef CD_MAX_KNOTS
++#define CD_MAX_KNOTS 1024
++#endif
++#ifndef CD_BAL_MAX
++#define CD_BAL_MAX 1.5           /* sample imbalance beyond which the tolerance is halved and the fit redone (up to 4 rounds) */
++#endif
++struct cd_cell { uint64_t kn1; int32_t s0; int32_t multi; };                   /* segment lookup: first knot strictly inside the cell (~0 if none); segment at the cell start; more knots follow */
++struct cd_seg  { uint64_t k0; double slope, y0; int32_t blo, bhi; };           /* a DP segment: y = y0 + ((k - k0) >> 1) * slope, clamped to [blo, bhi] */
++struct cd_flat { double slope; float y0; int16_t blo, bhi; };                  /* flat lookup: y = y0 + (k & mask) * slope over the cell, clamped */
++typedef struct cd_cell cd_cell_t; typedef struct cd_seg cd_seg_t; typedef struct cd_flat cd_flat_t;
++static inline int cd_on(void) { const char *e = getenv("LOGOS_KNOTS"); return !(e && e[0] == '0'); }
++static inline __attribute__((always_inline)) int cd_lookup(const job_t *j, double x) {
++    uint64_t k = total_key(x);
++    if (k < j->cd_klo) return 0;
++    if (k >= j->cd_khi) return j->nbk - 1;
++#ifdef CD_SEGMENT_LOOKUP
++    const cd_cell_t *ce = &j->cd_cells[(k - j->cd_klo) >> j->cd_shift];
++    int s = ce->s0 + (k >= ce->kn1);
++    if (__builtin_expect(ce->multi, 0)) { const cd_seg_t *sg = j->cd_seg; while (k >= sg[s + 1].k0) s++; }   /* sentinel seg[nseg].k0 = ~0 */
++    const cd_seg_t *sg = &j->cd_seg[s];
++    double y = sg->y0 + (double)(int64_t)((k - sg->k0) >> 1) * sg->slope;
++    int b = (int)y; b = b < sg->blo ? sg->blo : b; return b > sg->bhi ? sg->bhi : b;
++#else
++    uint64_t d = k - j->cd_klo; const cd_flat_t *ce = &j->cd_flat[d >> j->cd_shift];
++    double y = (double)ce->y0 + (double)(int64_t)(d & j->cd_mask) * ce->slope;   /* shift <= 52, so the in-cell offset fits an int64 */
++    int b = (int)y; b = b < ce->blo ? ce->blo : b; return b > ce->bhi ? ce->bhi : b;
++#endif
++}
++/* the fitted function at key k, segment s (caller keeps s current) */
++static inline double cd_eval(const cd_seg_t *sg, int s, uint64_t k) { return sg[s].y0 + (double)(int64_t)((k - sg[s].k0) >> 1) * sg[s].slope; }
++/* one fit at tolerance `tol` over the distinct points (kx, ky): returns the segment count or -1 */
++static int cd_fit(job_t *j, const uint64_t *kx, const double *ky, size_t np, double tol) {
++    uint8_t *isk = calloc(np, 1); size_t (*stk)[2] = malloc((2 * CD_MAX_KNOTS + 8) * sizeof *stk); int nk = 2, sp = 0, ok = 1;
++    if (!isk || !stk) { free(isk); free(stk); return -1; }
++    isk[0] = isk[np - 1] = 1; stk[sp][0] = 0; stk[sp][1] = np - 1; sp++;
++    while (sp && ok) {
++        size_t lo = stk[--sp][0], hi = stk[sp][1];
++        if (hi - lo < 2) continue;
++        double x0 = (double)kx[lo], slope = (ky[hi] - ky[lo]) / ((double)kx[hi] - x0), dmax = -1; size_t imax = lo;
++        for (size_t i = lo + 1; i < hi; i++) { double d = ky[i] - (ky[lo] + ((double)kx[i] - x0) * slope); if (d < 0) d = -d; if (d > dmax) { dmax = d; imax = i; } }
++        if (dmax > tol) {
++            if (++nk > CD_MAX_KNOTS) { ok = 0; break; }
++            isk[imax] = 1; stk[sp][0] = lo; stk[sp][1] = imax; sp++; stk[sp][0] = imax; stk[sp][1] = hi; sp++;
++        }
++    }
++    free(stk);
++    if (!ok) { free(isk); return -1; }
++    int nseg = nk - 1;
++    free(j->cd_mem); j->cd_mem = NULL; j->cd_ok = 0;                      /* a failed allocation below must not leave a dangling map */
++    size_t segb = ((size_t)nseg + 1) * sizeof(cd_seg_t), cellb = (size_t)CD_CELLS * sizeof(cd_cell_t), flatb = (size_t)CD_CELLS * sizeof(cd_flat_t);
++    j->cd_mem = malloc(segb + cellb + flatb + 64); if (!j->cd_mem) { free(isk); return -1; }
++    j->cd_seg = (cd_seg_t *)j->cd_mem; j->cd_cells = (cd_cell_t *)((char *)j->cd_mem + segb);
++    j->cd_flat = (cd_flat_t *)(((uintptr_t)((char *)j->cd_mem + segb + cellb) + 63) & ~(uintptr_t)63);   /* 64-byte aligned: four cells per line */
++    { int s = 0; size_t prev = 0;
++      for (size_t i = 1; i < np; i++) if (isk[i]) {
++          cd_seg_t *g = &j->cd_seg[s]; g->k0 = kx[prev]; g->y0 = ky[prev];
++          double len = (double)(int64_t)((kx[i] - kx[prev]) >> 1);
++          g->slope = len > 0 ? (ky[i] - ky[prev]) / len : 0.0;
++          g->blo = (int)ky[prev]; g->bhi = (int)ky[i]; if (g->bhi > j->nbk - 1) g->bhi = j->nbk - 1; if (g->blo > g->bhi) g->blo = g->bhi;
++          prev = i; s++; }
++      j->cd_seg[nseg].k0 = UINT64_MAX; j->cd_seg[nseg].slope = 0; j->cd_seg[nseg].y0 = (double)(j->nbk - 1); j->cd_seg[nseg].blo = j->cd_seg[nseg].bhi = j->nbk - 1; }
++    free(isk);
++    j->cd_nseg = nseg; j->cd_nk = nk; j->cd_klo = kx[0]; j->cd_khi = kx[np - 1];
++    { uint64_t span = j->cd_khi - j->cd_klo; int sh = 0; while ((span >> sh) >= (uint64_t)CD_CELLS) sh++; j->cd_shift = sh; j->cd_mask = (1ULL << sh) - 1; }
++    /* segment index per cell (the opt-in lookup) */
++    { int s = 0; const cd_seg_t *sg = j->cd_seg;
++      for (int c = 0; c < CD_CELLS; c++) {
++          unsigned __int128 cs = (unsigned __int128)j->cd_klo + ((unsigned __int128)(uint64_t)c << j->cd_shift);
++          unsigned __int128 ce = cs + ((unsigned __int128)1 << j->cd_shift);
++          while (s + 1 < nseg && (unsigned __int128)sg[s + 1].k0 <= cs) s++;
++          cd_cell_t *cl = &j->cd_cells[c]; cl->s0 = s;
++          cl->kn1 = (s + 1 < nseg && (unsigned __int128)sg[s + 1].k0 < ce) ? sg[s + 1].k0 : UINT64_MAX;
++          cl->multi = (s + 2 < nseg && (unsigned __int128)sg[s + 2].k0 < ce); } }
++    /* the fit rasterised: one line per cell, continuous at every cell boundary (the same evaluation
++       ends one cell and starts the next), so floor() of it is monotone across cells */
++    { int s = 0; const cd_seg_t *sg = j->cd_seg; double ycur = sg[0].y0, width = (double)(int64_t)(1ULL << j->cd_shift);
++      for (int c = 0; c < CD_CELLS; c++) {
++          unsigned __int128 ce = (unsigned __int128)j->cd_klo + ((unsigned __int128)(uint64_t)(c + 1) << j->cd_shift);
++          uint64_t kk = ce >= (unsigned __int128)j->cd_khi ? j->cd_khi : (uint64_t)ce;
++          while (s + 1 < nseg && sg[s + 1].k0 <= kk) s++;
++          double yend = cd_eval(sg, s, kk);
++          if (yend < ycur) yend = ycur;
++          cd_flat_t *f = &j->cd_flat[c]; f->y0 = (float)ycur; f->slope = (yend - ycur) / width;
++          int blo = (int)ycur, bhi = (int)yend; if (bhi > j->nbk - 1) bhi = j->nbk - 1; if (blo > bhi) blo = bhi;
++          f->blo = (int16_t)blo; f->bhi = (int16_t)bhi;
++          ycur = yend; } }
++    return nseg;
++}
++/* build from the sorted sample; sets cd_ok, cd_bal (sample imbalance) and cd_tol (the tolerance kept) */
++static void cd_build(job_t *j, const double *samp, size_t m) {
++    j->cd_ok = 0; j->cd_bal = 0; j->cd_tol = CD_TOL;
++    if (!cd_on() || m < 256 || j->nbk < 2) return;
++    uint64_t *kx = malloc(m * sizeof(uint64_t)); double *ky = malloc(m * sizeof(double)); size_t np = 0;
++    if (!kx || !ky) { free(kx); free(ky); return; }
++    for (size_t i = 0; i < m; i++) { uint64_t k = total_key(samp[i]); if (np && kx[np - 1] == k) continue; kx[np] = k; ky[np] = (double)i * (double)j->nbk / (double)m; np++; }
++    if (np >= 2 && kx[np - 1] > kx[0]) {
++        double tol = CD_TOL; { const char *e = getenv("LOGOS_KNOT_TOL"); if (e && atof(e) > 0) tol = atof(e); }   /* runtime override so a tolerance sweep is a one-binary A/B too */
++        for (int round = 0; round < 4; round++, tol *= 0.5) {
++            int nseg = cd_fit(j, kx, ky, np, tol); if (nseg < 0) break;
++            uint32_t load[MAX_BUCKETS]; memset(load, 0, (size_t)j->nbk * sizeof(uint32_t)); uint32_t mx = 0;
++            for (size_t i = 0; i < m; i++) load[cd_lookup(j, samp[i])]++;
++            for (int b = 0; b < j->nbk; b++) if (load[b] > mx) mx = load[b];
++            j->cd_bal = (double)mx * (double)j->nbk / (double)m; j->cd_tol = tol; j->cd_ok = 1;
++            int multi = 0; for (int c = 0; c < CD_CELLS; c++) multi += j->cd_cells[c].multi;
++            TRACE("par: cdf-knot map: tolerance %.3f -> %d knots (%zu distinct sample keys), sample imbalance %.2fx, %d of %d cells with 2+ knots, shift %d", tol, j->cd_nk, np, j->cd_bal, multi, CD_CELLS, j->cd_shift);
++            if (j->cd_bal <= CD_BAL_MAX) break;
++        }
++    }
++    free(kx); free(ky);
++}
++static void cd_free(job_t *j) { free(j->cd_mem); j->cd_mem = NULL; j->cd_ok = 0; }
++#else
++#define cd_free(j) ((void)0)
++#endif
+ static void do_hist(job_t *j) {
+     size_t ch;
+ #ifndef LOGOS_NO_SPLITTER_TABLE
+@@ -1999,6 +2151,9 @@
+         int b = (int)((double)(k - j->kk_lo) * j->kk_scale); return b >= j->nbk ? j->nbk - 1 : b;
+     }
+     if (mode == 9) return hf_lookup_md(j, x);                         /* every mode certified uniform inside itself */
++#ifdef LOGOS_CDF_KNOTS
++    if (mode == 10) return cd_lookup(j, x);                           /* knots by curvature: cell, segment, one multiply-add */
++#endif
+     if (mode == 8) {                                                  /* exponent-histogram map: approximate inverse CDF */
+         uint64_t k = total_key(x), q = k >> EX_SHIFT;
+         unsigned e = q <= j->ex_e0 ? 0u : (unsigned)(q - j->ex_e0); if (e > 255u) e = 255u;
+@@ -2026,19 +2181,26 @@
+     if (j->md_ok) { h->mode = 9; return; }                            /* uniform inside every mode: compares then one multiply */
+ #endif
+ #ifndef LOGOS_NO_SPLITTER_TABLE
+-    int cand[5], nc = 0;
++    int cand[6], nc = 0;
+     if (j->bt_ok && j->bt.vok) cand[nc++] = 1;
+     if (j->bt_ok && j->bt.kok) cand[nc++] = 2;
+     if (j->bt_ok && j->bt.mok && j->bt.merr <= 1) cand[nc++] = 4;
+     if (j->bt_ok && j->bt.dok) cand[nc++] = 5;
+     if (j->ex_ok) cand[nc++] = 8;
++#ifdef LOGOS_CDF_KNOTS
++    if (j->cd_ok) cand[nc++] = 10;                                    /* only when every certified grid declined (they return above) */
++#endif
+     if (nc == 0) return;
+     size_t *c = calloc(j->nbk, sizeof(size_t)); if (!c) { h->mode = cand[0]; return; }
+     double best = 1e300; size_t W = j->n < 3 * 16384 ? j->n / 3 : 16384;
+     for (int q = 0; q < nc; q++) {
+         size_t res = 0; double t0 = bt_now();
+         for (int w = 0; w < 3; w++) { size_t lo = (j->n / 4) * (size_t)(w + 1) - W / 2, hi = lo + W;
+-            for (size_t i = lo; i < hi; i++) { int b = cand[q] == 1 ? bt_lookup_v(&j->bt, j->src[i], 0, &res) : cand[q] == 2 ? bt_lookup_k(&j->bt, j->src[i], 0, &res) : cand[q] == 5 ? bt_lookup_d(&j->bt, j->src[i], 0, &res) : cand[q] == 8 ? hf_lookup_ex(j, j->src[i]) : bt_lookup_m(&j->bt, j->src[i], 0, &res); c[b]++; } }
++            for (size_t i = lo; i < hi; i++) { int b = cand[q] == 1 ? bt_lookup_v(&j->bt, j->src[i], 0, &res) : cand[q] == 2 ? bt_lookup_k(&j->bt, j->src[i], 0, &res) : cand[q] == 5 ? bt_lookup_d(&j->bt, j->src[i], 0, &res) : cand[q] == 8 ? hf_lookup_ex(j, j->src[i]) :
++#ifdef LOGOS_CDF_KNOTS
++                                                    cand[q] == 10 ? cd_lookup(j, j->src[i]) :
++#endif
++                                                    bt_lookup_m(&j->bt, j->src[i], 0, &res); c[b]++; } }
+         double dt = bt_now() - t0;
+         if (dt < best) { best = dt; h->mode = cand[q]; double p = (double)res / (double)(3 * W); h->style = (p > 0.85 || p < 0.15) ? 0 : 1; }
+     }
+@@ -2289,7 +2451,7 @@
+                 size_t maxb = 1, lsz[MAX_BUCKETS];
+                 for (int b = 0; b < nbk; b++) { size_t z = h.cnt[b] + h.spc[b]; lsz[b] = z; h.bstart[b + 1] = h.bstart[b] + z; if (z > maxb) maxb = z; }
+                 hf_order(h.order, lsz, nbk);                          /* biggest leaf first: the last one picked up sets the finish time */
+-                TRACE("par: leaf sizes max %zu mean %zu -> imbalance %.2fx", lsz[h.order[0]], n / (size_t)nbk, (double)lsz[h.order[0]] * (double)nbk / (double)n);
++                TRACE("par: leaf sizes max %zu mean %zu -> imbalance %.2fx", maxb, n / (size_t)nbk, (double)maxb * (double)nbk / (double)n);   /* was lsz[h.order[0]]: bucket 0 unless LPT is on (fixed 2026-09-12, cdf-knots) */
+                 if (h.bstart[nbk] != n) h.declined = 1;
+                 for (int t = 0; !h.declined && t < P; t++) if (!ctx_init(&ctxs[t], maxb, 0)) h.declined = 1;
+                 PROF(for (int t = 0; t < P; t++) ctxs[t].tid = t;)
+@@ -3552,6 +3714,9 @@
+         if (ok) { j.md_ok = 1; j.md_nm = nm; TRACE("par: all %d modes certify uniform inside themselves", nm); }
+     }
+ #endif
++#if defined(LOGOS_CDF_KNOTS) && defined(LOGOS_HISTFREE)
++    if (!j.ks_ok && !j.ks_key_ok && !j.md_ok) cd_build(&j, samp, m);   /* knots by curvature, only where no certified grid applies */
++#endif
+     /* A map is only usable if the partition it produces is balanced, and the per-thread trial times the
+      * LOOKUP, not the partition: it once picked a map that sent 63% of the data to the spill list. Apply
+      * each certified map to the sample here and drop it if any bucket would take more than HF_BAL_MAX
+@@ -3569,6 +3734,9 @@
+ #endif
+         BAL_OK(hf_lookup_md(&j, samp[i]), j.md_ok);
+         BAL_OK(hf_lookup_ex(&j, samp[i]), j.ex_ok);
++#if defined(LOGOS_CDF_KNOTS) && defined(LOGOS_HISTFREE)
++        BAL_OK(cd_lookup(&j, samp[i]), j.cd_ok);
++#endif
+ #undef BAL_OK
+     }
+     free(samp); j.sp = sp;
+@@ -3581,7 +3749,7 @@
+ #ifndef LOGOS_NO_SPLITTER_TABLE
+         bt_free(&j.bt);
+ #endif
+-        free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
++        cd_free(&j); free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
+         PROF(prof_phase(LOGOS_PH_OTHER); prof_finish(LOGOS_ROUTE_PARTITION, t_start);)
+         return;
+     }
+@@ -3617,12 +3785,12 @@
+     TRACE("par: buckets done");
+     barrier_destroy(&j.bar);
+     for (int t = 0; t < P; t++) ctx_free(&ctxs[t]);
+-    if (!ok) { if (pooled) pool_release(); else { free(j.bidx); free(j.dst); } free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs); qsort(a, n, sizeof(double), cmp_d); return; }
++    if (!ok) { if (pooled) pool_release(); else { free(j.bidx); free(j.dst); } cd_free(&j); free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs); qsort(a, n, sizeof(double), cmp_d); return; }
+     if (pooled) pool_release(); else { free(j.bidx); free(j.dst); }
+ #ifndef LOGOS_NO_SPLITTER_TABLE
+     bt_free(&j.bt);
+ #endif
+-    free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
++    cd_free(&j); free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
+     PROF(prof_phase(LOGOS_PH_OTHER); prof_finish(LOGOS_ROUTE_PARTITION, t_start);)
+     return;
+ fallback:
+@@ -3633,7 +3801,7 @@
+ #ifndef LOGOS_NO_SPLITTER_TABLE
+     bt_free(&j.bt);
+ #endif
+-    free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
++    cd_free(&j); free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
+     qsort(a, n, sizeof(double), cmp_d);
+ }
+ 
+Binary files pristine/engines/c/scalebench and work/engines/c/scalebench differ
+diff -ruN -x '*.o' -x '*.a' -x '*.so' -x harness -x example-bin -x '*.html' -x pairprobe -x ledgerbench -x viewbench -x intbench -x knotbench -x knotprobe -x parbench -x __pycache__ pristine/tools/ledger_rerun.py work/tools/ledger_rerun.py
+--- pristine/tools/ledger_rerun.py	2026-09-12 07:43:38.086122013 -0700
++++ work/tools/ledger_rerun.py	2026-09-12 08:27:26.939831295 -0700
+@@ -43,6 +43,8 @@
+     ("-DLOGOS_INT_NARROW", "bucket-relative int32 digit narrowing", "ledger: mixed, +21%/-16%"),
+     ("-DLOGOS_MODEL_TABLE", "linear model splitter table", "ledger: 0.93-1.09x, 'noise'"),
+     ("-DAV_PIVOT_NET", "sorting-network pivot for the AVX2 leaf", "ledger: 0.94-1.06x, 'noise'"),
++    ("-DLOGOS_CDF_KNOTS", "CDF-knot map: knots placed by curvature (cdf-knots)",
++     "new 2026-09-12; the one-binary env-toggle A/B is make knotbench"),
+ ]
+ 
+ 
+@@ -64,7 +66,7 @@
+     if "error" in out:
+         print("  BUILD FAILED:\n" + out[:800])
+         return None
+-    rc, out = sh("./ledgerbench %d %d" % (pairs, n))
++    rc, out = sh("flock /tmp/logos-bench.lock ./ledgerbench %d %d" % (pairs, n))   # one benchmark machine-wide at a time
+     rows = {}
+     for line in out.splitlines():
+         if not line.startswith("ROW\t"):

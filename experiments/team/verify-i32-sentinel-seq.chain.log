@@ -1,0 +1,112 @@
+=== chain start Sat Sep 12 08:58:25 PDT 2026 ===
+=== 1. pairprobe (Sat Sep 12 08:58:25 PDT 2026) ===
+paired null test: identical engine in both halves, n=8000000, 40 pairs, 14 threads
+the true ratio is 1.000; everything below is this machine's measurement error
+
+  size          median       p10       p90    resolves
+  1000000        1.020     0.619     1.477        9.4%
+  8000000        1.014     0.837     1.223        4.4%
+
+  median is what to report; p10/p90 bound a single pair. "resolves" is the rough
+  standard error of the median over these pairs: effects smaller than that are noise.
+=== 2. skeptbench 20 8M both mode0 (Sat Sep 12 09:42:38 PDT 2026) ===
+skeptbench: n=8000000, 20 pairs, P=14, mode 0 (0=all toggles, 1=window only, 2=cap+pool only, 3=DIV only). old/new > 1 = NEW faster
+  shape                  thr  old/new      p10      p90   old med   new med  note
+  bulk + one INT32_MIN     1    2.734    1.665    3.562   259.8ms    98.8ms  DECISIVE (a): the sentinel row
+  bulk 0..99               1    0.946    0.767    1.466   118.6ms   119.5ms  null
+  exp mean 3e5             1    0.924    0.757    1.335   655.2ms   729.2ms  GUARD: natural tail, window fires
+  gauss sigma 3e5          1    0.980    0.764    1.745   609.1ms   652.8ms  GUARD: natural two-sided tail
+  span n/2                 1    1.651    1.148    2.644   996.4ms   563.5ms  GUARD (c): DIV 1 counted, DIV 4 radix
+  span n                   1    1.648    1.312    2.719  1172.6ms   731.5ms  (c): the top edge
+  full 2^32                1    0.964    0.665    1.059   724.1ms   737.6ms  guard
+  span 1e6                14    2.661    2.069    3.380   286.3ms   111.5ms  DECISIVE (b): the band
+  span 3e6                14    1.304    1.010    1.745   298.9ms   248.6ms  band: 5 x 12 MB
+  exp mean 3e5            14    1.261    0.789    1.544   275.9ms   217.0ms  GUARD: old declined, new counts with window
+  gauss sigma 3e5         14    0.993    0.920    1.175   293.5ms   295.1ms  GUARD
+  bimodal far             14    1.086    0.884    1.191   273.5ms   260.4ms  GUARD: declines at sample, partition, narrow leaves
+  full 2^32               14    0.967    0.900    1.113   314.4ms   321.9ms  GUARD: 168 leaves each pay a sample and decline
+=== 3. i32abbench 16 8M G (Sat Sep 12 09:50:50 PDT 2026) ===
+i32abbench: n=8000000, 16 pairs, P=14. One binary, runtime toggles: no layout bias. ratio > 1 = NEW faster.
+
+== G: sentinel row / clean row, same engine, adjacent, 1 thread (the target's metric) ==
+  shape                        win ON      p10      p90 |  win OFF      p10      p90
+  bulk + one INT32_MIN          1.090    0.782    1.332 |    2.367    1.859    5.940  
+ROW	G	bulk + one INT32_MIN	1	1.0904	0.7817	1.3324	2.3674	1
+  bulk + both extremes          1.156    0.837    1.312 |    5.336    4.948    6.213  
+ROW	G	bulk + both extremes	1	1.1561	0.8371	1.3124	5.3357	1
+  bulk + 0.1% wide tail         1.138    1.033    1.404 |    5.553    2.893    6.917  
+ROW	G	bulk + 0.1% wide tail	1	1.1380	1.0330	1.4043	5.5535	1
+  bulk + one -1                 0.981    0.900    1.094 |    1.027    0.813    1.311  control: plain counting both
+ROW	G	bulk + one -1	1	0.9814	0.9000	1.0943	1.0273	1
+=== 4. i32abbench 16 1M C (Sat Sep 12 09:54:12 PDT 2026) ===
+i32abbench: n=1000000, 16 pairs, P=14. One binary, runtime toggles: no layout bias. ratio > 1 = NEW faster.
+
+== C: sequential counting gate span <= n/DIV (old = DIV 1), 1 thread ==
+  shape           DIV  old/new      p10      p90  note
+  span 1e6          2    1.401    1.155    1.660  counts under every DIV <= 8
+ROW	C	span 1e6	2	1.4006	1.1551	1.6602	1
+  span 1e6          4    1.413    0.871    1.513  counts under every DIV <= 8
+ROW	C	span 1e6	4	1.4131	0.8710	1.5134	1
+  span 1e6          8    1.438    1.219    1.635  counts under every DIV <= 8
+ROW	C	span 1e6	8	1.4377	1.2194	1.6350	1
+  span 2e6          2    1.031    0.882    1.244  
+ROW	C	span 2e6	2	1.0307	0.8816	1.2444	1
+  span 2e6          4    0.975    0.755    1.225  
+ROW	C	span 2e6	4	0.9746	0.7549	1.2252	1
+  span 2e6          8    1.031    0.902    1.152  
+ROW	C	span 2e6	8	1.0311	0.9020	1.1520	1
+  span 4e6          2    1.012    0.842    1.182  
+ROW	C	span 4e6	2	1.0120	0.8420	1.1824	1
+  span 4e6          4    0.969    0.854    1.275  
+ROW	C	span 4e6	4	0.9693	0.8543	1.2754	1
+  span 4e6          8    0.977    0.858    1.114  
+ROW	C	span 4e6	8	0.9766	0.8580	1.1138	1
+  span n/2          2    0.961    0.913    1.099  
+ROW	C	span n/2	2	0.9609	0.9130	1.0993	1
+  span n/2          4    0.909    0.759    1.076  
+ROW	C	span n/2	4	0.9087	0.7589	1.0759	1
+  span n/2          8    0.927    0.684    1.385  
+ROW	C	span n/2	8	0.9272	0.6843	1.3851	1
+  span n            2    1.360    1.098    1.777  the inherited gate's top edge
+ROW	C	span n	2	1.3604	1.0975	1.7767	1
+  span n            4    1.566    1.216    1.922  the inherited gate's top edge
+ROW	C	span n	4	1.5663	1.2162	1.9218	1
+  span n            8    1.520    1.206    1.724  the inherited gate's top edge
+ROW	C	span n	8	1.5197	1.2062	1.7239	1
+=== 5. skeptbench 16 1M both mode0 (Sat Sep 12 09:54:43 PDT 2026) ===
+skeptbench: n=1000000, 16 pairs, P=14, mode 0 (0=all toggles, 1=window only, 2=cap+pool only, 3=DIV only). old/new > 1 = NEW faster
+  shape                  thr  old/new      p10      p90   old med   new med  note
+  bulk + one INT32_MIN     1    3.327    1.806    4.835    30.0ms     9.0ms  DECISIVE (a): the sentinel row
+  bulk 0..99               1    1.049    0.727    1.488     7.9ms     7.5ms  null
+  exp mean 3e5             1    1.018    0.837    1.084    38.3ms    37.4ms  GUARD: natural tail, window fires
+  gauss sigma 3e5          1    0.996    0.795    1.322    56.1ms    54.9ms  GUARD: natural two-sided tail
+  span n/2                 1    0.850    0.638    1.086    35.9ms    39.7ms  GUARD (c): DIV 1 counted, DIV 4 radix
+  span n                   1    1.419    1.194    1.481    57.5ms    42.0ms  (c): the top edge
+  full 2^32                1    1.004    0.935    1.087    50.0ms    49.6ms  guard
+  span 1e6                14    1.181    0.819    2.462    73.0ms    61.3ms  DECISIVE (b): the band
+  span 3e6                14    1.011    0.742    1.156    68.4ms    73.7ms  band: 5 x 12 MB
+  exp mean 3e5            14    0.979    0.661    1.152    69.1ms    69.3ms  GUARD: old declined, new counts with window
+  gauss sigma 3e5         14    0.913    0.775    1.133    57.3ms    62.3ms  GUARD
+  bimodal far             14    1.015    0.890    1.411    69.6ms    67.6ms  GUARD: declines at sample, partition, narrow leaves
+  full 2^32               14    1.016    0.739    1.205    70.0ms    65.1ms  GUARD: 168 leaves each pay a sample and decline
+=== 6. i32abbench 16 8M B (Sat Sep 12 09:55:21 PDT 2026) ===
+i32abbench: n=8000000, 16 pairs, P=14. One binary, runtime toggles: no layout bias. ratio > 1 = NEW faster.
+
+== B: parallel count route, table budget (old = fixed 262144-slot cap), 14 threads ==
+  shape           old/new      p10      p90 |    1T min    PT old    PT new P/1new  note
+  span 1e5          0.923    0.791    1.314 |     84.9ms     43.7ms     54.8ms   1.55  guard: under the old cap, same tables
+ROW	B	span 1e5	14	0.9234	0.7907	1.3144	1	84.90	43.72	54.83
+  span 5e5          3.210    2.839    4.496 |    133.6ms    254.5ms     67.2ms   1.99  band: 14 threads x 2 MB
+ROW	B	span 5e5	14	3.2098	2.8393	4.4962	1	133.63	254.51	67.17
+  span 1e6          2.535    1.558    3.420 |    175.5ms    249.7ms    105.6ms   1.66  THE target: 14 threads x 4 MB
+ROW	B	span 1e6	14	2.5346	1.5576	3.4199	1	175.47	249.67	105.57
+  span 2e6          2.022    1.697    2.859 |    162.1ms    194.5ms     84.2ms   1.92  band: 8 threads x 8 MB
+ROW	B	span 2e6	14	2.0223	1.6967	2.8590	1	162.11	194.47	84.22
+  span 4e6          1.029    0.787    1.882 |    300.5ms    265.4ms    234.9ms   1.28  band: 4 threads x 16 MB
+ROW	B	span 4e6	14	1.0295	0.7867	1.8823	1	300.54	265.42	234.93
+  span 8e6          0.957    0.784    1.219 |    316.0ms    275.7ms    280.6ms   1.13  declines (2 threads): partition, as before
+ROW	B	span 8e6	14	0.9566	0.7843	1.2191	1	315.96	275.69	280.62
+  full 2^32         1.038    0.901    1.209 |    256.6ms    244.7ms    240.0ms   1.07  guard: declines at the sample
+ROW	B	full 2^32	14	1.0379	0.9014	1.2086	1	256.58	244.66	240.02
+
+=== chain end Sat Sep 12 09:58:23 PDT 2026 ===

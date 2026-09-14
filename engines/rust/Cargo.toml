@@ -1,0 +1,14 @@
+[package]
+name = "logos-sort"
+version = "0.3.0"
+edition = "2021"
+description = "Parallel sample sort with a coarse interpolation leaf; benchmarked against slice::sort_unstable and rayon's par_sort_unstable."
+
+# The library itself has no dependencies. rayon is only used by the benchmark
+# (examples/bench.rs) as the parallel opponent.
+[dev-dependencies]
+rayon = "=1.10.0"   # last release supporting rustc 1.75
+
+[profile.release]
+lto = true
+codegen-units = 1

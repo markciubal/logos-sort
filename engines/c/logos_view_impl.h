@@ -133,7 +133,10 @@ void VFN(ranks)(VIEW *v, const size_t *ks, size_t m, VT *out) {
 void VFN(quantiles)(VIEW *v, const double *q, size_t m, VT *out) {
     if (!v || !q || !out || m == 0) return;
     size_t *ks = malloc(m * sizeof *ks);
-    if (!ks) return;
+    if (!ks) {                                          /* no room for the rank list: one at a time, the same answers. It used to return with out[] unwritten */
+        for (size_t i = 0; i < m; i++) { double x = q[i]; if (!(x > 0.0)) x = 0.0; if (x > 1.0) x = 1.0; out[i] = VFN(at)(v, (size_t)(x * (double)(v->n - 1) + 0.5)); }
+        return;
+    }
     for (size_t i = 0; i < m; i++) { double x = q[i]; if (!(x > 0.0)) x = 0.0; if (x > 1.0) x = 1.0; ks[i] = (size_t)(x * (double)(v->n - 1) + 0.5); }
     VFN(ranks)(v, ks, m, out);
     free(ks);

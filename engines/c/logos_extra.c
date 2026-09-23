@@ -89,7 +89,7 @@ size_t logos_find_outliers_f64(const double *a, size_t n, uint32_t *out, size_t 
     if (n == 0) return 0;
     if (budget == 0) { budget = (size_t)sqrt((double)n); if (budget < 3) budget = 3; }
     uint32_t *perm = (uint32_t *)malloc(n * 4), *inv = (uint32_t *)malloc(n * 4);
-    if (!perm || !inv) { free(perm); free(inv); return 0; }
+    if (!perm || !inv) { free(perm); free(inv); return SIZE_MAX; }   /* not 0: that reads as 'no outliers'. SIZE_MAX = could not be computed */
     logos_argsort_f64(a, n, perm);
     logos_inverse_perm(perm, n, inv);
     size_t cnt = 0;

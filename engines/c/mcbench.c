@@ -85,6 +85,7 @@ static const struct { const char *name; gen_fn g; } MC[] = {
 };
 #define NMC ((int)(sizeof MC / sizeof MC[0]))
 
+#define DENSE_SPAN_MULT_BENCH 16     /* the engine's DENSE_SPAN_MULT, for the header line */
 /* ---- section 3: dense consecutive integers, the single-thread gap the chaos map found ---- */
 static void dn_old(double *a, size_t n, int t) { setenv("LOGOS_NO_DENSE", "1", 1); logos_sort_f64(a, n, t); }
 static void dn_new(double *a, size_t n, int t) { unsetenv("LOGOS_NO_DENSE");       logos_sort_f64(a, n, t); }
@@ -111,9 +112,58 @@ static const struct { const char *name; gen_fn g; const char *note; } DN[] = {
 };
 #define NDN ((int)(sizeof DN / sizeof DN[0]))
 
+/* ---- mode `span` (2026-09-21): the dense-integer bitmap's span budget, laddered. n DISTINCT integers spread over s x n (one per
+ * stride of s, jittered inside it, then shuffled), sorted at ONE thread (the route is sequential-only) with the shipped budget
+ * (DENSE_SPAN_MULT, 4n) against the gate lifted to 64n (LOGOS_DENSE_SPAN=64). Rows up to s = 4 take the route on both sides and
+ * are the null; above it the lifted side takes the bitmap and the shipped side the leaf, so each row is the bitmap against the
+ * leaf at that span, and the ladder says where the budget should be. Lift the gate, measure the ladder, then set it.
+ * PREDICTION, written first (8.4M): s = 6 1.4-1.8x, s = 8 1.3-1.7x, s = 12 1.1-1.4x, s = 16 1.0-1.3x (the map is 16 MB, most of
+ * the last-level cache), s = 32 0.7-1.0 (32 MB, past it). At 1M everything fits, so the win should last to s = 32. */
+static const char *g_sp_lift = "256";   /* the lifted side's budget; ./mcbench P N span <k> sets it */
+static const char *g_sp_ship = NULL;  /* ./mcbench P N span <lift> <A>: A, when given, is the budget of the first side (e.g. the old 4) */
+static void sp_ship(double *a, size_t n, int t) { if (g_sp_ship) setenv("LOGOS_DENSE_SPAN", g_sp_ship, 1); else unsetenv("LOGOS_DENSE_SPAN"); logos_sort_f64(a, n, t); unsetenv("LOGOS_DENSE_SPAN"); }
+static void sp_lift(double *a, size_t n, int t) { if (!strcmp(g_sp_lift, "-")) { unsetenv("LOGOS_DENSE_SPAN"); logos_sort_f64(a, n, t); return; } setenv("LOGOS_DENSE_SPAN", g_sp_lift, 1); logos_sort_f64(a, n, t); unsetenv("LOGOS_DENSE_SPAN"); }
+/* guards for the widened gate: n draws WITH repeats over s x n (abandoned at the first repeat, which the birthday bound puts early),
+   and a clean spread with ONE repeat planted in the middle (abandoned after half a pass: the worst case the gate lets in) */
+static void g_withrep(double *a, size_t n, size_t s) { for (size_t i = 0; i < n; i++) a[i] = (double)(nr() % (s * n)); }
+static void g_spread(double *a, size_t n, size_t s);
+static void g_planted(double *a, size_t n, size_t s) { g_spread(a, n, s); size_t x = n / 2, y = n / 3; a[x] = a[y]; }
+static void g_spread(double *a, size_t n, size_t s) {
+    for (size_t i = 0; i < n; i++) a[i] = (double)(i * s + (s > 1 ? nr() % s : 0));
+    for (size_t i = n - 1; i > 0; i--) { size_t j = nr() % (i + 1); double x = a[i]; a[i] = a[j]; a[j] = x; }
+}
+
 int main(int argc, char **argv) {
     int pairs = argc > 1 ? atoi(argv[1]) : 24; if (pairs < 5) pairs = 5;
     size_t n = argc > 2 ? (size_t)atol(argv[2]) : 8388608;
+    if (argc > 3 && !strcmp(argv[3], "span")) {
+        double *b0 = malloc(n * 8), *w0 = malloc(n * 8), *r0 = malloc(n * 8); if (!b0 || !w0 || !r0) return 1;
+        if (argc > 4) g_sp_lift = argv[4];
+        if (argc > 5) { g_sp_ship = argv[5]; printf("(first side: LOGOS_DENSE_SPAN=%s; second side: %s)\n", g_sp_ship, strcmp(g_sp_lift, "-") ? g_sp_lift : "shipped"); }
+        const size_t S[] = { 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128 };
+        printf("DENSE-INTEGER BITMAP, SPAN LADDER, n = %zu, %d pairs, ONE thread: t(shipped budget, %dn) / t(gate lifted to %sn). Above 1 = the bitmap wins\n"
+               "at that span. Rows up to 4n take the route on both sides: they are the null.\n\n", n, pairs, (int)DENSE_SPAN_MULT_BENCH, g_sp_lift);
+        printf("  %-10s %9s %9s %9s  %s\n", "span", "ratio", "p10", "p90", "verify");
+        for (size_t k = 0; k < sizeof S / sizeof *S; k++) {
+            RS = 5 + k; g_spread(b0, n, S[k]); memcpy(r0, b0, n * 8); qsort(r0, n, 8, cmp_d);
+            int ok = 1; memcpy(w0, b0, n * 8); sp_ship(w0, n, 1); ok &= !memcmp(w0, r0, n * 8); memcpy(w0, b0, n * 8); sp_lift(w0, n, 1); ok &= !memcmp(w0, r0, n * 8);
+            double p10 = 0, p90 = 0, med = bench_paired(sp_ship, sp_lift, b0, w0, n, 1, pairs, &p10, &p90);
+            printf("  %2zun       %9.3f %9.3f %9.3f  %s\n", S[k], med, p10, p90, ok ? "ok" : "FAILED"); fflush(stdout);
+        }
+        struct { const char *nm; int kind; size_t s; } GD[] = { { "repeats 16n", 1, 16 }, { "repeats 64n", 1, 64 }, { "planted 16n", 2, 16 },
+            { "planted 64n", 2, 64 }, { "int_wide", 3, 0 }, { "uniform", 4, 0 } };
+        printf("\n  guards: the gate lets the first four in when lifted and the bitmap must give them back (repeats early, planted after half a pass)\n");
+        for (int k = 0; k < 6; k++) {
+            RS = 50 + (uint64_t)k;
+            if (GD[k].kind == 1) g_withrep(b0, n, GD[k].s); else if (GD[k].kind == 2) g_planted(b0, n, GD[k].s);
+            else if (GD[k].kind == 3) { for (size_t i = 0; i < n; i++) b0[i] = (double)(int32_t)nr(); } else { for (size_t i = 0; i < n; i++) b0[i] = (double)(nr() >> 11) / 9007199254740992.0; }
+            memcpy(r0, b0, n * 8); qsort(r0, n, 8, cmp_d);
+            int ok = 1; memcpy(w0, b0, n * 8); sp_ship(w0, n, 1); ok &= !memcmp(w0, r0, n * 8); memcpy(w0, b0, n * 8); sp_lift(w0, n, 1); ok &= !memcmp(w0, r0, n * 8);
+            double p10 = 0, p90 = 0, med = bench_paired(sp_ship, sp_lift, b0, w0, n, 1, pairs, &p10, &p90);
+            printf("  %-12s %8.3f %9.3f %9.3f  %s\n", GD[k].nm, med, p10, p90, ok ? "ok" : "FAILED"); fflush(stdout);
+        }
+        free(b0); free(w0); free(r0); return 0;
+    }
     int P = bench_threads(logos_num_cpus());
     double *base = malloc(n * 8), *w = malloc(n * 8), *ref = malloc(n * 8);
     if (!base || !w || !ref) return 1;

@@ -1,5 +1,47 @@
 # Changelog
 
+## (unreleased) — a sort() that never returned, two quadratic cliffs in flash sort, and an insertion sort with no budget; all found from the C engine's work
+
+The C engine returned UNSORTED output on NaN-free data holding subnormals (2026-09-20, engines/c/CHANGELOG): a value range
+narrower than about 1e-305 makes `classes / range` overflow to Infinity. All three engines share that value-linear bucket map,
+so the same inputs were run here. JavaScript's integer conversion hides the wrong answer and leaves the cost:
+
+- **`sort()` never returned on one NaN between two clusters.** The gap-split partition (two modes far apart: split at the gulf)
+  scanned with `arr[i] < pivot` from the left and `arr[j] >= pivot` from the right. A NaN fails BOTH tests, so when the two scans
+  met on one, neither index moved again: `[lows..., NaN, highs...]` with 6,000 elements hangs forever, plain Array or
+  Float64Array. Found from the C engine, where the same loop is intermittent (the meeting point depends on thread timing) and
+  spun a parallel sort about one run in fifteen. Both scans now use ONE predicate, `x < pivot`, so a NaN goes right. NaN order
+  stays unspecified; returning does not. `test/perf-guard.js` holds the case, and it hangs the suite if this ever comes back.
+- **`flashSort` on a subnormal-wide range: every element in bucket 0, then an O(n^2) insertion pass.** `x * Infinity | 0` and
+  `0 * Infinity | 0` are both 0. 300,001 plain-Array subnormals took **77 s** (42 ms now); 50,000 took 2.4-3.6 s. Output was
+  always correct. `flashSort` and `coarseBucketSort` now hand a range whose scale is not a positive finite number to the introsort.
+- **`flashSort` on a dense cluster inside a wide range: quadratic in the largest bucket, and nothing to do with subnormals.**
+  One scatter into n buckets, then ONE insertion pass. 100k distinct values near 0 among 200k spread over +-1e9 all sit in one
+  bucket, and the dispatcher's safety probe compares two quartiles, between which such a cluster hides: 300,001 elements took
+  **13-21 s** (about 30 ms now). The closing pass now carries a displacement budget (16 shifted slots per element, touched only
+  when an element actually moves); past it the array, a valid permutation at every step, goes to the coarse sort, which rescans
+  each bucket's own range.
+- Cost, measured (old module against new, interleaved, 40 pairs, 12 rows from 30k to 450k): about 3% on healthy flash-path data
+  (mean ratio 0.973; two identical copies of the old module read 1.000 with rows from 0.97 to 1.06, so single rows are inside
+  the floor and the mean is not). Scanning the counts for a large bucket was tried first and cost 5-11%: rejected.
+- `test/perf-guard.js` gained all three shapes (limit 300 ms; the cliffs were 77 s, 13 s and forever). Infinities, ranges whose width
+  overflows and all other edge inputs of the C probe were already handled correctly: 126 runs, 0 bad.
+
+- **The nearly-sorted branch below the momentum threshold ran a plain insertion sort with no budget** (found 2026-09-20 from the C
+  engine's short-reach work, which has the same probe). Its 40 strided pairs bound inversions at ONE stride, length/40. Disorder
+  that is dense but shorter than the stride (an event log with bounded latency, a series jittered around its own order) passes
+  them, and so does sparse disorder that reaches far: 45,000 elements with noise of +-400 took **24 ms**, and 45,000 sorted elements
+  with 1% random swaps **47 ms**, against 2.3. Two changes, from 4096 elements up (below that nothing changed: the fallback there is
+  a quicksort, which an insertion sort beats up to ~25 shifts per element, and both changes measured 10-30% SLOWER on 2000-3000
+  elements). (1) When the probe says nearly sorted, 64 strided pairs EIGHT apart decide whether an insertion sort is tried at all:
+  its budget is a mean displacement of 8, and an element displaced further is usually inverted with its eighth neighbour. (2) The
+  small case runs a plain insertion sort WITH the 8n budget of the momentum sort and falls through when it is spent. The galloping
+  momentum sort was tried there first and lost 20-40% on displacements of a few places, which is what the branch mostly sees.
+  Old module against new, interleaved, both load orders: noise of +-30 1.6-3.9x, +-100 2.3-3.9x, +-400 11x at 45k and 1.7x at 300k,
+  1% swaps 8x at 20k and 17-19x at 45k; noise of +-2 and +-8, 0.1% swaps, adjacent swaps and uniform 0.95-1.05. Load order alone
+  moves a row by up to 30% at 2000 elements (the module loaded second read slower): swap it before believing a small row.
+  `test/perf-guard.js` holds both shapes as batches of twenty 45k arrays: ~100 ms now, 837 and 1470 ms on the old module.
+
 ## 0.3.0
 
 This is the feature-rich engine line, published as 0.3.0 to supersede the lean

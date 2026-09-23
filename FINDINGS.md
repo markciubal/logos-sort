@@ -494,6 +494,1074 @@ Prediction and grade: I predicted bimodal's total 22.9 → about 17 ms, roughly
 1.3×. Measured 21.7 → 17.3, 1.25× on the quieter layout and 1.38× on the
 other. Right in both size and mechanism.
 
+## 3az. Knowing the data FORMAT: nothing for numeric timestamps, 4.9-8.5x for date TEXT (2026-09-22, `make dateprobe`, `make datestrprobe`)
+
+The proposal: detect that the values are dates and exploit the format, not just the distribution. The engine
+receives a bare `double *`, so "these are dates" is a DATA fact and must be certified like any other -- but a
+format would hand over the STEP and the ORIGIN for free, which is what the int32 type handed `count_try_i32`
+when it went 37.6 -> 3.8 ms. The dispatcher reads as though there is a hole: for integer-valued doubles it tries
+a counting sort when `span <= COUNTING_SORT_K * n`, then the int32 radix when the values fit +-2.1e9, then falls
+through to the general leaf. Epoch SECONDS over a day (span 86,400) clears the first gate; epoch MILLISECONDS
+over the same day (span 86.4M = 10.3n, and 1.76e12 is outside int32) clears neither. Same data, different unit.
+
+**Measured against a sort TOLD the origin and the step** (subtract, divide, LSD-radix only the bytes that vary),
+8.4M values, one thread:
+
+| shape | logos 1T | logos 14T | std::sort | told 1T | told/logos |
+|---|---|---|---|---|---|
+| epoch_sec_day (1 s, 1 day) | 306.5 | 49.5 | 1901.1 | 655.7 | 0.47 |
+| epoch_ms_day (1 ms, 1 day) | 362.7 | 50.2 | 1928.7 | 468.9 | **0.77** |
+| epoch_ms_hour (1 ms, 1 hour) | 216.0 | 30.5 | 1645.0 | 416.6 | 0.52 |
+| epoch_us_min (1 us, 1 min) | 213.4 | 42.4 | 1593.1 | 467.0 | 0.46 |
+| day_serial (1 day, 10 yr) | 85.8 | 16.9 | 1021.1 | 257.1 | 0.33 |
+| packed_ymd (YYYYMMDD) | 38.9 | 13.1 | 447.2 | 163.5 | 0.24 |
+| excel_serial (day + fraction) | -- | -- | -- | **WRONG OUTPUT** | -- |
+
+**Every ratio is below 1: the told sort is 1.3-4.2x SLOWER than the engine.** The prediction was 2.0-4.0x
+AVAILABLE on epoch_ms_day; it measured 0.77. And the format approach is not merely slower on one row -- it is
+WRONG on `excel_serial`, because a day-plus-fraction at 1/86400 has no exact integer representation, so the
+round trip does not return a permutation.
+
+The trace says why the hole is not a hole (`./datetrace`): the high-resolution shapes all take the general
+partition (`chao1` 74k to 2.1M, so the counting routes correctly decline) and the partition handles them well
+(leaf imbalance 1.01-1.04x); `day_serial`, at 3,650 distinct, takes the LATTICE route at both thread counts.
+So the engine already exploits every exploitable part of being a date -- quantization and low cardinality --
+by certifying them, and for millisecond timestamps there is nothing left to exploit: 8.4M values over 86.4M
+slots is dense numeric data, and the label does not reduce its information content.
+
+**That bounds the whole idea.** The most format knowledge can save is the DETECTION, and detection is the shared
+sample at 1-4% of a parallel call -- under the resolving floor, which is why S7 (stopping the sample early) is
+parked for the same reason.
+
+**Where it does pay: when the dates are TEXT.** A fixed-width ISO-8601 timestamp has a monotone map to an
+integer that the format hands over, and lexicographic order on ISO-8601 IS chronological order, so comparing 24
+characters per comparison is waste. 2M records, one thread: `std::sort` on `std::string` 1724 ms, `std::sort` on
+fixed 24-byte records with `memcmp` 989 ms, and parse-to-key + `logos_argsort_f64` + one gather **203 ms**
+(parse 26.3 + argsort 129.2 + gather 47.8) -- **8.48x and 4.87x**, which is inside the predicted 8-25x and 3-8x.
+The first cut placed the records with `std::sort` on indices and read only 2.67x, with placement 618 of 702 ms:
+**the format buys the KEY, and the key is worth nothing without a fast argsort behind it.**
+
+The general statement, which is not about dates: **a format is worth what it saves in COMPARISON WIDTH, not in
+distribution knowledge.** For numbers the engine already infers the distribution and the width is already 8
+bytes, so there is nothing to give. For text the format collapses a 24-byte comparison to an 8-byte one, and
+that is the whole win.
+
+## 3ay. Where the lattice route's idle threads are: thread CREATION and a bandwidth-bound emit, not the serial merge (2026-09-22, `make profile` with four lattice phases, `make spawnprobe`)
+
+Open direction 1 asked for one thing: finer profiler phases, because the route was ONE phase and an occupancy
+average cannot say which part of it the idle threads are in. The route is now split into map / merge / emit /
+teardown (PROF-only), and the answer is not what any of the three standing suspects predicted.
+
+**First, the entry's premise was stale.** It recorded 6.0-6.9 of 14 threads busy. Re-measured today, after this
+session shipped per-worker tables and the map chunk queue, the lumped route reads **8.42 (quantized) and 8.93
+(mod_card_30k)**; few_distinct, on the hash route, is 5.69 and is now the worse case. In every cell all 14 threads
+do work, **none** wait at a barrier, and cpu/busy is 0.99-1.00, so nothing is preempted.
+
+**Split, at 14 threads:**
+
+| phase | quantized wall | share | concurrency | mod_card_30k | concurrency |
+|---|---|---|---|---|---|
+| lattice map | 4.482 ms | 68% | **10.72** | 5.567 ms | **11.32** |
+| lattice merge | 0.063 ms | 1.0% | serial | 0.494 ms | serial |
+| lattice emit | 1.843 ms | 28% | **3.17** | 2.371 ms | **3.03** |
+| lattice teardown | 0.009 ms | 0.14% | serial | 0.014 ms | serial |
+
+**Two suspects died here, and one of them was mine.** The serial merge is **1.0-5.8%** of the route, not the ~55%
+the occupancy average once implied nor the ~10% the earlier trace put it at. The teardown -- freeing 14 tables of
+16 MB, which a trace build timed at 2 ms and which I was about to attack with the int32 route's persistent-pool fix
+-- is **9 to 14 MICROseconds, 0.14%**. That 2 ms was an artifact of the trace build. **A trace build says which path
+ran and what share each phase took; it does not price a phase against a normal build, and I nearly shipped a fix
+for 0.14% of a route on the strength of one.**
+
+**The emit is where the threads are idle, and it is not an imbalance.** Every thread is handed exactly n/P output
+positions, so the work is equal by construction. A faithful standalone replica (`make spawnprobe`: 14 threads each
+filling n/14 doubles into a pre-faulted array) reproduces the phase at 1.597 ms against the engine's 1.843, and
+splits it:
+
+- create + join 13 workers with **no work at all**: **0.564 ms, 35% of the phase**
+- the same fill on ONE thread: 4.314 ms, so 14 threads buy only **2.7x**
+
+67 MB of stores in 1.03 ms is 65 GB/s, which is the DDR5 limit on this box. So the emit is **memory-bandwidth
+bound**: there is no more parallelism in it to extract, and better chunking cannot help. What CAN be removed is the
+0.564 ms of spawn and join, which the lattice route pays TWICE (map and emit) -- about **1.13 ms of a 6.58 ms
+call, 17%**. That is open direction 0h (a), where a persistent worker pool is already noted as a change to two
+functions (`par_run` / `par_spawn`) rather than to 23 sites, and this is the first per-phase number that prices it.
+
+**What is left open on this route:** the map at concurrency 10.72-11.32 of 14 still leaves ~20%, and its inner loop
+touches TWO 400 KB arrays at the same random index per element (`keys[idx]` to verify, then `cnts[idx]++`), which
+is two cache lines where an interleaved 16-byte record would be one. That is a separate, untested lever on the
+phase that is 68% of the route.
+
+## 3ax. Branchless sorting networks for 4 to 16 elements: 1.03x at n = 4, 1.58x at n = 16 (2026-09-22, `make callbench`)
+
+The leaf finished every short range with insertion sort. On unstructured data of a dozen elements that is about n^2/4
+comparisons of which roughly half mispredict, and a mispredict is ~15 cycles where a compare is one. A Batcher odd-even
+mergesort network for each size from 4 to 16 replaces the branches with straight-line compare-exchanges.
+
+**The networks are generated, and proved before they are written.** `gen_small_net.py` emits one straight-line network
+per size (424 comparators in all) and refuses to write any network that fails the 0-1 principle -- a comparator network
+sorts every input if and only if it sorts every sequence of zeros and ones, so 2^n binary inputs per size is a complete
+proof. The compare-exchange is one predicate and two selects rather than a min and a max, because `min(x,y)` and
+`max(x,y)` both return the same operand when one side is a NaN and LOSE the other, which would break the permutation
+`logos_sort_f64` promises. **Read from the assembly**, at the engine's own flags: 424 `vcmpltsd` + 424 `vblendvpd` +
+424 `vmaxsd`, and exactly ONE branch in the whole function -- the jump table that selects the size. `net_sort_small` is
+`noinline` and its frame is 8 bytes, so it adds nothing to the dispatcher's stack-probed prologue.
+
+**Measured** (`make callbench`, two binaries with the copies swapped so layout cancels, two runs; work/base, below 1 is
+the win):
+
+| random n | 3 | 4 | 6 | 8 | 10 | 12 | 14 | 16 | 18 | 24 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| run 1 | 0.981 | 0.968 | 0.943 | 0.817 | 0.750 | 0.748 | 0.722 | **0.631** | 0.996 | 0.995 |
+| run 2 | 0.992 | 0.941 | 0.918 | 0.810 | 0.753 | 0.750 | 0.716 | **0.635** | 0.995 | 0.991 |
+
+So **1.03-1.06x at n = 4 rising monotonically to 1.57-1.58x at n = 16**, and the two sizes just outside the range
+(18 and 24) read 0.99 in both runs -- the control that says the effect is where the code changed and nowhere else.
+Every SORTED row is 0.97-1.04 at every size, as predicted: the prescan returns a sorted array before the leaf is
+reached, so a network never runs on one. The rows at 1000, 5000 and 50000 are 0.98-1.02, because a large sort takes the
+flash, coarse or AVX2 leaf and the scalar quicksort base case barely runs. **This is a small-end result (open direction
+0g), not a result at scale, and it should not be quoted as one.**
+
+**Grading the prediction, which was written first and was half wrong.** It said 1.5-3x across 4-16. The top of the range
+landed (1.58x at 16); the bottom did not (1.03x at 4). The error was treating the range as uniform when the effect is
+the ratio of comparators to mispredicted branches, and that grows with n. The stop rule inherited the same flaw -- one
+bar ("clear 1.15") across a range where the effect obviously scales -- so it is met from n = 8 up and missed at n = 4-7.
+It ships anyway because nothing regresses and every size in range improves in both runs and both orientations, and the
+miss is recorded here rather than quietly rounded away.
+
+**A process failure worth more than the result.** The first correctness run reported "all correctness checks passed" for
+both settings from a STALE harness: the verification script sent `make` output to `/dev/null`, the new harness section
+failed to compile (a heredoc turned the `\n` in two `printf` strings into real newlines), and `make` left the previous
+binary in place. The tell was a timestamp -- the binary predated the source by six minutes -- and the section was
+reporting nothing because it was not in the binary at all. Built properly it is **368 checks, 0 failures**, covering
+n = 2 to 24 past both edges of the network range, with shapes the rest of the harness never sorts at that size: a NaN,
+two NaNs, signed zeros only, infinities with a subnormal, and heavy ties. **Never send a build's output to `/dev/null`
+in a script that then claims the tests passed.**
+
+**And the frame check found the mechanism for an older open item.** CLAUDE.md prints the dispatcher frame every round
+for a reason. At the engine's own flags (`-O3 -fPIC`, no `-march`), `psort_f64` is **36,640 bytes in the committed
+engine and 42,576 in the working tree**. Stack-clash protection probes every 4096-byte page of the frame on EVERY call,
+so that is 9 probes against 11 -- two extra probes on a sorted call that costs about 17 ns. Open direction 0g records
+an untraced drift of exactly that size: sorted calls of 3 to 24 elements reading 1.08-1.14 against the committed
+engine. **This round is not the cause** (its own callbench rows are 0.97-1.04 sorted and 1.00 at n <= 3, and
+`net_sort_small` is `noinline` with an 8-byte frame); the growth is cumulative, from the routes this session added to
+the dispatcher -- `nearsorted_parallel_f64` went 8,656 to 33,056 bytes and `reach_from_sample` at 32,848 is new. No
+large callee disappeared between the two builds, so nothing newly inlined: `psort_f64` simply carries more locals.
+The fix 0g already names is unchanged and now worth more: a THIN FRONT, with the prescan and insertion sort in a
+function with a small frame and the large body behind a call.
+
+**Two measurement traps, both mine, both worth the space.** `-fstack-usage` writes its `.su` next to the `-o` target,
+so compiling to `/dev/null` writes nothing at all and compiling to `/tmp/x.o` leaves a STALE `logos_psort.su` in the
+source directory -- which is what I read first, and it happened to be a `-march=native` build, so the number looked
+plausible and was from the wrong compilation. And the frame must be measured at the ENGINE's flags: `-march=native`
+changes inlining and gives a different answer.
+
+## 3aw. The threads on this box are not equal: a work queue pays on a COMPUTE phase and measures nothing on a MEMCPY phase (2026-09-22, `make capbench` with CAP_SWITCH)
+
+The hypothesis came from the hardware. This box is an i9-13900H: 6 performance cores and 8 efficient ones. The engine
+hands every thread an equal slice (`lo = t*n/P`), so a phase ends when the SLOWEST core does, and `make profile` showed
+that shape -- 6.0-6.9 of 14 threads busy inside the lattice map with NONE waiting (a finished thread is neither), and
+6.6 busy with 3.6 WAITING at relocation's barrier. **The kill test came first, and from profile data already on disk**:
+per-thread busy inside the statically chunked phases is BIMODAL (quantized lattice map 4.40 against 2.99 ms, a ratio of
+1.47; mod_card 1.44; the few_distinct hash map 2.09; relocation tiles 1.39) where the queue-driven leaf reads 1.04. Six
+fast cores carrying a phase is what that looks like.
+
+Two sites then got the same treatment -- claim the next chunk from an atomic counter instead of taking a slice -- and
+they measured opposite results.
+
+**The lattice MAP phase: 0.90-0.97 on 12 of 12 cells at 4M and up, both runs. SHIPPED.**
+
+| 60 pairs, t(queue)/t(static), below 1 is the win | 1M | 2M | 4M | 8M | 16M |
+|---|---|---|---|---|---|
+| quantized (lattice) | 1.03 / 0.99 | 0.95 / 0.96 | 0.95 / 0.90 | 0.95 / 0.93 | 0.96 / 0.97 |
+| mod_card_30k (lattice) | 1.00 / 0.99 | 0.95 / 0.99 | 0.90 / 0.92 | 0.95 / 0.95 | 0.97 / 0.97 |
+| few_distinct (hash route, untouched) | 0.98 / 0.99 | 0.97 / 1.03 | 1.00 / 0.97 | 1.02 / 1.00 | 1.01 / 0.99 |
+
+A NULL switch on the same rows in the same build reads 0.97-1.04 and never falls below 0.97, so the separation is real
+at about **1.05x**. Chunks are n / 4P, never under 4096; a worker whose thread was never created simply never claims and
+the rest drain the queue, which is strictly safer than the slice it replaced. The prediction was 0.75-0.90 -- too
+optimistic by about half, the second round running that this knob has been overestimated.
+
+**Relocation output tiles (phases 1 and 3): 0.96-1.04 on every cell of both runs. REVERTED.**
+Predicted 0.88-0.97 at 4M and up, from the same bimodal evidence plus the 3.6 threads measured waiting. Measured
+block_perm 1.00 0.98 1.00 1.00 1.01 and 1.02 0.99 1.04 1.00 1.01; block_overlap 1.02 0.98 0.98 1.01 1.01 and 1.00 0.99
+1.01 0.99 1.00. Four tiles per thread, never under 32768 elements, the first overlapping run found by binary search (it
+had been a scan from run 0, O(R) per tile, affordable for one tile per thread but not for a queue of them). Correct
+throughout -- the harness passes on both settings, and faultprobe injects 1,926 allocation failures and 48
+thread-creation failures with 0 bad, reaching `reloc_worker` itself once the knot route is switched off -- and worth
+nothing.
+
+**Why the same change wins in one place and not the other, which is the actual result.** The lattice map is COMPUTE:
+every element is hashed or indexed into that thread's own private table, so a faster core really does finish more
+elements and equalising the work equalises the finish. Relocation's phases 1 and 3 are `memcpy` over disjoint ranges,
+where the bottleneck is one shared memory controller and not the cores, so handing a fast core extra tiles cannot raise
+the aggregate. That agrees with the three earlier memory-system results in the ledger (ping-pong, huge pages and
+streaming stores, all measured zero). **The generalisation: a work queue buys balance only where the CORES are the
+bottleneck; on a bandwidth-bound phase the slices were never the problem.** It also says, without another round, that
+the knot worker's A1 and C phases -- the same static tiles over the same kind of copy -- are not worth converting.
+
+And the negative moves the target. If equalising the tiles changes nothing, the 3.6 threads the profile shows waiting
+are not waiting for a slow tile. They are at the SECOND barrier, where phase 2 merges overlapping chains: that phase is
+already queue-driven, but one long chain is a single indivisible task, so one thread merges it while thirteen wait.
+Relocation's serial middle, already listed as open, wants a merge-path split of ONE chain -- not better tiling.
+
+## 3av. The lattice route: the merge was not the problem, the table setup was (2026-09-22, `make capbench` with CAP_SWITCH)
+
+The Amdahl round said the counting routes leave 7-8 of 14 threads with nothing to do and blamed the serial merge between
+their two parallel phases. Building that merge in parallel settled it: it is CORRECT (harness, sanitizers, TSan and 546
+injected allocation failures all clean) and **1.02-1.12x slower**, because the trace puts the merge at about 2 ms of a
+route whose map phase is 11.6-14.1 ms. The merge is ~10% of the route, Amdahl caps the prize there, and an extra spawn
+plus a second pass over the slots eat it. The lesson is about the instrument: a thread-occupancy average says how many
+threads are busy, not which phase they are busy in, and inferring a phase's share from it is not the same as timing it.
+
+What did pay, on the same route, was the phase the trace actually named: the caller's setup loop allocated all P tables
+and memset `slots` keys for each of them before the spawn — 5.6 MB of serial writes at 8M and 14 threads, inside the
+phase that is ~80% of the route. Each worker now takes its own table. Measured over 60 pairs and two runs at 1M-16M,
+twenty of twenty cells land on the winning side, centred on 0.97 against a null switch centred on 1.00, and the trace
+confirms the mechanism (map phase 8.8-11.3 ms against 10.9-13.8). It ships at about 1.03x on the lattice shapes. The
+prediction was 0.83-0.95, so it was too optimistic by half; the stop rule's bar was missed and the change was shipped on
+the mechanism plus the null control, which is recorded so the judgement can be argued with.
+
+## 3au. Where the parallel speedup stops: the serial merge, the static tiles, and two remedies that did not pay (2026-09-22, `make amprobe`, `make capbench`, `make profile`)
+
+Amdahl's law bounds a parallel sort by its serial fraction, so the question is which fraction each route actually has.
+Two instruments agree at 8M and 14 threads. The partition is healthy: 13.0 of 14 threads busy in the leaf, 11.3 in the
+scatter, a Karp-Flatt serial fraction of 0.055-0.09 from three threads up, and perfect packing would buy only ~1.16x.
+The counting and lattice routes spend 98-99% of the wall in one phase where 6.0-6.9 of 14 threads are busy and NONE are
+waiting: the rest have no work, because a serial merge sits between two parallel phases and grows with P (the lattice
+merge walks slots x P), which is why e rises 0.06 -> 0.23 as P goes 2 -> 14. Relocation has 3.6 of 14 threads WAITING at
+a barrier, from static output tiles. And kinked data sorts fastest on ONE thread (6.84 ms) at every thread count: 15.6
+at 2, 7.2 at 14.
+
+Two remedies were built and measured, and both were rejected by their own stop rules. A thread CEILING for the counting
+routes: no global value passes, because the lattice map phase is real parallel work (a ceiling of 3 costs it 0.53-0.87,
+6 and 8 cost 0.72-0.90 at 8M and 16M) while the hash route stops scaling near 8; a hash-only ceiling then read about 1.0
+at 4M and 1.1 at 8M, inside the resolving floor. A GATE against the near-sorted route at low thread counts: the route is
+worth 1.80-1.97x at two threads on the shapes it was built for, and switching it off helps only the kinks shape (1.18x
+at 2 threads) while costing 1.10x at 14. The lesson is the useful part: idle threads are not fixed by withholding
+threads. The only remedy the profile endorses is to give those threads work -- a parallel merge for the counting routes
+(0a) and a task queue for relocation's placement.
+
+## 3at. Uniform data as a complete computation: the chunks are cheap, the merge is not (2026-09-22, `make unibench`)
+
+The proposal: certify the distribution from the sample, then sort P chunks with a parallel SIMD quicksort and merge them,
+instead of partitioning. Built with x86-simd-sort's AVX2 kernel per chunk and a bottom-up tree whose every merge is split
+by merge path, so no level runs on one thread. At 8M and 14 threads the chunk sorts alone run at **0.76-0.86 of the
+shipped engine's whole time** — the premise is right — and the merge then adds about three times the engine's runtime,
+putting the pipeline at 3.3-4.2x on every shape including uniform. The mechanism is measured rather than argued: the tree
+moves 3.86n on every shape, and that same movement costs 15-18 ms when neighbouring chunks hold disjoint value ranges
+(near_sorted, block_perm: std::merge degenerates to a copy) against 87 ms when every chunk spans the whole range (uniform:
+every output element comes from a comparison). A merge on uniform data costs 5.8x what moving the same bytes costs. The
+engine's answer on the same certificate is one multiply-add per element into an equi-width grid with no comparisons, which
+is why it wins. One defect found on the way, by the output check and not by the clock: `logos_sort_f64` may not be called
+concurrently from several threads, because the context pool and bundle table are plain globals.
+
+## 3as. The handoff pipeline: merge order decides, and the specified micro-kink never fires (2026-09-22; implementation REMOVED 2026-09-23, in git history before that commit -- it was `make tsbench` modes `moebius`, `moebanat`)
+
+A handoff specification of "what remains to implement" in a Moebius hybrid: bail out under 16, swap 2-3 element dips inline, stitch the
+runs with a galloping merge behind an O(1) boundary check. Built literally and in a repaired form, and paired with the engine at 1M: the
+literal form is behind on 14 of 16 shapes, the repaired on 13. Three measurements worth keeping. **The micro-kink branch never fires on
+the shape it targets**: a dip's first element belongs to the preceding ascending run, so the descending run is one element, never two or
+three; the engine's own repair asks both neighbours instead and swaps the pair back inside the run. **The bail-out as written is a no-op**,
+since it sorts a run the scan has just proved sorted; as Timsort's minrun it is worth 2x on noisy data. **Merge order is the whole
+difference**: the same runs and the same merge kernel cost 100,999 merged elements per element stitched left to right into a growing
+prefix (58-68 s on a ring buffer) and 4.6 merged bottom-up (24 ms). And the O(1) boundary check skipped 0.0-1.6% of boundaries, which
+is the third independent measurement of that idea in this bench. What it found: the run detector's block of eight was scalar compares
+(read from the disassembly), and with vector ones one kinked strand sorts 1.30-1.32x faster at one thread and shuffled blocks
+1.27-1.30x. What is still open: eight sorted logs concatenated, where the pipeline reads 0.80-0.86 over three runs.
+
+## 3ar. The triple-reversal weld: an O(1) test in front of an O(prefix) merge (2026-09-22; implementation REMOVED 2026-09-23, in git history before that commit -- it was `make tsbench` modes `weld`, `weldanat`)
+
+An outside pipeline: condense into runs, sort the runs by their min edge, move them into that order in place by triple reversals, and
+weld the seams left to right, skipping a seam when the left max is at most the right min. Built as proposed (the rotations scheduled
+by a rotation merge over whole blocks so they cost O(n log^2 K) at worst) and paired with the engine at 1M: faster on a sorted array
+and on one kinked strand, slower on the other fourteen shapes by 2x to 4,600x, and 2.6-368x behind at 14 threads. The boundary test
+bypassed none of its seams on any shape. A maximal run swallows the next block whenever that block starts higher, so a unit spans a
+hole; the prefix's maximum reaches the top of the range within a few units; and from then on every seam fails the test and merges
+into most of the prefix. The test is O(1), the merge behind it is not: 1,720 merged elements per element on a late batch, 98,000 on
+uniform data. The triple reversals themselves are correct and in O(1) space, and cost 1.2-3x against a gather on the block shapes.
+What the rows it won found: the dispatcher's prescan, commented as vectorizable, was a scalar compare chain at the engine's flags
+(vector compares: sorted 1.7-2.2x), and the run detector walked eight scalar steps after every wrong-way step (a jump to the step:
+kinks 1.05-1.08x). After both, the weld reads 1.93 against the engine on sorted and 0.94 on kinks.
+
+## 3aq. A trend under the wave: collected when the wave is clean, not when it is noisy (2026-09-22, `make sineprobe` mode `tilt`)
+
+The engine has no trend model; it sees a trend as runs that overlap less. On noise-free waves that is enough: as a linear trend grows
+from nothing to the slope at which the wave stops falling, the cost falls from about 1.0 of uniform to 0.2 at one thread, and past
+that point the array is sorted. The user's line from the wave's minimum to its maximum moved routes rather than structure: it gave a
+crest-started wave a ninth run (0.55 of uniform, past the few-runs knot gate) and took the exact repeats out of a 32-cycle wave (1.2).
+With noise of +-50 the trend bought nothing, and three routes misfired on the upper half of the ladder: the wave route re-entered the
+whole dispatcher for each of 65 pieces the short-reach route declined (1.42x at one thread); at 14 threads the partition's
+uniformity certificate passed a grid whose buckets overflowed their slack (631,108 spills, a pass thrown away, 1.39-1.54x); and the
+near-sorted route accepted 21% strays (1.40-1.48x). The engine's min-to-max interpolation is its uniform grid, and on a tilted wave
+that is the piece that fails: the wave bunches values where the curve flattens, and a KS distance of 1% of n does not bound one
+bucket's count within the 60% the regions allow.
+
+## 3ap. cos() in place of sin(): the phase costs nothing; a zero at a[0] and the few-runs knot gate do (2026-09-22, `make sineprobe` modes `cos`, `fewgate`, `legs`)
+
+A cosine with the same slope is the sine moved a quarter period, and at one thread it sorts the same (0.96-1.00, same routes). At 14
+threads it did not, and the phase was not why: a sloped sine starts at zero, so the always-sampled a[0] and a dozen values near it
+are tiny or negative, and the partition's key grid, which works in total-order key space where the neighbourhood of zero spans
+hundreds of binades, went coarse and was rejected. The scatter fell to the value table, and the cosine, which starts at its crest,
+was 0.85-0.88 of the sine's time. A wave with a cosine descending leg and a sine ascending leg shows it without a slope: the order
+that starts at exactly 0.0 reads 1.07-1.17 at 14 threads. One value is enough.
+
+Without a slope the ends set the run count. A four-cycle cosine has eight runs and the sine nine, and the knot route's cost gate is
+three times stricter at eight runs or fewer, on the assumption that the run merge is the fallback there. On these arrays it is the
+leaf: the cosine cost 1.66-1.72x, and lifting the gate on noise-free waves of 3 to 8 overlapping runs is worth 1.6-2.9x. Neither
+behaviour was changed; both are open directions with their measurements.
+
+## 3ao. The edge sort: sorting blocks by their min edge feeds nothing; its three wins were three engine defects (2026-09-22, `make tsbench` modes `edge`, `edgeanat`)
+
+A proposal: condense the array into natural runs (twisting the descending ones), sort the K runs by their first element, lay them out
+in that order, and hand the result, "an ascending sine wave", to the boundary-bypass merge sort of §3an. Built exactly so, with a
+trimmed bottom-up merge as its strongest form, on sixteen timestamp shapes. On every shape with noise in it K was 41% of N (runs of
+2.4), the block sort cost 15-47% of the pipeline, the rearranged array still left elements 38 to 6,608 positions from home, and the
+hybrid still merged every element 18 times: the steps made it slower on 15 of 16 shapes. The idea's premise fails twice. A run's min
+edge describes the run only if the run stops where the data's blocks stop; a maximal run swallows the next block's first element, and
+a sensor dropout pairs with a real reading, so sorting by min edge moves whole blocks, or real readings, to the wrong end. The
+engine's relocation plan sorts the same descriptors, but only after splitting runs at gaps (J5's first lesson), and places each
+element once instead of laying the blocks out and merging again.
+
+Three rows lost to the proposal, and each was a defect in the engine, not a strength of the idea. On a sorted array the engine took
+2.2x a plain scan: its prescan, which is the whole sort there, tested twice per element; it now reads sixteen at a time once the
+direction is known (2.2x on sorted, 1.4x on reversed, 1.3-1.4x on a late batch). On one kinked strand the engine spent 20.7 of 34 ms
+putting back 820 strays through three full passes; they now go back by one memmove per segment, the short-reach route's method (2.4x).
+And a tie ended a descending run, as a stable sort's must, though nothing here is stable: timestamps with 1.25% ties cut every
+descending block into pieces under the relocation floor (6.0x at one thread, 1.3x at 14). After the fixes, against edge+trim:
+0.94-0.95 (was 0.44) on sorted, 1.39-1.43 (was 0.59-0.60) on kinks and 2.73-2.79 (was 0.40-0.41) on the tied blocks.
+
+This round's callbench, run against the committed engine as well, found a regression none of its own switches caused: every call of
+2 to 10 elements cost 4-5x the committed engine's. The dispatcher's frame had grown from 35.9 KB to 60.5 KB with no stack array
+added, because GCC had begun inlining the near-sorted route (a 33 KB frame, called once), and stack-clash protection probes every
+page of the frame on every call. Kept out of line with the stream route, the frame is 28.3 KB and a sorted pair costs 19 ns again,
+not 85. An inlining decision is not a property of the code one edits: print the frame after every round.
+
+## 3an. Server timestamps with slight knots: the boundary bypass never fires on latency; one strand and one seam fixed (2026-09-22, `make tsbench`)
+
+An outside write-up credited a "Moebius hybrid" (reverse the small descending runs, then a merge sort that skips any merge whose halves
+are already in order) with O(N) sorting of data that is "macroscopically ascending but locally noisy", naming sensor telemetry and log
+merging. Built exactly as described and run on thirteen timestamp shapes, its O(1) check skipped **none** of 262,143 merges on any shape
+with network latency in it: the jitter reaches farther than the 32-element blocks the recursion bottoms out at, so no two adjacent halves
+are ever in order, and the hybrid merged every element 18 times, level with std::sort. It skipped every merge on sorted data and on
+adjacent swaps, the one shape where the reversal is the whole job.
+
+The engine beat the hybrid on 12 of 13 shapes (3-6x on latency, 3.5x on batches, 8x on noise). The thirteenth found a gap: one sorted
+strand with 1% adjacent swaps lost 9x to the hybrid and 1.1x to std::sort, because the detector repaired the kinks, lifted the tangled
+ones as strays, left one run, and relocation declines a single run. Finishing that case (sorted, or strays merged back) made it 5.5x
+faster; the hybrid still leads there by 1.6x, two passes against five. A second gap, at 14 threads: the short-reach route sorted every
+block of a noisy ring buffer before seeing the seam; its fences now decline first (0.74 -> 0.94 against the order routes off).
+
+What the order-reading routes buy on server timestamps, measured as the engine with and without them: 1.4-1.9x at one thread on
+every latency shape and 5x on kinks, batches and late batches; at 14 threads 1.3-1.7x on jitter, skew, kinks and batches, and nothing
+on the shapes whose strays make the short-reach route decline. Millisecond clocks are the weak row (1.6x over std::sort): 84k distinct
+values on a 1 ms lattice that no counting route takes.
+
+## 3am. Round six: strays lifted out of strands, a wave cut into its pieces, a seam in the fences (2026-09-22, `make unknotprobe`)
+
+Asked where the slowdowns still are and what else the knot view offers, six ideas were built and paired against their own
+switches. Three shipped, all for sequential sorts. **Strays inside strands**: the run detector lifts late records out of runs in
+five forms (the last found because a run that STARTS with a stray has no body for the gap test, the unknotting probe's Culprit in a
+new place), closes the holes in one pass, and merges the sorted strays back in place of the copy-back: blocks with 0.1% strays 4.0x,
+1% 3.0-3.3x. **The wave route**: a seasonal series with drift is monotone at the sample's scale and noisy at the element's; put back
+in position order, the sample names the pieces, each piece is sorted where it lies, and the knot sweep merges only where pieces
+cross. 1.11-1.24x, and only where the sample prices the crossings low: a swing of two periods lost 0.76 before that gate. **The
+seam**: a noisy ring buffer shows in the short-reach route's block medians before any block is sorted, as one drop across the
+range; one rotation, then the route: 1.12-1.16x.
+
+Two reverted. A Weyl pivot for the AVX2 quicksort read 1.00 on every row, so the wave's cost there is still unexplained, now with
+two diagnoses struck off. Direct three- and four-way merges read 0.52-0.68: one pass with a longer dependency chain loses to three
+short ones. Two measured: the copy-back pass is worth 1.21-1.35x on block shapes to anything that could return a description
+instead of an array, and the longest increasing subsequence of the sample separates one strand with strays from many strands.
+
+Two things the first cuts taught. A side structure allocated before the route knows it needs it cost clean inputs 4-6% (a 1 MB list
+per sort); take it at the first use. And every relaxation of what counts as a run needs the NaN rule restated, because the one form
+that tested neither element it lifted was the one that lifted a NaN.
+
+## 3al. The unknotting problem as a sort: the unknotter loses, the sphere wins, and a cliff under it (2026-09-21, `make unknotprobe`)
+
+Guided by Kauffman and Lambropoulou's "Hard Unknots and Collapsing Tangles": the array closed into a ring (a circular doubly linked
+list) is the diagram, strands are monotone arcs with an orientation bit, two strands cross where their value intervals overlap, and
+Reidemeister moves are local rewrites (R1 the kink, R2 a merge of two ring neighbours touching only their overlap, R3 an O(1) slide).
+Built literally, the unknotter is slower than the engine on 15 rows of 16 at one thread (0.009 on noise to 0.37 on near_sorted),
+like the literal list before it: a list pays a node written and walked per element before any move. Its counts still say
+something: the paper's hard state (no two ring neighbours cross, yet the diagram is not split) appeared exactly once, on the
+shuffled staircase, and what made local moves affordable was the paper's own escape, a move that complicates first: cutting a
+strand at a gap (the Culprit's long arc) took the nodes walked per element from 21.5 to 0.00 on near_sorted.
+
+The transfer that won is R0. On the sphere a rotation is free, and in the engine a sorted array read from the wrong slot (a ring
+buffer, a wrapped log) cost 2.0x the sorted array at one thread and 2.6x at 14, because the tail route merged the second run in
+element by element. The loop-back reads the strand across the wrap: the prescan's prefix plus an ascending suffix whose last
+element is no larger than the first, rotated to the front once. 1.56-1.63x at one thread and 1.90-2.03x at 14 on the ring buffer,
+1.73-1.75x / 1.46-1.51x on a rotated sorted prefix with a random tail, 2.07-2.14x at one thread on a 30% prefix + noise + 40% suffix,
+guards 0.97-1.02 (three runs). Its first cut re-entered the whole dispatcher and read 0.89: on a sort three or four passes long, one redundant
+pass is the difference between a loss and a win. The fix that hinted the prescan where to start then cost every sorted call of 2
+to 32 elements 10-16% (`make callbench`: a loop whose start is a variable is a different loop), so the remainder goes to the tail
+route directly instead.
+
+The probe's worst row was not about rotation at all. The run detector behind relocation and the knot route gave up at an average
+run under 4096 elements, the run MERGE's constant, inherited by two routes that copy runs; a shape whose runs were exactly 4096
+passed by nothing and, rotated, failed by 12 elements (5.8x). At one thread every array of disjoint blocks averaging 256 to 4095
+elements had been sorted in full. The floor there is now the knot route's own 256: 3.6-7.6x on those shapes, guards 0.98-1.01;
+at 14 threads every lower floor measured mixed, so it stays.
+
+## 3ak. The proposed Moebius DLL sort, implemented as given: slower on every shape (2026-09-21, `make dllbench`, `experiments/moebius_dll/`)
+
+An outside conversation proposed turning the array into a doubly linked list, reading descending runs back through their `.prev`
+pointers, and merging the runs pairwise, and said it should be faster than the engine on sine-wave data. Implemented as given in
+JavaScript and translated to C twice (as written, and in the conversation's own relinking form), each paired with the engine on the
+same data. **No row clears 1.05 anywhere.** C at one thread: 0.03-0.51 as written, 0.01-0.23 relinked; the clean and noisy sines
+0.16-0.29. JavaScript against the JS engine: 0.07-0.30. The only win is against V8's own `Array.prototype.sort` on uniform data
+(1.18-1.33), because V8 calls a comparator per compare. It is a natural merge sort with a linked list in front: O(n log R), the list
+costing a node per element before anything is sorted, and its one real idea, reading a descending run backwards, is already in the
+engine as the twist.
+
+## 3aj. A galloping merge for a sparse strand over dense blocks; the dense-integer bitmap's budget 4n -> 16n (2026-09-21, `make knotbench`, `make mcbench`)
+
+**The galloping two-strand merge.** One sparse strand spanning every value over dense disjoint blocks makes every block a
+two-strand crossing of a few sparse elements and the whole block. The knot route already took it, then merged every element one
+compare at a time: 2.4-2.7x the same array with nothing crossing, at one thread (the ceiling). Now eight branch-free steps while
+the strands alternate, and when one strand still wins eight places ahead, a gallop and one bulk copy. One binary, 8.4M: **1 in 65
+2.45x, descending 2.56x, 1 in 513 2.70x, 1 in 4097 2.70x at one thread; 1.18-1.31x at 14.** It recovers the whole ceiling. The
+first cut ran the lookahead on every crossing and cost 2-5% on the staircase where most elements merge; now only crossings whose
+pieces differ fourfold in length take the galloping kernel, and the staircases read 1.00. Same output bytes as the branch-free
+merge, which the harness checks row by row.
+
+**The dense-integer bitmap's budget.** It accepted distinct integers spanning up to 4n, a bound set from a guess about the cache.
+A ladder with the gate lifted says the bitmap beats the leaf (the int32 radix) by 5.0x at 6n, 3.3x at 16n, 2.9x at 24n and still
+narrowly out to 64n, and that what the wider gate must give back costs more as the map grows (one planted repeat 0.89 at 16n, 0.73 at
+64n). The budget is now 16n: **3.7-5.0x at 8.4M and 6.0-8.7x at 1M on spans 6n to 16n**, every other row 0.98-1.05, the planted
+repeat 0.88-0.94. The predictions (1.4-1.8x at 6n, a loss by 32n) were far too low, and the harness had never reached this gate: its
+"span 8n must decline" row was a sorted array, which the prescan returns first.
+
+## 3ai. Three changes taken from an outside write-up: kinks repaired, a gate fix that measured nothing, four shapes in the scale report (2026-09-21)
+
+An outside conversation about a "Moebius unknot sort" was read against the engine. No sort was timed in it, and most of it was
+already here or already measured false here. Three things were taken.
+
+**Kinks (Reidemeister move I): won.** An adjacent pair swapped inside a run that otherwise goes on ended the run, and an array
+of sorted blocks with a few thousand of them paid for a full sort. The detector now asks both neighbours at a run break and,
+if they agree, swaps the pair back where it stands; the strand stays contiguous, so the knot plan is untouched. Ceiling first
+(a pass told where the kinks are): 4.0-5.6x at one thread. A/B, one binary (`./strandprobe 40 8388608 kinkab`): **5.8x at 0.1%
+kinks, 5.0x at 1%, 3.2x at 4.8% on blocks; 4.2 / 3.8 / 2.7 on staircases; 1.24-1.52x at 14 threads up to 1%**; the same with
+every other block twisted; guards 0.98-1.01 over three runs.
+
+**The noisy sloped sine's gate fix: built, neutral (1.02), reverted, and the diagnosis was wrong.** §3af item (f) blamed
+`AVX2_TAKE`'s `!c->nearly` for sending the wave to the coarse leaf, on a profile build's 126 ms against 87. Paired in a normal
+build the two leaves cost the same on this shape. With the AVX2 leaf switched off the wave reads 1.05 against uniform and its
+own values shuffled read 1.05; with it on, 1.19 and 1.01. **The AVX2 quicksort is what is slower on this order, by 1.17x.**
+Not traced; its pivot is the median of 63 strided samples, and 32 cycles against 63 strides alternates crest and trough.
+
+**The scale report** now carries `block_twist`, `block_kinked`, `sine_slope` and `reach_mirror` beside the nine standard shapes.
+At 10M, inside each row: logos against x86-simd-sort's AVX2 kernels reads 25.5 against 176 ms on block_twist, 39.4 against 181
+on block_kinked and 127 against 156 on reach_mirror at one thread, and **251 against 162 on sine_slope: logos loses that row by
+1.55x**, which is the open item above seen from outside.
+
+## 3ah. Round four, twist and knot: a scan in blocks of eight, one orientation bit for the whole array (2026-09-21, `make twistbench`, `make mirrorprobe`, `make strandprobe`)
+
+`experiments/TWIST_AND_KNOT.md` ranked seven avenues. Its order: the free classifier, then two stop-or-go measurements, then builds.
+
+**Built, the run detector's scan eight elements at a time.** The profile put the scan at 47-49% of the run routes at one thread
+(1.1 ns per element for a read). The twist had left it read-only, so eight elements are taken at once whenever a bound proves
+the scalar test accepts each: the run list is identical by construction, and the harness checks that it is. Same binary, 60
+pairs, 8.4M: **1.43-1.49x at one thread on block shapes, 1.33-1.36 on x20 staircases, 1.19 on x80, 1.16-1.22 at 14 threads**,
+uniform 1.00. The 14-thread prediction (1.05-1.15) was low.
+
+**Which moved an old verdict.** Against the PURE partition (the relocation family compiled out, both copy orientations, layout
+cancelled) the run routes at 14 threads read 0.95 and a tie in §3ac. Now: **block_perm 1.077, stairs_x20 1.165; 5.77x and 4.74x
+at one thread.** The parallel run routes are a win again.
+
+**Built, one orientation bit for the whole array.** Sequential sorts, behind relocation: when a directional gate fires on the
+MIRROR image (a descending suffix of half the array, the reach ladder turned round, streams that descend in arrival order) the
+array is reversed once and the dispatcher entered again. `LOGOS_NO_MIRROR=1` against it, one binary: mirrored short reach
+**2.07x**, mirrored 95% prefix **2.20x**, mirrored streams **2.76-2.81x**; every guard, mirrored or not, 0.98-1.02 (three cells
+needed 120 pairs to say so). The prefix prediction (2.3-2.5) was low: the suffix scan is a read the ceiling never paid. The
+writhe could not pre-gate the stream probe: four mirrored streams read 0.88 at 1,048,576 elements and under 0.60 at 1,000,003,
+because whether a sampled pair falls inside one stream depends on the lag modulo the stream count. A harness row that named
+what must happen found it.
+
+**Measured, not built.** Persistence (the share of consecutive sample-pair directions that agree) reads 0.33 on noise and
+0.95-1.00 on anything stranded, in either direction or both, where the inversion rate reads 0.00-0.05 for a triangle wave, a
+sloped sine and noise alike: 16 of 16 shapes classed as predicted, rule fixed in advance. And sorted blocks with 1% late records
+sort **2.0-2.2x** faster when told which positions are strays, through a told sort that wastes two serial passes of its own
+(its null row is 0.61), so a route that lifts strays inside the scan has about 3x to collect at one thread. Next build.
+
+**The literal linked list, built because it was asked for, and measured.** The knot route was first described as "convert the
+array to a linked list"; what shipped is an array of run descriptors. The literal version (`LOGOS_KNOT_LIST=1`: a 32-bit link per
+element, twisted runs linked backwards, crossings untied by relinking, the list walked out) is **0.50-0.57 of the shipped route's
+speed at one thread on blocks and x20 staircases, 0.73-0.75 on x80, 0.62-0.69 at 14 threads**, for 4 more bytes per element. Its
+one strength is where merges dominate (a relinking merge moves no data); its one free lunch is the twist (links that point the
+other way). The guessed walk (next = cur +- 1, the load only checking) first measured the same as the plain pointer walk,
+because the compiler continued from the loaded link on the path where the two compare equal; laundering the comparison made
+it worth 0.43 -> 0.51. Kept opt-in, with a harness section that asserts the list was the path.
+
+**Found on the way.** Every multi-copy bench had stopped linking: the Makefile's symbol-rename list never got last round's new
+public symbol. "Every flag builds" had compiled the engine and never re-linked a bench.
+
+## 3ag. The Moebius twist: a descending run is consumed as it lies (2026-09-20/21, `make twistbench`)
+
+The run routes (relocation, the knot route) used to swap every descending run end for end the moment the detector found it. Now
+the run's descriptor carries one orientation bit and nothing is reversed: a lone piece is placed by a backward copy, a crossing is
+merged with the twisted cursor walking down (an up-run beside a down-run is a bitonic pair, and this is its two-ended merge), and
+the knot plan cuts in logical coordinates. The detector no longer writes to the array, and a descending run that straddles a
+detection chunk's boundary is one strand instead of two.
+
+**Ceiling first.** An array with descending blocks against the same array with them already ascending prices the reversal
+passes exactly, because after the reversals the two are byte-identical: 1.07-1.17 at one thread, 1.02-1.12 at 14 (8.4M, 40
+pairs, null 1.014 / 1.017). My one-thread prediction (1.03-1.08) was wrong and low: the run routes cost 2.3 ns per element, so
+a swap pass is a sixth of the sort.
+
+**A/B, one binary, one engine copy, switched by `LOGOS_NO_TWIST=1`** (120 pairs, 8.4M; above 1 = the twist is faster):
+
+| shape | 1 thread | 14 threads |
+|---|---|---|
+| 64 disjoint blocks, every one twisted | **1.149** | **1.114** |
+| every other one | **1.068** | 1.015 |
+| 1024 blocks of 8k, all twisted | **1.144** | **1.094** |
+| staircase, 20% crossing, all twisted | **1.108** | **1.093** |
+| staircase, 20% crossing, every other | **1.056** | 1.044 |
+| staircase, 80% crossing, all / every other | 1.014 / 1.020 | 1.093 / 1.045 |
+| guards: blocks none twisted, staircase none twisted, uniform | 0.998, 0.984, 1.026 | 0.994, 0.987, 1.006 |
+
+It recovers 84-97% of its ceiling at one thread, and ties where four elements in five are merged (there the merge is the sort).
+The 14-thread cells have p10-p90 of 0.81-1.33 tonight: read their first decimal only.
+
+**One wrong turn inside it.** The first two-ended merge was one loop with a signed stride per strand, four cursor updates per
+element against the untwisted merge's two, and the staircase with every other block twisted read 1.000 and 1.002 against a
+ceiling of 1.067. One loop per orientation pair: 1.05-1.06 over the strided loop on x20 staircases, 1.10-1.11 on x80, in the
+same binary (`./twistbench 120 8388608 merge`), as predicted.
+
+**Probed afterwards: where else does an orientation bit pay?** (`make mirrorprobe`, nothing built.) Not in the leaf's run
+detector: descending teeth against ascending ones read 1.02-1.06, because what reaches it is sorted by a 16 ns/element leaf.
+But ONE bit for the whole array does. Every cheap route reads order in one direction, and its own input mirrored (a
+newest-first log with late arrivals) fires no gate: short reach costs **2.0-2.1x** its mirror image at one thread and 1.4x at
+14, a sorted prefix plus tail **2.7x**, interleaved streams **3.1-3.3x**. One reversal pass in front keeps 90-95% of that at one
+thread (1.9-3.1x) and costs 5-10% on a false positive, so it belongs behind relocation, decided by running the directional
+gates on the mirrored SAMPLE. Mirrored block shapes read 0.98-1.02: the twist made them free. One wrong prediction became a
+lead: at 14 threads a 95% sorted prefix sorts 1.8x SLOWER than its mirror, and the tail route is not why (it still wins 1.075).
+
+**What the named harness rows found.** `logos_twist_last()` reports the twisted strands each route placed, and the row that
+expected plain relocation at 1,000,003 elements and 8 threads got nobody: a detection chunk began 7 elements before a block's
+end, a body under `RELOC_MIN_BODY` has no gap test, the 7 fused with the next block into a run whose interval hid holes, and
+relocation declined. Older than the twist, masked by the knot route, not fixed. CHANGELOG has the full account, the
+verification, and a reading of `make profile-full` that ranks what is left to trim per element.
+
+## 3af. Disorder of short reach: index blocks sorted where they lie; and what the hunt for it found in the near-sorted gates and the general leaf (2026-09-20, `make reachhunt`, `make reachbench`, `make nsgatebench`)
+
+The question was abstract: the knot route worked, so what else looks like run detection and unknotting? Six analogies were written
+down with predictions (`experiments/SHORT_REACH.md`). The first step was a ceiling bench, not a route. One analogy was then built
+and ships, two were measured and are not built, three are unmeasured, and the hunt found defects in code that was already
+shipping: in the near-sorted route's gates, in the general leaf's nearly-sorted probe, and in a harness row. The order of events
+matters here, so this section keeps it.
+
+**Ceilings first (`make reachhunt`).** `reachhunt.cpp` includes the zoo of twenty unchanged and adds informed sorts that are TOLD
+the structure. Paired rows, n = 2^23, ratio = t(logos) / t(method):
+
+| shape | method | 1 thread | 14 threads |
+|---|---|---|---|
+| event_ts_latency (displacement <= 4096) | index blocks sorted in place + seam repair | 1.28-1.31 | 1.18-1.22 |
+| window_shuffle (2048-element windows) | the same | 1.34-1.37 | 1.22-1.24 |
+| window_shuffle | cuts (everything before <= everything after), told | 1.64 | 0.30 |
+| window_shuffle | cuts, found blind | 1.11 | 0.24 |
+| coarse_key_groups (random inside groups of 2k-200k) | cuts, told | 1.43 | 1.11 |
+| regime_switch (3 value bands, reach 512 inside a dwell) | chunk relocation, told the segments, then blocks | 2.0-2.1 | 1.3-1.5 |
+| latency + 0.01% far strays | blocks + seam repair, which must decline | 0.60 | 0.41 |
+
+Seven predictions were graded there; two were right. The informative misses: cuts told at 14 threads were predicted 1.3-1.8x and
+measured 0.30x, because 2048-element ranges fall under the leaf's flash threshold and a parallel sort sends them to a scalar
+quicksort; blind cut detection was predicted at 8-12 ms and costs 35, because a suffix minimum and a running maximum are
+dependency chains; and the chunk-relocation ceiling was predicted 1.2-1.5x and measured 2.0x for a reason that is not its merit:
+the engine runs three-band data at twice its uniform time. **A ceiling measures the baseline's weakness too.** Cuts are a special
+case of blocks (a block boundary that happens to be a cut has an empty seam), so they are not built. The stop rule had been written
+down in advance: no parallel route unless blocks beat the 14-thread time on both zoo shapes. They did, by 18-24%.
+
+**The route (`reach_try_f64`).** Cut the array into index blocks of 32768 (more when the reach needs it, 131072 at most), sort every
+block in place in parallel, then repair the seams: for sorted blocks L and R, the elements of L above R[0] and the elements of R
+below the last of L are merged in place, and what crosses a seam rightward is matched by what crosses leftward, so nothing else
+moves. No n-sized buffer is asked for. The ceiling bench could only CHECK that every block keeps an untouched middle (the condition
+under which seams are independent) and decline otherwise. The route GUARANTEES it: with m(k) the median of sorted block k, an
+element of block k below m(k-1) or above m(k+1) is a stray and is set aside first, so x(k) counts elements below m(k), y(k+1)
+counts elements above it, and m(k) is in neither.
+
+**Strays decide the cost, and a sample cannot see them.** A few are sorted apart and put back by one in-place shift pass: between
+two strays every element moves by the same amount, so the pass is a list of `memmove`s, left-movers first from the left, then
+right-movers from the right. (The first cut merged them through a second buffer: +36 ms at one thread for ONE stray.) A block that
+holds a stray is split three ways before it is sorted, because one zero in a block of timestamps stretches the flash sort's
+value-linear map until every real element lands in one class. How many strays are worth putting back depends on the thread count:
+the shift is serial, about 0.7 ns per element at most, against a saving of ~7 ns per element at one thread and ~0.4 at fourteen. Up
+to four threads strays are simply put back; wider sorts hold eight probe blocks against their fences first (the estimated medians
+of their neighbours) and decline when two break one, which costs 0.05-0.1 ms and moves nothing. A rule that stopped the block phase
+when strays kept turning up was measured dominated and removed (strays in 28% of the blocks at 14 threads: 1.24x against the
+partition when put back, 0.78x when the phase stopped itself).
+
+**The gate reads the sample, never the array.** Sample indices i and i+L sit |frac(L phi)| n positions apart; for the Fibonacci lags
+144, 233, 377, 610, 987 and 1597 that is 0.31%, 0.19%, 0.12%, 0.073%, 0.045% and 0.028% of n, a ladder of distances. The reach
+estimate is the smallest rung from which no distance shows more than 2% inverted pairs. Random data fails the first rung, which the
+shared sample has already read, so it pays nothing. Four 4096-element windows must then show dense adjacent descents; sparse
+disorder on sorted data is left to the near-sorted route.
+
+**The block sort was the surprise, twice.** The first cut sorted blocks with the engine's general leaf and measured 1.15-1.53x at
+one thread. (a) The general leaf's 40-pair probe calls a block nearly sorted when the reach is under its stride of n/40, tries an
+insertion sort that gives up after 8n moves, and keeps the quicksort away: going straight to a kernel was 1.97x at 14 threads on
+latency < 512. (b) On these blocks a flash sort beats the AVX2 quicksort at one thread by 1.26-1.81x: classification is nearly the
+identity on locally ordered data, so count, scatter and insertion pass all stay where the cache already is. The route's flash counts
+its classes before it scatters and hands a block with a crowded class to the general leaf (a block that straddles a quiet hour holds
+two clusters, which the leaf's quantile-spread check passes). (c) A second look found the first cut's "small span means integers"
+test sending every series with unit spacing to the general leaf: 293 ms on 64-element windows at one thread, 76 through the kernel.
+(d) Disorder that reaches two or three places is an insertion sort's; four-apart pairs tell it (noise of +-2 at one thread: 0.81
+with flash alone, 1.10 with the insertion kernel). Block size: 16384 is neutral against 32768, 65536 is 0.85-1.00.
+
+Route off / route on in one binary (`LOGOS_NO_REACH`). 8.4M with 30 pairs on a day whose null test read 6.0% at 8M; 30M with 12
+pairs; 1M with 120 pairs:
+
+| shape | 8.4M, 1 thread | 8.4M, 14 threads | 30M: 1 / 14 | 1M: 1 / 14 | 8.4M at 4 / 7 threads |
+|---|---|---|---|---|---|
+| latency_4096 (event log, latency < 4096 ms) | **1.91** | **1.31** | 2.53 / 1.51 | 1.00 / 1.00 (*) | 1.61 / 1.63 |
+| window_2048 (shuffled inside 2048-element windows) | **2.22** | **1.38** | 2.72 / 1.79 | 1.94 / 1.38 | 1.79 / 1.82 |
+| jitter_1000 (index + noise of +-1000) | **2.05** | **1.33** | 2.13 / 1.52 | 1.81 / 1.25 | 1.50 / 1.43 |
+| latency_512 | **2.38** | **1.49** | 2.86 / 1.70 | 2.21 / 1.38 | 1.82 / 1.68 |
+| window_64 (`TRUTH_TABLE` J6's shape) | 2.46 | 1.48 | 2.86 / 1.83 | 2.45 / 1.34 | |
+| jitter_2, jitter_8, jitter_30 | 1.10, 2.54, 2.17 | 1.80, 2.35, 1.31 | 1.09, 2.56 / 1.67, 1.55 | 1.12, 2.60 / 1.44, 2.08 | |
+| ticks_dup (jittered one-second ticks: heavy duplicates) | 2.80 | 1.02 (a counting route wins the dispatch) | | | |
+| one_stray (latency_4096 + one far element) | 1.81 | 1.14 | 2.44 / 1.31 | | 1.49 / 1.39 |
+| strays in 0.001%, 0.01%, 0.1%, 1% of elements | 1.77, 1.57, 1.49, 1.23 | 1.26, 1.00, 1.01, 1.04 | 2.21 / 1.14 (0.01%) | | 1.28 / 1.01 (0.01%) |
+| 0.05% zeros; 8, 84, 840 zeros; 84 late events | 1.58; 2.28, 2.35, 1.54; 1.77 | 0.99; 0.96, 0.97, 0.99; 1.10 | 1.41 / 1.00 (0.05%) | | 1.15 / 1.01 (0.05%) |
+| latency_512, noise of +-100, +-20, +-8, +-2, each + 0.01% strays | 1.84, 1.81, 2.33, 2.32, 1.56 | 0.99-1.02 | | | |
+| reach_40000 (needs blocks above the cap: declined from the sample) | 1.01 | 0.96 | | | |
+| uniform, near_1pct, coarse_groups, regime_switch, stairs_x20, block_perm64, heavy_tail, few_distinct | 0.99-1.03 | 0.94-1.02 (few_distinct read 1.18 with p10/p90 of 0.68/1.46) | 1.02 / 0.98 (uniform) | 1.00 / 1.01 (uniform) | |
+
+(*) a reach of 4096 is longer than the first rung of a 1M ladder (0.31% of n is 3,100 positions), so the gate declines from the sample.
+
+**Defect 1: the shared sample's inversion rate read 7 pairs, not ~1900.** Sample indices i and i+144 are 0.31% of n apart and the
+LATER index is the EARLIER position (frac(144 phi) = 0.99689). The `p1 <= p0` test meant to drop the few pairs that wrap around
+the array dropped all 1,897 adjacent pairs and kept the 7 wrapped ones, a whole array apart. It passed gray-code, sawtooth,
+block-permuted, staircase and grouped-run data as nearly sorted (true rates 8-79%) and turned away one genuinely near-sorted input
+in seven. Found because the short-reach gate wanted the same statistic at other lags and the pair counts came back 7 and 3.
+**Defect 2: the near-sorted pre-gate had no poison recovery**, and the route it guards has: on sorted data with random swaps it
+declined 12 of 40 seeds at 1% swaps and 38 of 40 at 2%, so the route was mostly unreachable on the data it was built for.
+**Defect 3, what the two cost together:** sorted runs grouped by a coarse key ran 5.8x off the ceiling at 14 threads, because the
+7-pair statistic let the near-sorted route run, it rejected 73% of the array and declined after 57 ms. Found only because the
+ceiling bench's late decline handed the engine an array of sorted blocks. The gate now reads every pair in position order and the
+pre-gate runs the route's own scan on its four windows (`LOGOS_NS_GATE_OLD=1` restores both):
+
+| shape (8.4M, gates as they were / repaired) | 1 thread | 14 threads |
+|---|---|---|
+| groups_of_runs (sorted 33k blocks inside coarse-key groups) | 1.00 | **3.82** |
+| sorted + 1% random swaps, four seeds (the 7-pair statistic turned two away; the pre-gate turned the other two away) | 0.95-1.01 | **1.36, 1.39, 1.30, 1.48** |
+| sorted + 2% swaps, two seeds (newly admitted: true rate ~3.5%) | 1.00-1.01 | **1.37, 1.23** |
+| sorted + 0.5%, 3%, 5%, 10% swaps (100 pairs) | 0.99-1.02 | 1.01, 1.01, 0.98, 1.00 |
+| block_perm64, stairs_x20, sawtooth, gray_code, sorted_runs_256, uniform, heavy_tail, few_distinct | 0.99-1.00 | 0.97-1.04 (30 pairs); 0.98-1.01 (100 pairs) |
+
+**What the ROUTE is worth, not the gates** (`NSG_ROUTE=1 ./nsgatebench`: the route switched off by `LOGOS_NO_NEARSORTED` against the repaired
+gates, 14 threads, 100-300 pairs). The old pre-gate had turned 38 of 40 inputs with 2% swaps away whatever their size, so nobody had
+seen this table:
+
+| swaps | 1M | 1.5M | 2M | 3M | 4M | 6M | 8.4M |
+|---|---|---|---|---|---|---|---|
+| 0.5% | 1.36 | 1.19 | 1.48 | 1.66 | 1.69 | 1.75 | 2.12 |
+| 1%, two seeds | 1.21, 1.28 | 1.07, 1.12 | 1.25, 1.25 | 1.42, 1.37 | 1.38, 1.43 | 1.36, 1.73 | 1.38, 1.41 |
+| 2%, two seeds | 0.98, 1.04 | **0.84, 0.87** | 0.93, 1.15 | 0.94, 0.94 | 0.99, 0.98 | 1.33, 1.41 | 1.12, 1.13 |
+| 3% | 1.00 | **0.75** | **0.80** | 1.00 | 1.01 | 1.02 | 1.09 |
+
+The route has three spawn phases and sorts its strays once, which a few million elements do not pay back unless the strays are few. So
+the gate is **2.5% below 6M elements and 5% from there on** (`NS_INV_RATIO_SMALL`, `NS_WIDE_MIN_N`); with the gate lifted, 5% swaps lose
+0.71 at 8.4M. With it, gates as they were / repaired at 1.5M, 2M and 4M (300 pairs): 1% swaps 1.00-1.36, 0.5% swaps 0.98-1.61, 2% and 3%
+swaps 1.00-1.02, groups_of_runs 2.76-3.81.
+
+**A harness row had been passing because of the broken gate.** The tail route's parallel NaN row demanded identical BYTES from two
+runs, on the premise that a declined tail route leaves both on one deterministic path. That held only while the 7-pair statistic sent
+its input (a tenth of it a random tail, which reads 5.1%) to the near-sorted route. Read properly it goes to the partition, where the
+order inside a bucket depends on thread timing, and with a NaN present two runs of the SAME configuration differ (21 of 40 tries).
+It showed first as one unexplained failure under ThreadSanitizer, whose target pipes through `tail -3` and cut the FAIL line off;
+looping the plain harness caught it on the first pass. The row now checks a return and a permutation of the input's bits.
+
+**Defect 4: the general leaf wastes 8n moves on dense, short disorder.** The same 40-pair probe runs in every partition leaf and
+in the sequential dispatcher. Data the short-reach route declines (strays at 14 threads, arrays under 2^18, int32 never) still meets
+it. When the probe says nearly sorted, 64 strided pairs EIGHT apart now decide whether the insertion sort is tried at all: its
+budget is a mean displacement of 8, and an element displaced further is usually inverted with its eighth neighbour
+(`LOGOS_NO_DENSE_PROBE=1` restores the old leaf):
+
+| shape (8.4M, old leaf / new leaf, the short-reach route on both sides, 30 pairs) | 1 thread | 14 threads |
+|---|---|---|
+| latency_512 + 0.01% strays (the route declines it at 14 threads: the partition's leaves meet it) | the route takes it | **1.36** |
+| noise of +-100 + strays | the route takes it | **1.70** |
+| noise of +-20 + strays | the route takes it | **1.87** |
+| noise of +-8 and +-2 + strays (inside the insertion sort's budget: it must still run) | | 1.00, 1.01 |
+| regime_switch | 1.17 | 1.16 |
+| coarse_groups, reach_40000 | 1.10, 1.07 | 0.99, 1.00 |
+| the other 24 rows | 0.98-1.01 | 0.96-1.08 (a 6% day); 0.99-1.06 on six guards with 100 pairs |
+| the three stray rows at ONE thread, measured before the route took strays there (24 pairs) | 1.32, 1.31, 1.28 | |
+| with the route OFF on both sides (four configurations interleaved, minima): 64-element windows | 384 -> 160 ms | 39.7 -> 21.4 ms |
+| the same: noise of +-30 | 497 -> 221 ms | 46.5 -> 23.9 ms |
+
+**What the route weighs and what it does when resources run out.** `make memprobe` (10M, peak traced heap of one cold call on top of the input): **0.10 bytes per element at one thread and 1.33 at fourteen**, against 15.5 and 23.2 on the partition, and 0 after `logos_release_buffers()`; at 1M, 1.1 and 11.2 (ten threads' scratch and contexts over thirty blocks), against 15.9 and 28.5. `make faultprobe`: 480 failed allocations and 12 failed
+thread creations over the two short-reach cases, none ending badly (20 allocation sites, one worker function); the whole sweep on the
+final engine, twice: 8,170 and 8,166 failed allocations (the count moves by a few with thread timing) and 234 failed thread creations each, 0 bad. Every branch of the
+route is asserted BY NAME in the harness through `logos_reach_last()`: sorted, sorted with strays shifted in, declined at the gate,
+by the probe, by the plan. The first version of that section passed with the route never firing at one thread, because the gate's
+sample is 384 points there and the ladder needs 2048; and the diagnostic itself reported the previous sort's answer until it was
+reset at the top of the dispatcher rather than at the route.
+
+**What one call costs at the small end** (`make callbench`, new: a baseline engine against the working tree on 0 to 50,000 elements,
+random and sorted, two binaries with the copies swapped). Every A/B of the round starts at a million, so this was the only way to
+see that the round AS BUILT cost every small call: **1.09-1.14 at n = 0, 1 and 2**, 1.03-1.09 at 3 and 5. Three causes, three
+different verdicts. (1) MEASURED AND FIXED: a gate helper with two 16 KB arrays was inlined into the dispatcher, whose prologue
+probes every page of its frame on every call (stack-clash protection); 8 probes became 10, which alone is 1.09-1.14 at n = 0 and 1,
+all eight orientation readings between 1.07 and 1.16. `noinline`: 0.98-1.01. (2) NOT RESOLVED, REMOVED ANYWAY: resetting the
+thread-local diagnostic on every sort put two `__tls_get_addr` calls (thread-locals are function calls under `-fPIC`) on a path
+that had none; predicted +20-35% on a sorted triple, measured +5% in one orientation and -14% in the other. The reset now starts at
+the route's floor of 2^18 elements and a smaller sort leaves the answer alone, which the header states and the harness asserts.
+(3) A WIN THAT IS LAYOUT, NOT SHIPPED: the leaf's new probe loop, inline, made a sort of 100 random doubles THAT NEVER RUNS IT 5%
+slower; deleted, 2.5% faster; out of line, 12% faster, in two bench binaries. But the round as built, with the same inline loop,
+read 0.90. Rows from 10 to 100 elements read 0.78 to 1.13 across nine builds with identical logic on that path, reproducibly:
+**reproducible is not real**, it is a property of one build. A small-call row counts at n <= 5, in both orientations and two
+runs, with a mechanism visible in the assembly. The bench also gave a ceiling: entering the dispatcher costs ~5.6 ns (a thread-local
+read, the call, nine probed pages of a 36 KB frame), so `logos_sort_f64` now returns at once when n < 2 (**8.5 -> 2.9 ns**, 0.29 in
+both orientations), and every call of 2 to 24 elements still pays it (open direction 0g).
+
+**Still open, found here.** (a) A sentinel the SAMPLE happens to contain defeats the partition's certificates: with 840 zeros in 8.4M
+jittered timestamps the trace shows KS 0.99, a rejected key grid and a table scatter; the int32 path windows its sample against
+exactly this and the f64 partition does not. (b) Three value bands 2^40 apart run at twice the uniform time at both thread counts.
+(c) The lazy view's bucket sorter sends ranges under 4096 elements to a scalar quicksort when it runs parallel (0.30x on 2048-element
+ranges). (d) The route is f64 only, its ladder is fractions of n, and blocks are capped at 131072, so above ~117M elements the gate
+declines even when the reach is short; its stray shift is serial. (e) Candidates 4 to 6 of the brainstorm are unmeasured. (f) **Two scales of order at once**: a sine wave with a slope plus noise
+of +-50 elements costs **1.22-1.31x a sort of random data at one thread** (`make sineprobe`, paired against a uniform reference,
+40 pairs, two runs, null 0.99-1.00), and nothing at 14 threads. The control is the finding: the SAME noise on a plain slope reads
+0.59-0.63, because the short-reach route takes it, so the cost belongs to the WAVE and not to the noise, and it tracks the reach
+rather than the swing. A third control found the CAUSE: the same VALUES with the index order destroyed read 1.01, level with random, so the cost is the
+ORDER and the array is slower than the same numbers shuffled. A profile build says the natural order takes the COARSE leaf while the
+shuffled multiset and uniform take the AVX2 quicksort leaf, because `AVX2_TAKE` requires `!c->nearly` and the 40-pair probe calls a
+sloped wave nearly sorted. The dense-disorder probe added in this same round is exactly the statistic that would overrule it, and it
+gates only the insertion sort; extending it is predicted at ~1.45x here and neutral on near-sorted shapes, unbuilt and un-A/B'd.
+A composed route is bounded by measurement at 2.1x (the control's level) to 3.7x (the clean wave's), 2.6x after that gate fix.
+
+## 3ae. An outside review, re-tested here: what a sort weighs, what it does when a resource runs out, subnormals, NaN, and the scaling exponent (2026-09-20, `make memprobe`, `make faultprobe`, `make slopebench`, `make sanitize`, `make tsan`)
+
+A publication-readiness review of a sibling line of this engine (v3.10, developed separately, measured on another host) named three
+gaps: edge-domain validation (NaNs, infinities, allocation failures, extreme sizes), buffered memory that is understated and "may
+approach O(Pn) under pessimistic parallel allocation", and novelty. None of it was assumed to hold in this tree. Each was turned into
+a measurement here, and the pattern of the results is the finding: **every condition the harness had never produced found a defect**
+(an infinity, subnormals, a NaN payload, a failed allocation, a failed thread creation). The timing discipline of this project is
+strict and its correctness harness is large, and both only ever ran the engine with every resource available, on finite, normal,
+NaN-free numbers. Most fallbacks did work; but the ones that did not had never had the chance to show it.
+
+**What a sort weighs.** Peak traced heap of ONE COLD sort in a fresh child process (the malloc family interposed; the pools make
+every later call look cheap), bytes per element on top of the 8-byte input, 10M elements:
+
+| | 1 thread | 14 threads, before | 14 threads, after |
+|---|---|---|---|
+| uniform, heavy_tail, near_sorted | 15.5 | 34.9 | **23.2** |
+| block_perm (relocation) | 15.5 | 9.0 | 9.0 |
+| few_distinct, quantized (counting) | 0.0 | 0.0-0.2 | 0.0-0.2 |
+| **dominant_90**: one value holds 90%, the rest distinct | 15.5 | **104.5** | **17.8** |
+| `logos_sort_f64_inplace` | 0 | 0 | 0 |
+
+| still held after `logos_release_buffers()` | before | after |
+|---|---|---|
+| any partition shape, 1 thread | 7.5 | 0 |
+| uniform, 14 threads | 14.0 | 0 |
+| dominant_90, 14 threads | **95.2** | 0 |
+
+The header said "~9n bytes of scratch". Three defects sat behind the numbers. Every parallel leaf loop sized ALL P contexts by the
+LARGEST bucket, so one bucket no splitter can divide cost P times n, the review's O(Pn) exactly: a gigabyte of scratch for an 80 MB
+array. The histogram-free partition allocated its slack-sized regions (12.8 bytes per element) twice and freed the first copy, because
+glibc never returns a 64-byte-aligned block from mmap. And `logos_release_buffers()` freed 9 of the 23 bytes per element it held, 9 of
+104 on the dominant shape, and none of the int32 counting route's table pool (up to 64 MB). Contexts now fit a typical bucket and an oversized one borrows room while it is sorted (the buckets in
+hand at one moment are disjoint, so they sum to at most n); the regions are asked for once, aligned; release returns everything.
+Speed: neutral. The final engine against the committed one, paired, both copy orientations so that the code-layout term cancels,
+  8M, 30 pairs each, run twice: 0.99 to 1.04 on nine rows (uniform, heavy_tail, dominant_90, block_perm, near_sorted,
+  few_distinct and quantized at 14 threads, uniform and block_perm at one), and after the last fix of the round 0.98 to 1.06 on
+  eleven, with bimodal at both thread counts (0.998 and 1.035: its leaves take the gap-split path that fix touched). At or inside
+  the ~4% floor; the staircase row reads 1.40 and 1.43, which is the knot route. An earlier check of the memory fixes alone, on a hot box, read 0.96 to 1.07 with the same spread on the one-thread rows
+  that change cannot touch.
+Prediction for 14 threads: 9.6. Measured 34.9. I forgot the partition's regions exist.
+
+**The bound, and a check on it.** A context costs 6 bytes per element of capacity (a 4-byte count and a 2-byte index) and is
+grown with 25% headroom: 7.5. With B = 12P buckets and m the largest bucket, the old engine peaked at about 9n (scratch and index
+cache) + 25.6n (the regions, twice) + 7.5 P m: 35.6n on uniform (measured 34.9) and, with the partition declining on a dominant
+value, 9n + 7.5 x 14 x 0.9n = 103.5n (measured 104.5). Now the contexts cost 7.5 x P x min(m, n/(6P) + 4096), about 1.3n, plus m
+once when a bucket has to borrow: 9n + 12.8n + 1.3n = 23.1n on the partition (measured 23.2) and 9n + 1.3n + 7.5 x 0.9n = 17.0n
+when it declines (measured 17.8). **O(n) with a constant under 24, whatever P is, where it had been O(P m).**
+
+**What it does when a resource runs out.** `faultprobe` interposes malloc, calloc, realloc, posix_memalign and pthread_create and
+fails the k-th call the engine makes in one cold call (or every call from the k-th on), each run in a forked child so that a crash
+or a hang is a result. Four entries, 19 cases, 1 and 4 threads:
+
+| one cold call, one fault injected | runs | came back sorted | wrong output | crashed | hung |
+|---|---|---|---|---|---|
+| an allocation, 1 thread, before | 1,500 | 1,239 | **261** | 0 | 0 |
+| an allocation, 4 threads, before | 6,816 | 4,862 | **1,880** | **74** | 0 |
+| a thread creation, 4 threads, before | 186 | 32 | **45** | 2 | **107** |
+| all of them, after | 7,008 | **7,008** | 0 | 0 | 0 |
+
+(The allocation runs fell from 8,316 to 6,822 because the k-way merge no longer allocates. Three targeted sweeps reach what the
+main one does not, and are clean too, 1,226 allocation and 48 creation faults: the hash-count route forced with
+`LOGOS_MCGATE_OLD=1`, relocation without the knot route with `LOGOS_NO_KNOT=1`, and the partition's spill path forced with
+`-DHF_SLACK=0.2`. With those, the creation of every one of the 18 worker functions in the default build has been failed at least
+once, and 128 distinct allocation sites. The final engine's own sweep, with the in-place entries and a 70-run chain added, 23
+cases: 7,894 injected failures, 0 bad, 19 worker functions, 132 allocation sites.)
+
+Four defects, none of them in code anybody had marked as risky. (1) No `pthread_create` result was read at any of 23 sites. A failed
+creation HUNG the partition (a barrier waiting for a participant that does not exist) and returned WRONG OUTPUT, silently, from the
+counting, lattice, near-sorted, relocation and sorted-prefix routes, which joined a garbage handle and read results nobody wrote.
+This is the likelier failure on Linux: a pid limit makes pthread_create fail while malloc still succeeds. (2) `merge_all_runs`
+returned with its runs unmerged when two small lists could not be allocated: unsorted output, no error, from three routes. (3) A
+context that failed to allocate was still handed to the leaf by every worker, because the flag that recorded the failure was only
+read by the caller. (4) The sequential path freed a stack context that had never been initialised whenever the scratch buffer
+failed first. That one was found by reading, while chasing the harness crash caused by (3); restored in a scratch copy it aborts
+the in-process harness (`munmap_chunk(): invalid pointer`) and passes every forked one-thread run, because a fresh child's deep
+stack is zeros. That is the argument for keeping both forms of the probe. The fixes are structural, not checks bolted on:
+an orphaned worker runs on the calling thread (17 sites), or is dropped from the barrier whose count became atomic (3 sites, all
+queue-driven), or has its static output tile covered by the caller (relocation, knot), or makes the route decline (int32 counting);
+the merge's lists moved to the stack with an allocation-free fold behind them; contexts are all or nothing and `ctx_fit` refuses an
+empty one. The harness repeats a sample of the probe on every `make test` (about 2,150 checks), so these paths are no longer code that
+only a separate tool ever runs. Predicted 5-15% of allocation faults bad; measured 27%, because one defect sat behind hundreds of
+allocations. Predicted every creation fault bad; measured 154 of 186, the rest passing on a garbage handle that happened not to fault.
+
+**Subnormals came back unsorted.** NaN-free data with a third of its values subnormal, 300k elements or more, 4 or 8 threads: 2 to 3
+descents in the output, on the committed engine too. A bucket whose range is narrower than about 1e-305 makes `classes / range`
+overflow to +inf; every element computes `x * inf` and the minimum `0 * inf = NaN`, whose garbage cast the coarse leaf clamped into
+the LAST bucket. The infinity fix of the day before guarded the RANGE; what must be finite is the SCALE. The same leaves had been
+quadratic there (43 ms of leaf time for 300k elements, 7 after).
+
+**NaN.** Order with a NaN present stays unspecified, and the probe shows how much: the non-NaN values came back out of order in 246
+of 672 runs, because a NaN fails every compare and a prescan takes `[1, NaN, 0.5]` for ascending. The floor that is now promised and
+tested is: no crash, no out-of-bounds access, and an output that is a permutation of the input's bit patterns. That floor was broken
+in 16 runs (the spill sort rewrote signalling, negative and payload NaNs as the canonical one). `logos_sort_f64_nan_last` is the
+entry with a defined order, at the price of one sequential pass.
+
+**A sort that did not return.** The floor had a hole: the gap-split partition scanned with `a[i] < pivot` from the left and
+`a[j] >= pivot` from the right, a NaN fails both, and when the two scans met on one neither moved again. In C it was intermittent,
+because the order inside a bucket depends on thread timing: about one harness run in fifteen, one worker at 100% and the caller
+asleep in a join, and about one sort in thirty on heavy-tailed data with 1% NaN at 4 threads. Catching it took a harness that can
+loop one section and a hunter that signals the spinning thread so its own handler prints the backtrace. In JavaScript, where the
+loop came from, it is deterministic: `[lows..., NaN, highs...]`, 6,000 elements, never returns, in the published package. One
+predicate for both scans fixes both. **An 'unspecified order' contract still has to say the call returns, and that is a thing to
+test, under a watchdog.**
+
+**The scaling exponent** (`make slopebench`).
+
+- The review read a scaling exponent off two sizes through the cost per element: with c = t/n, t ~ n^p gives
+  p = 1 + ln(c_50M / c_2M) / ln 25. The scale report holds those two numbers, but on this box its rows are measured minutes
+  apart and the machine's speed drifts by a multiple in that time (methodology 2), so a slope read off two rows carries the
+  drift. `slopebench` measures it the way this project measures everything else: ONE 50M sort adjacent to TWENTY-FIVE 2M sorts
+  of the same shape (the same generator, the same number of elements through the same work buffer), order alternating, median
+  of 8 pairs. The ratio of the two times IS c_50M / c_2M.
+- Two calibrations, because a new instrument is a claim. The null (50M on both sides, true growth 0) read +2.0%, +1.7%, +0.4%
+  and -0.8%: the floor is about 2%. And `std::sort` on uniform must show at least the comparison-count slope, log2(50M) /
+  log2(2M) = 1.222, p = 1.062: measured +23.5% and +22.3% in two runs, p = 1.066 and 1.063.
+- Growth of the cost per element from 2M to 50M, two full runs (first / second):
+
+| | std::sort, 1 thread | logos, 1 thread | logos in-place, 1 thread | logos, 14 threads | in-place, 14 threads |
+|---|---|---|---|---|---|
+| uniform | +23.5 / +22.3% | +13.4 / +16.3% | +21.2 / +21.6% | +34.3 / +26.4% | -20.6% |
+| heavy_tail | +21.4 / +21.0 | +19.3 / +17.3 | +34.3 / +38.2 | +7.4 / +19.9 | -15.9 |
+| bimodal | +24.0 / +21.7 | +14.0 / +17.6 | +22.7 / +21.3 | -14.4 / -14.7 | +0.4 |
+| near_sorted | +27.1 / +29.8 | **+29.3 / +33.4** | +1.5 / +2.8 | **-59.5 / -53.8** | -22.5 |
+| few_distinct | +13.0 / +15.2 | **+0.5 / -1.7** | +0.8 / +0.3 | -30.7 / -39.4 | -1.5 |
+| quantized | +1.8 / +3.0 | **-0.1 / -0.8** | +4.6 / +3.9 | -40.2 / -56.7 | -15.6 |
+| block_perm | +37.5 / +31.3 | **-4.4 / +0.2** | +18.1 / +37.8 | -50.0 / -37.8 | -29.1 |
+
+- How far to trust it. The one-thread cells reproduce within about 3 points, with one exception that does not (block_perm
+  in-place, 18 against 38, with p10-p90 ranges that do not overlap: unexplained, so that cell is not evidence). The 14-thread
+  cells reproduce within 10 to 17 points. What follows is only what is larger than that.
+- One thread. logos grows LESS than `std::sort` on every random shape (13-19% against 21-24%, p about 1.04-1.05 against 1.06),
+  and the counting and relocation routes are exactly linear (p = 1.00 on few_distinct, quantized and block_perm, where
+  `std::sort` pays 13-15%, 2-3% and 31-38%). near_sorted is the one buffered route that grows faster than `std::sort` (+29-33%).
+  The in-place sort grows like a comparison sort (+21% on uniform; the reviewed sibling measured +9.0% for its own) and at 50M
+  costs 3.6 to 21 times the buffered sort per element.
+- Fourteen threads: two opposite effects, and the prediction ("about flat") caught neither. Uniform gets 26-34% DEARER per
+  element: 2M doubles are 16 MB and sit in this CPU's 24 MB last-level cache, 50M do not. The structured routes get 31-60%
+  CHEAPER: at 2M near_sorted costs 2.2-2.8 times per element what it costs at 50M, quantized 1.7-2.3, block_perm 1.7-2.1,
+  few_distinct 1.5-1.6. At 2M a parallel call on those routes is mostly FIXED cost, of the order of 1 to 4 ms per call. That is
+  a lead, not a result. What a spawn costs here: creating and joining 13 empty workers takes 0.77 ms at the median (0.56 to 1.02), about 60 us a
+  thread, so a route with two spawn phases pays 1.5 ms of a 4.6 ms near_sorted call at 2M: about a third of that fixed cost,
+  and nothing at 50M. Every `pthread_create` now goes through `par_run` / `par_spawn`, which is where a persistent worker pool
+  would go. It has not been built: it changes the library's threading model, and it wants its own A/B at 1M to 4M.
+- Predictions, graded. `std::sort` +22-30%: RIGHT. Buffered logos at one thread +5-15%: RIGHT on uniform (13, 16), low on
+  heavy_tail (17-19). In-place +10-25%: RIGHT on uniform. Counting shapes flat: RIGHT. The null within 3%: RIGHT. Fourteen
+  threads "about flat, -5 to +10%": WRONG on six shapes of seven, in both directions.
+
+**The in-place sort, in parallel** (`make ipbench`). The review's headline pair was in-place against buffered. Here the in-place
+entries took an `nthreads` and ignored it, no harness check had ever called them, and the slope bench priced the gap at one
+thread: 3.6 to 21 times the buffered sort per element at 50M. A placement pass is cycle-following and does not split, but its
+256 buckets are disjoint ranges, so ranges became tasks: one pass on a large range, its large children back on a fixed
+4,096-entry stack, small ones sorted where they lie. At 14 threads against its own one-thread form: 2.50x at 8.4M and 2.85x at
+50M on uniform, 2.5-2.6x on the other random shapes, 1.1-1.6x on the structured ones, no row below 1 at the 2^20 threshold. The
+first pass stays on one thread, a serial share of 30 to 35%, and that is the whole table. It remains 6 to 24 times slower than
+the buffered sort at the same 14 threads: zero scratch (0 against 23 bytes per element) is bought with time. 408 harness checks,
+which passed on their first run, and 40 injected failures, 0 bad. Predicted 2-3x on uniform (right), 1.0x on few_distinct
+(wrong on its premise: five values differ in four bytes, but make a task tree at most four wide), 3-6x behind buffered (9.8x at
+8.4M, 6.0x at 50M).
+
+**Sanitizers, whole harness, first time.** ASan + UBSan + `float-cast-overflow` over all checks: no memory error, three NaN-to-index
+casts reported (clamped, left alone, per-element loops). ThreadSanitizer: 0 data races (needs `setarch -R` on this kernel).
+`float-cast-overflow` is not part of `-fsanitize=undefined` in GCC, and it found every one of the infinity and subnormal defects.
+
+**Boundaries, leak checking, and flags nobody builds.** Three more places that had never run. A boundary sweep (every n from 0 to
+300, every power of two from 2^9 to 2^21 and the 100k / 350k / 500k multiples from below, at and above; both types, the buffered
+and the in-place entries): 12,058 checks, which passed on their first run. Leak checking had been switched OFF in the sanitizer
+target, and the first run with it on found 313 KB leaked in 28 allocations: when the dispatcher's sorted sample is not handed to
+the partition (a NaN in it, another size, or it could not be extended), it was freed only on the fallback label, 11 KB per such
+sort, in the committed engine too. And `-DLOGOS_NO_SPLITTER_TABLE` did not compile, so `make stbench`, the A/B for the largest
+parallel win in the project, had not built since the per-mode certificate was added; with `-DLOGOS_NO_RELOCATE` the day before
+that is two A/B switches found rotten. A compile-only pass over the Makefile now builds all 49 targets that have a compile
+step. ThreadSanitizer covers the thread-creation faults as well: under it the harness keeps that half of its resource section
+and forwards to TSan's own interceptor: 186 failed creations, 0 failures, 0 data races.
+
+**The other engines, on the same inputs.** All three share the design behind the infinity and subnormal defects, a value-linear
+bucket map whose scale is `classes / range`. JavaScript was correct on all 126 edge runs and had two QUADRATIC cliffs. A
+subnormal-wide range makes the scale Infinity, and `x * Infinity | 0` is 0 in JavaScript, so nothing goes out of bounds or comes
+back unsorted, but every element lands in bucket 0 and flash sort's closing insertion pass is O(n^2): 300,001 subnormals took 77 s
+(42 ms after). The second is not about subnormals at all: flash sort is one scatter and one insertion pass, so a dense cluster
+of distinct values inside a wide range sits in ONE bucket, and the safety probe compares two quartiles, between which such a
+cluster hides: 13-21 s for 300k elements (about 30 ms after). The fix is a displacement budget on that pass, about 3% on healthy
+data (the null of two identical modules reads 1.000); scanning the counts instead cost 5-11% and was rejected. Rust passes 252
+edge sorts in 2.7 s (`engines/rust/tests/edge_values.rs`): it guards the range and not the scale, and is saved by saturating
+casts and a concentration bail. **The same overflow is a wrong answer in C, a quadratic stall in JavaScript and nothing in
+Rust: what a defect looks like is a property of the language's conversion rules, not of the algorithm.**
+
+**Novelty: a first pass at the literature.** The review's third issue was a novelty claim without a literature review. Titles,
+venues and years below were checked online on 2026-09-20; the papers themselves were not re-read, so treat this as the list to
+start from, not as the review.
+- **Relocation (J5) is adaptivity to a known measure, Block.** Carlsson, Levcopoulos and Petersson, "Sublinear merging and natural
+  mergesort", Algorithmica 9:629-648 (1993): Block(X) counts the elements not followed by their successor in sorted order, so 64
+  shuffled sorted blocks have Block = 63, and their Adaptive Mergesort is optimal for it in comparisons. What J5 adds is
+  engineering (memcpy from run descriptors, a sample gate, gap-splitting), not a measure.
+- **The knot route's "crossing" is close kin to Osc.** Levcopoulos and Petersson, "Heapsort - adapted for presorted files" (WADS
+  1989) and "Adaptive Heapsort" (Journal of Algorithms, 1993): Cross(x_i) is the number of edges of the sequence's line plot cut by
+  the horizontal line through x_i, and Osc is the total. The knot cost (mass times ceil(log2 k) over the value intervals where k
+  strands are alive) is a run-level, interval form of that same sweep. The map of these measures is Estivill-Castro and Wood, "A
+  survey of adaptive sorting algorithms", ACM Computing Surveys 24(4), 1992.
+- **Run-adaptive merge policies are a different axis.** Munro and Wild, "Nearly-optimal mergesorts" (ESA 2018; Powersort, CPython's
+  merge policy since 3.11), choose the ORDER of merges from run LENGTHS. J5 and the knot route look at VALUE intervals to avoid
+  merges altogether. The two compose; neither subsumes the other.
+- **Parallel in-place sorting is well trodden.** IPS4o (Axtmann, Witt, Ferizovic, Sanders, ESA 2017) distributes in place by block
+  permutations; PARADIS (Cho, Brand, Bordawekar, Finkler, Kulandaisamy, Puri, PVLDB 8(12):1518-1529, 2015) parallelises the radix
+  permutation itself by speculative permutation plus repair; Regions Sort (Obeya, Kahssay, Fan, Shun, SPAA 2019) is its
+  theoretically efficient successor. The parallel in-place sort added here is none of these: it parallelises only below the first
+  pass, and says so.
+- What this means for the tree: nothing here should be called a new measure or a complexity result. The defensible claims are the
+  engineering ones already made (certificates, routing, the measured niche), and the knot write-up already says the unknotting
+  analogy buys a cost model and nothing more.
+
+## 3ad. The small end of the scale: n = 0, 1, 3, 5, 10, ns per element on a linear axis, and what they found (2026-09-20, `make scale-full`)
+
+The scale report now runs seventeen sizes, 0 to 10M (0, 1, 3, 5, 10, then half-decades from 32), and every panel carries a second
+chart: nanoseconds per element on a value axis that is always linear, for all nine shapes at 1 and 14 threads. Below 10k a size is
+timed as a batch of up to 4096 distinct instances sorted back to back, because one such sort is shorter than the clock can resolve
+and repeating one input trains the branch predictor. n = 0 is the cost of a call. Calibration memcpy 3.17 ms, std::sort 1M 65.3 ms.
+
+**Per call at the requested sizes** (uniform, one thread, ns):
+
+| n | std::sort | logos | x86-simd-sort | IPS4o | LSD radix | timsort |
+|---|---|---|---|---|---|---|
+| 0 | 0.3 | 8.2 | 2.6 | 1.9 | 0.6 | 1.8 |
+| 1 | 1.8 | 7.4 | 2.3 | 2.2 | 0.6 | 1.7 |
+| 3 | 5.3 | 48.0 | 14.3 | 4.5 | 7005 | 26.9 |
+| 5 | 9.5 | 85.3 | 17.5 | 12.0 | 6883 | 40.6 |
+| 10 | 66.8 | 136.1 | 27.8 | 71.0 | 7399 | 144.5 |
+
+At 14 threads the same sizes read 7.4, 7.4, 52.8, 91.1 and 177.4 ns for logos against 0.6, 3.9, 12.4, 18.9 and 69.3 for
+`__gnu_parallel::sort`: every parallel contender falls back to one thread there. Logos asked for 14 threads costs 5 to 30% more than
+asked for one at these sizes (52.8 against 48.0 ns at n = 3, 177 against 136 at n = 10); the cause is not measured.
+
+**Where logos starts to win** (one thread, logos / std::sort): 9x slower at n = 3 to 5, 2x at 10 to 32, then ahead
+for good from n >= 100 on uniform, heavy_tail, bimodal, quantized and int_wide (0.50 at 100, 0.24 at 1000, 0.17 at 10M), from 316 on
+few_distinct and the block shapes, from 1000 on near_sorted. **Per element, logos is cheapest at about a thousand elements** (7.5 ns on
+uniform), not at the large end (13.4 at 10M).
+
+**A step in the dispatcher between 25 and 76 elements.** A finer ladder (`bump_probe`, committed engine identical):
+
+| n | 24 | 25 | 32 | 48 | 64 | 72 | 80 | 88 | 96 | 128 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| logos ns per element | 17.7 | 36.3 | 24.3 | 25.7 | 25.3 | 26.7 | 15.0 | 10.8 | 10.7 | 9.8 |
+| average runs in the input | 10 | 11 | 14 | 20 | 27 | 30 | 33 | 37 | 40 | 53 |
+
+Predicted before it ran, and both edges landed: it starts at 25, where insertion sort hands over to run detection, and ends near 80,
+where random data exceeds the 32 runs `detect_runs_limited` allows and it bails at once. In between the engine detects runs of two or
+three elements, builds a relocation plan, has it declined, and only then sorts: 72 random doubles take 1.9 us and 96 take 1.0. Open.
+
+**Two regressions of the knot route, a day old, found only by these sizes.** Its switches were read with `getenv` on every call
+(three sorted elements: 6 ns -> 42), and its cost gate let the plan run on runs of two or three elements, where nearly every
+element is a run endpoint so almost nothing crosses and the plan itself is the cost (random n = 32: 781 -> 2431 ns). Every A/B bench
+here starts at 1M and the harness checks answers, not times, so neither could be seen. Fixed (switches read from 512 elements up; an
+average run of at least 256 before the route is asked) and confirmed in one binary against the committed engine: 0.93-1.03 from
+n = 0 to 3162.
+
+**On drawing it.** A linear axis has one enemy, a fixed cost divided by a tiny n: the radix baseline's 7 us per call is 2300 ns per
+element at n = 3 and flattened every other line in the first rendering. The ns/element axis opens at three times the 85th percentile
+of what is drawn; the linear time chart, where the largest n towers by right, is capped only when one series peaks four times above
+every other. Captions name what runs off the top; legend and tables keep the true values.
+
+## 3ac. The knot route: comparisons only where runs cross; an infinity crashed the parallel sort; relocation no longer beats the partition at 14 threads (2026-09-19/20, `make knotbench`)
+
+**The idea.** Read each run as a strand, the run descriptors sorted by first value as a linked list the sorted output walks along, and
+a crossing as a value interval in which two or more strands both hold elements. Relocation (J5) merges every element of a chain of
+overlapping runs and declines the array once chains hold half of it. The knot route sweeps the 2R strand endpoints in value order,
+cuts each strand where the set of live strands changes, copies every piece that lies alone and merges only the pieces that share an
+interval: O(R log R) plan, O(n) copies, O(crossing mass x log k) comparisons. Pieces are counted by the elements they hold, so a fused
+run whose interval hides a hole reads correctly without gap-splitting. The target is a staircase: sorted blocks whose value ranges each
+overlap the next, where one chain covers everything and J5 declines. `stairs_xNN` has NN% of its elements inside a crossing.
+
+**Against the shipped engine** (`LOGOS_NO_KNOT` off vs on in one binary, paired, 40 pairs, floor 3.2% at 8M and 4.5% at 1M):
+
+| route off / route on | cost | 8.4M, 1 thr | 8.4M, 14 thr | 3.1M, 14 thr | 1M, 14 thr | predicted at 8.4M (1 thr; 14 thr) |
+|---|---|---|---|---|---|---|
+| block_perm64 (no crossings) | 0 | 1.000 | 0.986 | 1.019 | 1.002 | 1.00; 1.00 |
+| block_overlap | 0.03n | **1.099** | **1.131** | 1.095 | 1.027 | 1.10-1.25; 1.03-1.15 |
+| stairs_x10 | 0.10n | **4.44** | **1.20** | 1.23 | 1.38 | 2.2-3.5; 1.5-2.2 |
+| stairs_x20 | 0.20n | **4.05** | **1.32** | 1.20 | 1.33 | 2.0-3.2; 1.4-2.0 |
+| stairs_x40 | 0.39n | **3.42** | **1.35** | 1.21 | 1.40 | 1.8-2.8; 1.1-1.6 |
+| stairs_x60 | 0.59n | **2.93** | **1.31** | 1.27 | 1.44 | 1.6-2.5; 0.95-1.3 |
+| stairs_x80 | 0.79n | **2.62** | **1.39** | 1.18 | 1.29 | 1.4-2.2; 0.85-1.15 |
+| stairs_x100 | 0.98n | **2.64** | **1.50** | 1.30 | 1.44 | 1.3-2.0; 0.75-1.05 |
+| triple (three strands live) | 1.57n | **2.58** | 1.24 (declined) | 1.29 | 1.30 | 0.9-1.5; 0.6-0.95 |
+| quad (3-4 live) | 1.96n | **2.68** | 1.09 (declined) | 1.04 | 1.02 | |
+| k8 (8 live) | 2.95n | **1.40** | 1.15 (declined) | 1.21 | 1.28 | |
+| stairs_ord_x20 (in value order) | 0.20n | **4.02** | 1.02 | 1.00 | 1.01 | 2.0-3.2; 1.00 |
+| zigzag_x20 (every other block descends) | 0.20n | **3.73** | 1.05 | 0.99 | 0.98 | 2.0-3.2; 1.4-2.0 |
+| shards14_x20 | 0.19n | **1.85** | 1.09 | 0.98 | 0.98 | 2.0-3.2; 1.3-1.9 |
+| uniform, few_runs, segmented, near_1pct | | 1.000-1.015 | 0.988-1.055 | 0.988-1.027 | 0.971-1.030 | 1.00 |
+
+The rows marked declined still win, because the knot route's sample gate declines in half a millisecond where J5 scans the whole
+array before its chain gate says no. shards14 at one thread is 1.8x when the shipped fallback would have been the run merge (8 fused
+runs) and 3.6x when it would have been the sequential leaf (9): the route itself takes 23 ms for every shuffle.
+
+**Against the pure partition**, which is what the route itself is worth. On a shuffled staircase the shipped relocation scans for
+2.8 ms and then bails (traced), and that sits in the baseline above. Two engine copies, this engine against `-DLOGOS_NO_RELOCATE`,
+both orientations, layout cancelled, 8.4M, 30 pairs:
+
+| engine / pure partition | 1 thread | 14 threads |
+|---|---|---|
+| block_perm64 (J5's own target, no knot work) | 4.47 | **0.95** |
+| block_overlap (J5's own) | 4.37 | **0.92** |
+| stairs_x10, x20 | 4.14, 3.80 | 0.96, 0.97 |
+| stairs_x60, x100 | 2.78, 2.55 | 1.03, 1.11 |
+| triple (accepted in that build) | 2.43 | **0.89** |
+| zigzag_x20, shards14_x20 | 3.54, 1.77 | 1.01, 1.08 |
+
+At one thread the route is worth 1.8-4.1x. At 14 threads it ties the partition on two-strand crossings and lost 11% on three strands,
+so the parallel gate is 1.0n; declining three strands early raised that row against the shipped engine from 1.16 to 1.24. In absolute
+terms (one process, minimum of 11, 8.4M, 14 threads): uniform random 15.4 ms, the staircase with the route off 11.6, on 9.0.
+**Relocation's own parallel win is gone**: 1.9-2.2x at 20 threads on 2026-09-10, 0.92-0.95 against today's partition. J5 did not
+change; the partition did, and the comparison was never re-run. Not acted on: see the open directions in CLAUDE.md.
+
+**What was wrong along the way.** The sweep first cut every endpoint below its value, which put each strand's last element at the
+head of the next interval and read 98.5% crossing mass on a staircase built with 10%; the trace build caught it before any timing.
+The gate was first J5's n/2, on a predicted break-even of 60-100% crossing at 14 threads; lifted, the two-strand ladder never breaks
+even against the shipped engine, and the n/2 gate charged 4-9% for late declines on the shapes just past it. The placement inherited
+relocation's one-thread-per-500k cap, measured on copies; at 1M it merged on 2 threads what the partition sorted on 10 and the
+heavily crossed rows lost (0.84-0.99) until the cap counted work instead of elements (1.26-1.43).
+
+**Infinities.** The knot harness's infinite-endpoint shape segfaulted with the route off. Uniform doubles with `a[0] = -INFINITY` at 4
+threads crash the committed engine in `hf_scatter`; position 0 is always a sample point. Eight of ten shapes crashed. One cause in four
+places: a value-linear map over an infinite range computes `inf * 0 = NaN`, and NaN fails every compare, so the uniformity certificate
+measured a distance of 0 and certified the data, `isfinite` passed a splitter-table scale of `cells / inf = 0`, and the leaf's flash and
+coarse buckets cast NaN to a class. Fixed off the per-element paths; 720 sweep checks clean under ASan, UBSan and
+`float-cast-overflow`, 90 of them now in the harness. The whole change against the committed engine, layout cancelled: 0.987-1.021 on
+five standard shapes at 1 and 14 threads.
+
 ## 3ab. heavy_tail was not slower than before; the key grid makes it faster (2026-09-13, `make kgbench`)
 
 **The complaint.** heavy_tail benchmarked "very slow" in the scale report: 104 ms at 14 threads and 10M against uniform's

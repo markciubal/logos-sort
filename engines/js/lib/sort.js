@@ -102,6 +102,7 @@ const sortNumbersImpl = (() => {
   const MOMENTUM_MAX_AVG_RUN     = 8;
   const FLASH_SORT_THRESHOLD     = 4096;
   const FLASH_SAFETY_RATIO       = 0.05;
+  const FLASH_SHIFT_BUDGET       = 16;        // flash sort's closing insertion pass bails to the coarse sort past this many shifted slots per element
   // Below this length flash sort's single n-bucket scatter stays cache-resident
   // and beats coarse bucketing (up to ~2.9x at 100k); above it the n-bucket
   // count array exceeds cache and coarse's K-bucket scatter wins (audit-derived
@@ -119,6 +120,22 @@ const sortNumbersImpl = (() => {
       while (j >= lo && a[j] > k) { a[j + 1] = a[j]; j--; }
       a[j + 1] = k;
     }
+  }
+  // Plain insertion sort with the momentum sort's budget: true if it finished, false once the shifts pass 8n, leaving a
+  // valid permutation for a distribution sort. Below MOMENTUM_THRESHOLD the nearly-sorted branch used the UNBUDGETED
+  // plain sort: 45,000 sorted elements with 1% random swaps took 47 ms, 20x the 2.3 ms they take now, and noise of +-400
+  // took 24 ms (2026-09-20). The galloping momentum sort was tried here first and lost 20-40% on displacements of a few
+  // places, which is what this branch mostly sees; plain shifts are the cheapest there is when the hop is short.
+  function insertionSortBudget(a, lo, hi) {
+    const budget = 8 * (hi - lo + 1); let work = 0;
+    for (let i = lo + 1; i <= hi; i++) {
+      const k = a[i]; let j = i - 1;
+      if (a[j] <= k) continue;
+      while (j >= lo && a[j] > k) { a[j + 1] = a[j]; j--; }
+      a[j + 1] = k; work += i - 1 - j;
+      if (work > budget) return false;
+    }
+    return true;
   }
   // "Momentum" insertion sort for large, nearly-sorted data with only local
   // jitter. Plain insertion walks left one slot at a time; this remembers how far
@@ -314,6 +331,10 @@ const sortNumbersImpl = (() => {
   function flashSort(a, n, min, max) {
     ensurePool(n);
     const m = n, scale = (m - 1) / (max - min);
+    // A range narrower than ~1e-305 (subnormals) makes (m - 1) / range overflow to Infinity; then x * Infinity | 0 and
+    // 0 * Infinity | 0 are both 0, EVERY element lands in bucket 0, and the insertion pass below is O(n^2): 300k subnormals
+    // took 77 s (found 2026-09-20 from the C engine, where the same overflow returned UNSORTED output). Same for a scale of 0.
+    if (!(scale > 0 && scale < Infinity)) { quicksort(a, 0, n - 1, 2 * (31 - Math.clz32(n))); return; }
     const counts = pool.counts;
     for (let i = 0; i <= m; i++) counts[i] = 0;
     for (let i = 0; i < n; i++) { const idx = ((a[i] - min) * scale) | 0; counts[idx + 1]++; }
@@ -321,7 +342,23 @@ const sortNumbersImpl = (() => {
     const scratch = pool.f64Buf;
     for (let i = 0; i < n; i++) { const v = a[i]; const idx = ((v - min) * scale) | 0; scratch[counts[idx]++] = v; }
     for (let i = 0; i < n; i++) a[i] = scratch[i];
-    for (let i = 1; i < n; i++) { const k = a[i]; let j = i - 1; while (j >= 0 && a[j] > k) { a[j + 1] = a[j]; j--; } a[j + 1] = k; }
+    // One scatter and then ONE insertion pass: that pass is quadratic in the largest bucket. A dense cluster of distinct
+    // values inside a wide range (100k values near 0 among 200k spread over +-1e9) sits in ONE of the n buckets, and the
+    // dispatcher's safety probe cannot see it when it lies between the quartiles it compares: 300k elements took 13-21 s
+    // (found 2026-09-20). So the pass carries a displacement budget, like the momentum insertion: healthy data shifts well
+    // under one slot per element, and past FLASH_SHIFT_BUDGET slots per element the array (a valid permutation at every
+    // step) goes to the coarse sort, which rescans each bucket's own range and recurses. Scanning the counts for a large
+    // bucket instead was measured first and cost 5-11% on healthy data; the budget is one subtraction per element.
+    let budget = FLASH_SHIFT_BUDGET * n;
+    for (let i = 1; i < n; i++) {
+      const k = a[i]; let j = i - 1;
+      if (a[j] > k) {                                     // most elements are already in place: the budget is only touched when one moves
+        do { a[j + 1] = a[j]; j--; } while (j >= 0 && a[j] > k);
+        a[j + 1] = k;
+        budget -= i - 1 - j;
+        if (budget < 0) { coarseBucketSort(a, 0, n - 1, 0, min, max); return; }
+      }
+    }
   }
   // Coarse 2-level value-bucket sort (the float path). Instead of flash sort's
   // single scatter into n cache-hostile buckets, scatter into K≈2048 cache-
@@ -349,6 +386,7 @@ const sortNumbersImpl = (() => {
     const k = len < COARSE_K ? Math.max(2, len >> 1) : COARSE_K;
     const C = COARSE_C[depth], S = COARSE_S[depth], H = COARSE_H[depth];
     const scale = (k - 1) / (mx - mn);
+    if (!(scale > 0 && scale < Infinity)) { quicksort(a, lo, hi, 2 * (31 - Math.clz32(len))); return; }   // see flashSort
     const idx = pool.idx;   // cache each element's bucket here (Uint16 view of the idle u32B)
     for (let i = 0; i < k; i++) C[i] = 0;
     // Count pass also records the bucket index so the scatter pass can read it
@@ -613,8 +651,27 @@ const sortNumbersImpl = (() => {
     const sampleStep = Math.max(1, (length / sampleSize) | 0);
     let inv = 0, comps = 0;
     for (let i = 0; i + sampleStep < length; i += sampleStep) { if (arr[i] > arr[i + sampleStep]) inv++; comps++; }
-    if (comps > 0 && inv / comps <= NEARLY_SORTED_INV_RATIO) {
-      if (length <= MOMENTUM_THRESHOLD) { insertionSort(arr, 0, length - 1); return arr; }
+    // The 40 pairs bound inversions at ONE stride, length/40. Disorder that is dense but shorter than the stride (an event log
+    // with bounded latency, a series jittered around its own order) passes them, and an insertion sort then moves every
+    // element its whole displacement: 45,000 elements with noise of +-400 took 24 ms against 2.4 for random data, because
+    // below MOMENTUM_THRESHOLD the insertion sort here was the PLAIN one, with no budget (found 2026-09-20 from the C
+    // engine, which had the same probe). 64 strided pairs EIGHT apart tell the two apart: the budget below is a mean
+    // displacement of 8, and an element displaced further is usually inverted with its eighth neighbour. And the small
+    // case (from FLASH_SORT_THRESHOLD up) now runs a BUDGETED plain insertion sort, which falls through to a distribution
+    // sort when it gives up.
+    let denseDisorder = false;
+    if (comps > 0 && inv / comps <= NEARLY_SORTED_INV_RATIO && length >= FLASH_SORT_THRESHOLD) {
+      const st = (length / 64) | 0; let d = 0;
+      for (let i = 0; i + 8 < length; i += st) if (arr[i] > arr[i + 8]) d++;
+      denseDisorder = d >= 16;
+    }
+    if (comps > 0 && inv / comps <= NEARLY_SORTED_INV_RATIO && !denseDisorder) {
+      // Under FLASH_SORT_THRESHOLD nothing changes: the fallback there is a quicksort, which an insertion sort beats up to ~25
+      // shifts per element, and the unbudgeted worst case is a few milliseconds (measured: budget and probe both LOST 10-30%
+      // on 2000-3000 elements).
+      if (length < FLASH_SORT_THRESHOLD) { insertionSort(arr, 0, length - 1); return arr; }
+      if (length <= MOMENTUM_THRESHOLD) { if (insertionSortBudget(arr, 0, length - 1)) return arr; }
+      else
       // Large n: only use momentum insertion for genuine local jitter (short
       // runs). Sparse far-displaced disruptions look nearly-sorted to the
       // inversion sample but would make momentum O(n*displacement); let them
@@ -676,11 +733,14 @@ const sortNumbersImpl = (() => {
         maxGapIdx >= 4 && maxGapIdx <= SAMPLE_SIZE - 4;
       if (isMultimodal) {
         const pivot = (samples[maxGapIdx - 1] + samples[maxGapIdx]) / 2;
-        // In-place Hoare partition: arr[0..p-1] < pivot, arr[p..] >= pivot
+        // In-place Hoare partition: arr[0..p-1] < pivot, arr[p..] not < pivot. ONE predicate for both scans: the pair it
+        // replaces, arr[i] < pivot and arr[j] >= pivot, BOTH fail on a NaN, so when the two scans met on one neither index
+        // moved again and sort() never returned: [lows..., NaN, highs...] with 6000 elements hung forever (found 2026-09-20
+        // from the C engine, where the same loop spun a parallel sort about one run in fifteen). A NaN now goes right.
         let i = 0, j = length - 1;
         while (i <= j) {
           while (i <= j && arr[i] <  pivot) i++;
-          while (i <= j && arr[j] >= pivot) j--;
+          while (i <= j && !(arr[j] < pivot)) j--;
           if (i < j) { const t = arr[i]; arr[i] = arr[j]; arr[j] = t; i++; j--; }
         }
         // Recurse on each half via slice/copy. Memory cost: O(n) temporarily,

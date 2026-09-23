@@ -81,7 +81,9 @@ RENAME = -Dlogos_sort_f64=$(1)_sort_f64 -Dlogos_sort_i32=$(1)_sort_i32 -Dlogos_n
          -Dlogos_profile_reset=$(1)_profile_reset -Dlogos_profile_get=$(1)_profile_get -Dlogos_profile_phase_names=$(1)_profile_phase_names \
          -Dlogos_profile_path_names=$(1)_profile_path_names -Dlogos_profile_route_names=$(1)_profile_route_names \
          -Dlogos_partition_f64=$(1)_partition_f64 -Dlogos_partition_i32=$(1)_partition_i32 \
-         -Dlogos_sort_buckets_f64=$(1)_sort_buckets_f64 -Dlogos_sort_buckets_i32=$(1)_sort_buckets_i32
+         -Dlogos_sort_buckets_f64=$(1)_sort_buckets_f64 -Dlogos_sort_buckets_i32=$(1)_sort_buckets_i32 \
+         -Dlogos_nan_to_end_f64=$(1)_nan_to_end_f64 -Dlogos_sort_f64_nan_last=$(1)_sort_f64_nan_last -Dlogos_reach_last=$(1)_reach_last \
+         -Dlogos_twist_last=$(1)_twist_last -Dlogos_mirror_count=$(1)_mirror_count -Dlogos_prescan_agree=$(1)_prescan_agree
 PFV := 16 32 64 128
 pfbench: pfbench.c $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -DLOGOS_NO_PREFETCH $(call RENAME,pf0) -c $(SRC) -o pf0.o
@@ -137,6 +139,11 @@ cp.o: $(SRC) $(HDR)
 chaoshunt: chaoshunt.cpp cp.o $(LIB).a $(HDR)
 	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) chaoshunt.cpp cp.o $(LIB).a -o $@ $(LDLIBS)
 
+# Ceilings for disorder of SHORT REACH (FINDINGS 3af): cuts, in-place blocks + boundary repair, links. The zoo of
+# twenty is included unchanged; the new shapes live in reachhunt.cpp. Paired rows, every output verified.
+reachhunt: reachhunt.cpp chaoshunt.cpp cp.o $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) reachhunt.cpp cp.o $(LIB).a -o $@ $(LDLIBS)
+
 # The sorted-prefix-plus-tail route: paired A/B in one binary switched by LOGOS_NO_TAIL.
 prefixbench: prefixbench.c $(LIB).a $(HDR)
 	$(CC) $(CFLAGS) $(BENCHFLAGS) prefixbench.c $(LIB).a -o $@ $(LDLIBS) -lm
@@ -156,6 +163,186 @@ zerodiag: zerodiag.c $(LIB).a $(HDR)
 	$(CC) $(CFLAGS) zerodiag.c $(LIB).a -o $@ $(LDLIBS) -lm
 kgbench: kgbench.c $(LIB).a $(HDR)
 	$(CC) $(CFLAGS) $(BENCHFLAGS) kgbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+
+# How much memory does one sort take? Peak traced heap of a single cold call (malloc family interposed, a fresh child
+# process per cell), per shape, 1 thread and P, buffered and in-place, plus what is still held afterwards and what is
+# left after logos_release_buffers(). Includes the shape that tests O(P n): one value holding most of the array.
+# MEMPROBE_LOG=<bytes> ./memprobe 10000000 prints every allocation at least that large with its call site.
+memprobe: memprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) memprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+	./memprobe
+
+# How much dearer does ONE ELEMENT get from 2M to 50M? The scaling exponent p = 1 + ln(c_hi/c_lo) / ln(n_hi/n_lo), measured
+# in PAIRS: one 50M sort against twenty-five 2M sorts of the same shape, adjacent in time, order alternating, so the
+# machine drift that separates two rows of the scale report cancels. std::sort is the calibration (theory: p >= 1.062).
+# ./slopebench 8 50000000 50000000 uniform is the null test: same size both sides, true growth 0.
+slopebench: slopebench.cpp $(LIB).a $(HDR) bench_common.h
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) slopebench.cpp $(LIB).a -o $@ $(LDLIBS)
+	./slopebench
+
+# The strict in-place sort in parallel (placement passes as tasks): what the threads buy against its own 1-thread form, and
+# what zero scratch still costs against the buffered sort at the same thread count. Paired, verified, predictions in the header.
+# ./ipbench 8 50000000 uniform is the large end; ./ipbench 24 1048576 is the parallel threshold.
+ipbench: ipbench.c $(LIB).a $(HDR) bench_common.h
+	$(CC) $(CFLAGS) $(BENCHFLAGS) ipbench.c $(LIB).a -o $@ $(LDLIBS)
+	./ipbench
+
+# What happens when an allocation or a thread creation FAILS in the middle of a sort? malloc, calloc, realloc,
+# posix_memalign and pthread_create are interposed; each run fails the k-th call made from the engine (or every call from
+# the k-th on), in a fresh child process, and checks the output. Exit status 1 on any wrong output, crash or hang.
+# ./faultprobe -c <shape> <threads> one|rest|spawn-one|spawn-rest <k> prints the failing call sites (addr2line -f -e faultprobe).
+faultprobe: faultprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) -g faultprobe.c $(LIB).a -o $@ $(LDLIBS) -ldl
+	./faultprobe
+
+# The whole harness under sanitizers, correctness only (LOGOS_SKIP_BENCH=1). float-cast-overflow is NOT part of
+# -fsanitize=undefined in GCC, and it is the one that found the NaN-to-index casts behind the infinity and subnormal
+# defects. With a NaN in the data three such casts remain in the flash and coarse leaves, clamped and memory-safe; they
+# are reported, not fatal. Leak checking is ON (the pools are reachable from statics, so only a real leak is reported).
+# ThreadSanitizer needs address-space randomisation off on recent kernels (setarch -R); under it the harness keeps the
+# thread-creation half of its fault section, forwarding to TSan's own interceptor, so the orphan paths run under the race detector.
+SAN_SRC := $(SRC) $(SRC2) logos_view.c harness.c
+sanitize: $(SAN_SRC) $(HDR)
+	$(CC) -O1 -g -std=gnu11 -pthread -fsanitize=address,undefined,float-cast-overflow -fno-omit-frame-pointer $(SAN_SRC) -o harness-asan $(LDLIBS)
+	LOGOS_SKIP_BENCH=1 ASAN_OPTIONS=detect_leaks=1 ./harness-asan 2>harness-asan.log | tail -3; echo "sanitizer reports: $$(grep -c 'runtime error\|ERROR: AddressSanitizer\|ERROR: LeakSanitizer' harness-asan.log) (see harness-asan.log)"
+tsan: $(SAN_SRC) $(HDR)
+	$(CC) -O1 -g -std=gnu11 -pthread -fsanitize=thread $(SAN_SRC) -o harness-tsan $(LDLIBS)
+	LOGOS_SKIP_BENCH=1 TSAN_OPTIONS=halt_on_error=0 setarch $$(uname -m) -R ./harness-tsan 2>harness-tsan.log | tail -3; echo "data races: $$(grep -c 'WARNING: ThreadSanitizer' harness-tsan.log) (see harness-tsan.log)"
+
+# The knot route: runs as strands, value-range overlaps as crossings, merges only where strands cross.
+# Paired A/B in one binary (LOGOS_NO_KNOT = J5 as shipped). `./knotbench 20 8388608 lift` lifts the cost gate
+# (LOGOS_KNOT_MAX=8) to find the break-even.
+knotbench: knotbench.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) knotbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+# The same bench over a -DLOGOS_TRACE engine: `./knottrace 5 8388608 once` prints which route took each shape.
+# A trace build answers WHETHER a path runs, never how fast: do not read times off it.
+knottrace: knotbench.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE knotbench.c $(SRC) -o $@ $(LDLIBS) -lm
+
+# The short-reach route (sort index blocks where they lie, repair only the seams): paired A/B in one binary, switched
+# at runtime by LOGOS_NO_REACH. `./reachbench 40 8388608 - latency` reruns the rows whose name contains `latency`.
+reachbench: reachbench.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) reachbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+# The same bench over a -DLOGOS_TRACE engine: `./reachtrace 5 8388608 once` prints what the gate decided for each shape.
+reachtrace: reachbench.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE reachbench.c $(SRC) -o $@ $(LDLIBS) -lm
+
+# The proposed Moebius DLL sort (experiments/moebius_dll/): the JavaScript translated to C as written, and its own pure-C form (twist
+# and merge by relinking), paired against the engine at one thread. `./dllbench [pairs] [n]`; the JS side: node --expose-gc
+# experiments/moebius_dll/bench.js. Predictions and stop rule in both headers.
+dllbench: dllbench.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) dllbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+
+# Two probes from experiments/TWIST_AND_KNOT.md: `./strandprobe 30 8388608 strays` = sorted blocks with late records against a sort TOLD
+# which positions are strays (the ceiling for lifting strays out inside the run detector); `./strandprobe 0 8388608 writhe` = writhe and
+# persistence from 2,048 strided points, scored against a rule fixed in advance.
+strandprobe: strandprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) strandprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+
+# Where else could the twist go? A probe, not a route: every cheap route's shape against its own MIRROR image (one orientation
+# bit for the whole array), and descending teeth that reach the LEAF's run detector. Predictions and stop rule in its header.
+# Reidemeister moves on the Moebius loop (Kauffman & Lambropoulou, Hard Unknots and Collapsing Tangles): `./unknotprobe [pairs] [n] ring`
+# = a shape rotated as a ring buffer against itself through the engine (R0 on the sphere); `... moves` = a literal circular doubly
+# linked list cut into strands, R1/R2/R3 as local rewrites, against the engine at one thread; `... count` = what the moves did.
+# Server timestamps with slight knots (network jitter, retransmits, clock skew, batches, ring buffers, newest-first logs, sensor
+# telemetry, ms clocks, late batches): logos against std::sort and against the boundary-bypass 'Moebius hybrid' an outside write-up
+# described, plus logos with every order-reading route off. `./tsbench 20 8388608 anatomy` = what the hybrid's boundary check skips.
+# "Treat uniform data as a complete computation": P chunks sorted by the AVX2 leaf and merged (every merge split by
+# merge path) against the shipped partition. ./unibench [pairs] [n] [all | anat] [row filter]
+# A thread ceiling for the counting routes (their serial merge grows with P), paired against the engine as it ships.
+# ./capbench [pairs] [ceiling] [row filter]
+# Where the parallel speedup stops and why: a thread ladder with the Karp-Flatt serial fraction per route.
+# ./amprobe [reps] [n] [ladder]
+amprobe: amprobe.c $(LIB).a $(HDR) bench_common.h
+	$(CC) $(CFLAGS) $(BENCHFLAGS) amprobe.c $(LIB).a -o $@ $(LDLIBS)
+capbench: capbench.c $(LIB).a $(HDR) bench_common.h
+	$(CC) $(CFLAGS) $(BENCHFLAGS) capbench.c $(LIB).a -o $@ $(LDLIBS)
+unibench: unibench.cpp $(LIB).a $(HDR) bench_common.h
+	$(CXX) -O3 -std=gnu++17 -pthread -march=native -DHAVE_XSS -I $(XSS) $(BENCHFLAGS) unibench.cpp $(LIB).a -o $@ $(LDLIBS)
+tsbench: tsbench.cpp $(LIB).a $(HDR) bench_common.h
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) tsbench.cpp $(LIB).a -o $@ $(LDLIBS)
+tstrace: tsbench.cpp $(SRC) $(SRC2) logos_view.c $(HDR) bench_common.h
+	$(CC) $(CFLAGS) -DLOGOS_TRACE -c $(SRC) -o tstrace_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o tstrace_extra.o && $(CC) $(CFLAGS) -c logos_view.c -o tstrace_view.o
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) tsbench.cpp tstrace_psort.o tstrace_extra.o tstrace_view.o -o $@ $(LDLIBS)
+
+unknotprobe: unknotprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) unknotprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+unknottrace: unknotprobe.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE unknotprobe.c $(SRC) -o $@ $(LDLIBS) -lm
+
+mirrorprobe: mirrorprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) mirrorprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+mirrortrace: mirrorprobe.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE mirrorprobe.c $(SRC) -o $@ $(LDLIBS) -lm
+
+# The Moebius twist: run descriptors that carry their orientation, so a descending run is never reversed in memory.
+# `./twistbench [pairs] [n] ceiling` prices the reversal passes (an array with descending blocks against the same array
+# with them already ascending), which is the most the twist could save; `... ab` is the engine against itself under
+# LOGOS_NO_TWIST=1; `... merge` is the first two-ended merge (one strided loop, LOGOS_TWIST_GENERIC=1) against one loop per
+# orientation pair. One binary and one engine copy, so no layout term. Predictions, stop rule and ship rule are in its header.
+twistbench: twistbench.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) twistbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+
+# A sine wave with a slope (a seasonal metric with drift): the three invariants of the index -> value curve (monotone
+# pieces, how many cover a value, reach inside a piece), and whether that structure COSTS anything. Every shape is
+# paired against a uniform reference of the same size, adjacently, order alternated: the column is t_shape/t_uniform.
+# Two controls decide whether a row means anything: a null (uniform against uniform) and linear + the same noise and
+# no wave. `./sineprobe [pairs] [n]`. Its first cut compared absolute times across rows and had to be rewritten.
+sineprobe: sineprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) sineprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+	./sineprobe
+# Which route each of those shapes takes, from a -DLOGOS_TRACE engine. Routes only: never read a time from it.
+sinetrace: sineprobe.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE sineprobe.c $(SRC) -o $@ $(LDLIBS) -lm
+
+# What ONE CALL costs at the small end (n = 0 to 50000, random and sorted): a baseline engine against the working tree, in two
+# binaries with the copies swapped, layout bias cancelled. Every other A/B here starts at a million and cannot see a cost per call.
+# The baseline is the committed engine, or any source: make callbench CB_BASE=/path/to/old_logos_psort.c. Run it after touching
+# the first page of the dispatcher or of the leaf; read its header for what a row under ~15% does and does not mean.
+CB_BASE ?=
+# Where the lattice route's wall goes, phase by phase (open direction 1). lattrace reads the trace boundaries;
+# the four PROF phases (map / merge / emit / teardown) are what `make profile` now splits it into.
+lattrace: lattrace.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE lattrace.c $(SRC) -o $@ $(LDLIBS) -lm
+
+# How much of a short parallel phase is thread creation and joining: the emit phase measured 3.17 of 14 busy
+# with equal work per thread, and 35% of it is create+join of 13 workers.
+spawnprobe: spawnprobe.c
+	$(CC) $(CFLAGS) spawnprobe.c -o $@ $(LDLIBS) -lm
+
+# The sphere-projection proposal, priced per element and then checked for ORDER (it inverts 22.2% of pairs).
+sphereprobe: sphereprobe.c
+	$(CC) $(CFLAGS) -march=native sphereprobe.c -o $@ -lm
+invprobe: invprobe.c
+	$(CC) $(CFLAGS) invprobe.c -o $@ -lm
+
+# Does knowing the data FORMAT (dates) beat certifying the distribution? dateprobe prices six numeric date
+# shapes against a sort TOLD the origin and step (it loses on all six); datestrprobe prices date TEXT, where
+# the format collapses a 24-byte comparison to an 8-byte key (8.5x). datetrace names the route each one takes.
+dateprobe: dateprobe.cpp $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) dateprobe.cpp $(LIB).a -o $@ $(LDLIBS) -lm
+datestrprobe: datestrprobe.cpp $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) datestrprobe.cpp $(LIB).a -o $@ $(LDLIBS) -lm
+datetrace: dateprobe.cpp $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -w -DLOGOS_TRACE -c $(SRC) -o dt_trace.o
+	$(CC) $(CFLAGS) -w -c logos_extra.c -o dt_extra.o
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) dateprobe.cpp dt_trace.o dt_extra.o -o $@ $(LDLIBS) -lm
+
+callbench: callbench.c $(SRC) $(HDR)
+	@if [ -n "$(CB_BASE)" ]; then cp "$(CB_BASE)" callbench_base.gen.c; else git show HEAD:engines/c/$(SRC) > callbench_base.gen.c; fi
+	$(CC) $(CFLAGS) -w $(call RENAME,cb0) -I. -c callbench_base.gen.c -o cb_base0.o
+	$(CC) $(CFLAGS) -w $(call RENAME,cb1) -I. -c callbench_base.gen.c -o cb_base1.o
+	$(CC) $(CFLAGS) $(call RENAME,cb0) -I. -c $(SRC) -o cb_work0.o
+	$(CC) $(CFLAGS) $(call RENAME,cb1) -I. -c $(SRC) -o cb_work1.o
+	$(CC) $(CFLAGS) callbench.c cb_base0.o cb_work1.o -o callbench_a $(LDLIBS)
+	$(CC) $(CFLAGS) callbench.c cb_work0.o cb_base1.o -o callbench_b $(LDLIBS)
+	./callbench_a 1 > callbench_a.txt
+	./callbench_b 0 callbench_a.txt
+
+# The near-sorted route's two gates, repaired 2026-09-20 (7 sampled pairs instead of ~1900; a pre-gate without the route's
+# poison recovery): paired A/B in one binary, LOGOS_NS_GATE_OLD=1 restores the gates as they were.
+nsgatebench: nsgatebench.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) nsgatebench.c $(LIB).a -o $@ $(LDLIBS) -lm
 
 # Integrity check for zroute: the classifier as coded must reproduce the six shapes it was fitted to.
 ztrain: ztrain.cpp zroute.cpp chaoshunt.cpp cp.o $(LIB).a $(HDR)
@@ -355,9 +542,16 @@ profile-full: profbench.cpp logos_psort_prof.o $(OBJ2) $(HDR)
 	@if command -v node >/dev/null 2>&1; then node ../../tools/check_report.js profile-report.html | tail -1; fi
 	@if [ -d $(REPORTS) ]; then cp profile-report.html $(REPORTS)/profile-report.html && echo "copied to $(REPORTS)/profile-report.html"; fi
 
-# Time against n for every contender, every shape, 1T and P: scale-report.html (log-log line
-# charts). make scalebench = std::sort / gnu_par / logos; make scale-full adds x86-simd-sort and
-# IPS4o. Overrides: LOGOS_MAX_N (default 3e7), LOGOS_THREADS, LOGOS_MAX_SEC (default 20).
+# Time against n for every contender, every shape, 1T and P: scale-report.html. Sizes 0, 1, 3, 5, 10,
+# then half-decades from 32 to LOGOS_MAX_N; below 10k a size is timed as a batch of distinct inputs.
+# Per panel two charts: time per sort (linear, log-log toggle) and ns per element, whose value axis is
+# ALWAYS linear. make scalebench = std::sort / gnu_par / logos; make scale-full adds x86-simd-sort and
+# IPS4o. Overrides: LOGOS_MAX_N (default 3e7), LOGOS_MIN_N (10000 = the old ladder), LOGOS_THREADS,
+# LOGOS_MAX_SEC (default 20). LOGOS_SCALE_REUSE=<report.html> ./scalebench re-renders that report's
+# measurements through the current template and measures nothing. The node and browser checks below
+# are skipped where neither is installed (WSL here): run them from Windows, tools/check_report.js and
+# tools/browser_check.py, on the written report. The charts zoom and pan (the template's IX block); both
+# checkers DRIVE them, the second in a real browser, which is where two uPlot log-axis defects showed.
 scalebench: scalebench.cpp $(LIB).a $(HDR) uplot_embed.h
 	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp $(BENCHFLAGS) scalebench.cpp $(LIB).a -o $@ $(LDLIBS)
 	./scalebench
@@ -413,4 +607,4 @@ dist: clean
 	rm -rf logos-sort-c-$(VERSION)
 
 clean:
-	rm -f $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o intbench i32abbench scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o logos-sort-c-*.tar.gz prefixbench streamsbench streamsprobe cardgate zerodiag kgbench
+	rm -f reachhunt reachbench reachtrace nsgatebench sineprobe sinetrace twistbench mirrorprobe strandprobe dllbench mirrortrace callbench_a callbench_b callbench_a.txt callbench_base.gen.c $(OBJ) $(OBJ2) $(LIB).a $(LIB).so harness example-bin parbench pfbench j5bench stbench st0.o st1.o leafbench lb0.o lb1.o lb2.o lb3.o theorybench th0.o th1.o th2.o th3.o th4.o th5.o intbench i32abbench scalebench scale-report.html noiseprobe profbench logos_psort_prof.o profile-report.html scaling scaling-report.html pf0.o pf16.o pf32.o pf64.o pf128.o rl0.o rl1.o logos-sort-c-*.tar.gz prefixbench streamsbench streamsprobe cardgate zerodiag kgbench knotbench knottrace memprobe faultprobe slopebench ipbench harness-asan harness-tsan harness-asan.log harness-tsan.log

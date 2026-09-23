@@ -21,6 +21,21 @@ Legend: ✅ present & tested · 🟡 partial · ❌ absent
 | **parallel (multi-threaded)** | ❌ | ✅ | ✅ |
 | write-combining / prefetch / pooling | ❌ | ✅ | ❌ |
 | near-sorted index-partition parallel merge | ❌ | ✅ | ❌ |
+| disjoint-run relocation (J5) and the knot route (copy what lies alone, merge only where runs cross) | ❌ | ✅ (f64) | ❌ |
+| descending runs consumed as they lie, never reversed (the Moebius twist: orientation bit, backward copy, two-ended merge) | ❌ | ✅ (f64) | ❌ |
+| a whole array handed over back to front (mirrored short reach, prefix + tail, streams): one reversal, then the cheap route | ❌ | ✅ (f64) | ❌ |
+| a ring buffer read from the wrong slot (an ascending suffix that continues into the prefix across the wrap): one rotation | ❌ | ✅ (f64) | ❌ |
+| a noisy ring buffer (one drop in the short-reach route's block medians): one rotation, then that route | ❌ | ✅ (f64, sequential) | ❌ |
+| strays inside strands lifted by the run detector, merged back in place of the copy-back | ❌ | ✅ (f64, sequential) | ❌ |
+| one strand (a single run after kinks and strays are taken out) finished without a plan | ❌ | ✅ (f64) | ❌ |
+| the whole-array prescan in blocks of sixteen | ❌ | ✅ (f64) | ❌ |
+| ties continue a descending run (run detector; nothing is stable) | ❌ | ✅ (f64 relocation detector; not the leaf's) | ❌ |
+| the prescan's blocks compared with vectors (AVX2, SSE2; the scalar OR elsewhere) | ❌ | ✅ (f64) | ❌ |
+| the run detector resumes at a wrong-way step (blocks of eight) | ❌ | ✅ (f64 relocation detector) | ❌ |
+| the run detector's block of eight compared with vectors (SSE2, AVX2) | ❌ | ✅ (f64 relocation detector) | ❌ |
+| a wave with drift: pieces from the position-ordered sample, sorted where they lie, placed by the knot sweep | ❌ | ✅ (f64, sequential) | ❌ |
+| short-reach route (index blocks sorted where they lie, seams repaired in place, strays shifted back; no n-sized buffer) | ❌ | ✅ (f64) | ❌ |
+| the nearly-sorted probe tells dense short disorder from near-sortedness before an insertion sort is tried | ✅ from 4096 elements up; the small case also got the budget it never had (45,000 elements with 1% swaps: 47 ms → 2.3), guarded in `test/perf-guard.js` | ✅ | n/a (no such branch) |
 | **strict in-place mode (~1n)** | ✅ (`sortInplace`) | ✅ | ✅ |
 | **argSort (stable indirect sort)** | ✅ | ✅ | ✅ |
 | apply / inverse permutation | ✅ | ✅ | ✅ |
@@ -28,6 +43,11 @@ Legend: ✅ present & tested · 🟡 partial · ❌ absent
 | **string sort** | ✅ full (multikey + LCP + packed + run-merge) | 🟡 multikey QS only | 🟡 multikey QS only |
 | sortWithProxy (expensive comparator) | ✅ | ❌ | ❌ |
 | WebAssembly build | ✅ (native JS) | ✅ (emscripten recipe) | ❌ |
+| infinities and subnormals as ordinary values, tested (both broke the C engine until 2026-09-20: a value-linear map whose scale is `classes / range`, a design all three engines share) | 🟡 correct on all 126 edge runs; two quadratic cliffs in flash sort found and fixed (300k subnormals 77 s, a dense cluster 13–21 s), guarded in `test/perf-guard.js` | ✅ 522 checks | ✅ `tests/edge_values.rs`, 252 sorts |
+| NaN: a tested floor (no crash, output a permutation of the input's bit patterns) and an entry with a defined order (`logos_sort_f64_nan_last`) | 🟡 one NaN between two clusters hung `sort()` forever (the gap-split partition); fixed and guarded in `test/perf-guard.js`. Order otherwise unspecified | ✅ | ❌ order unspecified, untested |
+| a failed allocation or thread creation costs speed, never correctness (`make faultprobe`) | n/a (no threads; an allocation failure throws) | ✅ 7,008 injected failures, 0 bad | ❓ untested |
+| measured memory per element (`make memprobe`) | ❌ | ✅ | ❌ |
+| strict in-place sort runs in parallel | ❌ | ✅ (2.5–2.85× at 14 threads on random data) | ❌ |
 
 ## Reading this
 

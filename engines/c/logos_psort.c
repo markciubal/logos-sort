@@ -38,6 +38,27 @@
 #include <math.h>
 #include <stdatomic.h>
 #include <time.h>
+#if defined(__x86_64__) && defined(__SSE2__) && !defined(LOGOS_NO_SIMD_SCAN)   /* -DLOGOS_NO_SIMD_SCAN: the scalar OR of sixteen, as on other targets */
+/* Here, before the AVX2 region below includes immintrin.h: a header first included inside a target pragma defines its intrinsics
+   for that target, and a baseline function calling them fails to compile (see prescan_blocks). */
+#include <emmintrin.h>
+#define LOGOS_HAVE_SSE2 1
+#endif
+/* What this CPU runs, cached once: 2 = AVX2 with FMA (as the AVX2 leaf asks), 1 = SSE2 (baseline x86-64), 0 = neither. Read by the
+   prescan's blocks and by the run detector's, which sits far earlier in the file. */
+static int g_simd_kind = -1;
+static inline int logos_simd_kind(void) {
+    int c = g_simd_kind;
+    if (c < 0) {
+#ifdef LOGOS_HAVE_SSE2
+        c = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") ? 2 : 1;
+#else
+        c = 0;
+#endif
+        g_simd_kind = c;
+    }
+    return c;
+}
 
 /* ---- optional phase trace (-DLOGOS_TRACE): stderr timestamps per phase ---- */
 #ifdef LOGOS_TRACE
@@ -54,12 +75,13 @@ static double trace_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC
 
 /* ---- optional per-phase profiling (-DLOGOS_PROFILE); see logos_psort.h ---- */
 const char *const logos_profile_phase_names[LOGOS_PH_N] = { "prescan", "lowcard probe", "modcard probe", "near-sorted", "relocate", "sample",
-                                                            "histogram", "combine", "scatter", "leaf sorts", "copyback", "other", "relocate probe" };
+                                                            "histogram", "combine", "scatter", "leaf sorts", "copyback", "other", "relocate probe",
+                                                            "lattice map", "lattice merge", "lattice emit", "lattice teardown" };
 const char *const logos_profile_path_names[LOGOS_PATH_N] = { "none", "already sorted", "counting", "int32 radix", "insertion", "run merge",
                                                              "run relocate", "momentum", "gap split", "flash", "bits coarse", "coarse",
                                                              "quicksort", "quant radix", "simd leaf" };
 const char *const logos_profile_route_names[LOGOS_ROUTE_N] = { "none", "already sorted", "lowcard counting", "lattice counting", "modcard counting",
-                                                               "sequential leaf", "near-sorted merge", "run relocation", "sample-sort partition" };
+                                                               "sequential leaf", "near-sorted merge", "run relocation", "sample-sort partition", "short-reach blocks" };
 #ifdef LOGOS_PROFILE
 #include <time.h>
 static logos_profile_t g_prof;
@@ -182,6 +204,20 @@ static inline size_t weyl_pos(size_t i, size_t n) { double f = (double)i * 0.618
 #define SAMPLE_POS(i, m, n) weyl_pos((i), (n))
 #endif
 #define MIN_PARALLEL             (1u<<16)
+/* round six's routes and what they stand on: the wave sorts pieces and places them with relocation's planner and the knot sweep;
+   the seam is found in the reach route's fences (and in the position-ordered sample, which the wave block also reads) */
+#if defined(LOGOS_NO_RELOCATE) && !defined(LOGOS_NO_WAVE)
+#define LOGOS_NO_WAVE
+#endif
+#if (defined(LOGOS_NO_REACH) || defined(LOGOS_NO_SODO)) && !defined(LOGOS_NO_SEAM)
+#define LOGOS_NO_SEAM
+#endif
+#if defined(LOGOS_NO_SODO) && !defined(LOGOS_NO_WAVE)
+#define LOGOS_NO_WAVE
+#endif
+static __attribute__((unused)) int g_reach_relax = 0;   /* the wave route's pieces: the short-reach route below its usual size and block count */
+static __attribute__((unused)) int g_seamed = 0;        /* the seam route's re-entry guard */
+static __attribute__((unused)) size_t g_seam_count = 0, g_reach_seam = 0;   /* g_reach_seam: a rotation the reach route found in its fences, for the dispatcher to make */
 /* Thread-count policy (make scale-full, 2026-09-10): the parallel route has a fixed cost of several
  * ms (thread creation, barriers, P*12 tiny buckets), so on this box 20 threads were SLOWER than one
  * from 1e5 to ~5e5 elements. Use at most one thread per MIN_ELEMS_PER_THREAD elements; results never
@@ -218,25 +254,30 @@ typedef struct {
 } ctx_t;
 
 #define WC_MIN_THREADS 8   /* measured: staging loses ~8-35% sequentially, wins ~5-12% at 20 threads */
-static int ctx_alloc(ctx_t *c, size_t cap, int wc_on) {
-    memset(c, 0, sizeof *c); c->cap = cap; c->wc_on = wc_on;
-    c->aux = malloc((cap + 1) * sizeof(uint32_t));
-    c->idx = malloc((cap ? cap : 1) * sizeof(uint16_t));
-    if (!c->aux || !c->idx) return 0;
-    c->wc = malloc((size_t)COARSE_K * 8 * sizeof(double)); c->wcn = calloc(COARSE_K, 1);
-    if (!c->wc || !c->wcn) return 0;
-    for (int d = 0; d < COARSE_MAXD; d++) {
-        c->land[d] = malloc(COARSE_K); if (!c->land[d]) return 0;
-        c->C[d] = malloc((COARSE_K + 1) * sizeof(size_t));
-        c->S[d] = malloc((COARSE_K + 1) * sizeof(size_t));
-        c->H[d] = malloc((COARSE_K + 1) * sizeof(size_t));
-        if (!c->C[d] || !c->S[d] || !c->H[d]) return 0;
-    }
-    return 1;
-}
 static void ctx_release(ctx_t *c) {
     free(c->aux); free(c->idx); free(c->wc); free(c->wcn);
     for (int d = 0; d < COARSE_MAXD; d++) { free(c->C[d]); free(c->S[d]); free(c->H[d]); free(c->land[d]); }
+}
+/* All or nothing. A context that could not be had is ALL ZEROS when this returns 0: nothing held, nothing to free, and
+ * ctx_fit refuses it, so whoever holds it sorts with a routine that needs no context. Before 2026-09-20 a failure left
+ * the parts that had been allocated in place (leaked when the context was a pooled bundle) and, worse, left a context
+ * that looked usable: see ctx_fit. Found by failing every allocation in turn, `make faultprobe`. */
+static int ctx_alloc(ctx_t *c, size_t cap, int wc_on) {
+    memset(c, 0, sizeof *c); c->cap = cap; c->wc_on = wc_on;
+    int ok = 1;
+    c->aux = malloc((cap + 1) * sizeof(uint32_t));
+    c->idx = malloc((cap ? cap : 1) * sizeof(uint16_t));
+    c->wc = malloc((size_t)COARSE_K * 8 * sizeof(double)); c->wcn = calloc(COARSE_K, 1);
+    if (!c->aux || !c->idx || !c->wc || !c->wcn) ok = 0;
+    for (int d = 0; ok && d < COARSE_MAXD; d++) {
+        c->land[d] = malloc(COARSE_K);
+        c->C[d] = malloc((COARSE_K + 1) * sizeof(size_t));
+        c->S[d] = malloc((COARSE_K + 1) * sizeof(size_t));
+        c->H[d] = malloc((COARSE_K + 1) * sizeof(size_t));
+        if (!c->land[d] || !c->C[d] || !c->S[d] || !c->H[d]) ok = 0;
+    }
+    if (!ok) { ctx_release(c); memset(c, 0, sizeof *c); }
+    return ok;
 }
 /* Persistent context bundles (default; -DLOGOS_NO_CTX_POOL allocates per call). A context's buffers are
  * ~6 bytes per element of capacity plus ~340 KB fixed; the partition made P of them fresh on every call
@@ -253,7 +294,7 @@ static int ctx_init(ctx_t *c, size_t cap, int wc_on) {
     if (!g_ctx_pool_used[i] || b->cap < cap) {
         if (g_ctx_pool_used[i]) ctx_release(b);
         size_t want = cap + cap / 4 + 64;
-        if (!ctx_alloc(b, want, wc_on)) { g_ctx_pool_used[i] = 0; return 0; }
+        if (!ctx_alloc(b, want, wc_on)) { g_ctx_pool_used[i] = 0; memset(c, 0, sizeof *c); return 0; }   /* the bundle is empty again and the caller's context is all zeros */
         g_ctx_pool_used[i] = 1;
     }
     size_t bcap = b->cap;
@@ -269,11 +310,158 @@ static void ctx_free(ctx_t *c) { if (!c->pooled) ctx_release(c); }
 static int ctx_init(ctx_t *c, size_t cap, int wc_on) { int r = ctx_alloc(c, cap, wc_on); c->pooled = 0; return r; }
 static void ctx_free(ctx_t *c) { ctx_release(c); }
 #endif
+/* ---- a context that fits the bucket at hand (2026-09-20; measured by make memprobe) -------------------------
+ * Every parallel leaf loop used to size ALL P contexts by the LARGEST bucket. With balanced buckets that is nothing
+ * (P * n/nbk * 7.5 bytes, under a byte per element). With one bucket no splitter can divide, a value that holds most
+ * of the array, it is P * n: 104 bytes per element at 10M and 14 threads on 90% one value, a gigabyte of scratch for
+ * an 80 MB array. That is the O(Pn) an outside review warned about, and nothing here had ever weighed a sort.
+ * But a thread only needs room for the bucket in its hands, and the buckets in hand at one moment are disjoint, so they
+ * sum to at most n. Contexts are therefore sized for a TYPICAL bucket (twice the mean), and a bucket above that BORROWS
+ * room for as long as it is being sorted: the shared jumbo block if it is free (persistent, like the pools, so a
+ * dominant value does not page-fault tens of megabytes on every call), otherwise a private temporary. If neither can be
+ * had, ctx_fit says so and the caller sorts that one bucket with a routine that needs no context.
+ * Only aux and idx scale with the bucket; everything else in a context is fixed size. */
+static pthread_mutex_t g_jumbo_m = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t *g_jumbo_aux = NULL; static uint16_t *g_jumbo_idx = NULL; static size_t g_jumbo_cap = 0;
+typedef struct { uint32_t *aux; uint16_t *idx; size_t cap; int kind; } ctx_fit_t;   /* kind: 0 nothing borrowed, 1 the jumbo, 2 a temporary */
+static inline size_t ctx_typical(size_t maxb, size_t n, int nbk) { size_t t = 2 * (n / (size_t)(nbk > 0 ? nbk : 1)) + 4096; return maxb < t ? maxb : t; }
+static int ctx_fit(ctx_t *c, size_t nb, ctx_fit_t *f) {
+    f->kind = 0;
+    if (!c->aux) return 0;                          /* a context that could not be allocated is all zeros: no tables to lend room to */
+    if (nb <= c->cap) return 1;
+    f->aux = c->aux; f->idx = c->idx; f->cap = c->cap;
+    if (pthread_mutex_trylock(&g_jumbo_m) == 0) {
+        if (g_jumbo_cap < nb) {
+            size_t want = nb + nb / 4 + 64;
+            uint32_t *na = malloc((want + 1) * sizeof(uint32_t)); uint16_t *ni = malloc(want * sizeof(uint16_t));
+            if (na && ni) { free(g_jumbo_aux); free(g_jumbo_idx); g_jumbo_aux = na; g_jumbo_idx = ni; g_jumbo_cap = want; }
+            else { free(na); free(ni); }
+        }
+        if (g_jumbo_cap >= nb) { c->aux = g_jumbo_aux; c->idx = g_jumbo_idx; c->cap = g_jumbo_cap; f->kind = 1; return 1; }
+        pthread_mutex_unlock(&g_jumbo_m);
+    }
+    uint32_t *ta = malloc((nb + 1) * sizeof(uint32_t)); uint16_t *ti = malloc((nb ? nb : 1) * sizeof(uint16_t));
+    if (!ta || !ti) { free(ta); free(ti); return 0; }
+    c->aux = ta; c->idx = ti; c->cap = nb; f->kind = 2;
+    return 1;
+}
+static void ctx_unfit(ctx_t *c, ctx_fit_t *f) {
+    if (f->kind == 0) return;
+    if (f->kind == 2) { free(c->aux); free(c->idx); }
+    c->aux = f->aux; c->idx = f->idx; c->cap = f->cap;
+    if (f->kind == 1) pthread_mutex_unlock(&g_jumbo_m);
+}
+static void cnti_release_all(void);      /* the int32 counting route's table pool; defined with it, far below */
+/* everything the context side keeps between calls; logos_release_buffers calls it */
+static void ctx_release_all(void) {
+#ifndef LOGOS_NO_CTX_POOL
+    for (int i = 0; i < CTX_POOL_MAX; i++) if (g_ctx_pool_used[i]) { ctx_release(&g_ctx_pool[i]); memset(&g_ctx_pool[i], 0, sizeof g_ctx_pool[i]); g_ctx_pool_used[i] = 0; }
+    g_ctx_next = 0;
+#endif
+    pthread_mutex_lock(&g_jumbo_m);
+    free(g_jumbo_aux); free(g_jumbo_idx); g_jumbo_aux = NULL; g_jumbo_idx = NULL; g_jumbo_cap = 0;
+    pthread_mutex_unlock(&g_jumbo_m);
+}
+
 
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 static int cmp_i32(const void *a, const void *b) { int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
+static int g_no_dense_probe = 0;      /* read once per sort on the calling thread (leaf_env), like the knot route's switches */
+static int g_no_fastpre = 0;          /* LOGOS_NO_FASTPRESCAN=1: the dispatcher's prescan runs its scalar line; read from 65,536 up */
 static int log2i(size_t n) { int l = 0; while (n >>= 1) l++; return l; }
 static size_t sample_sort(double *s, size_t m);   /* defined with the samplers; used by the histogram-free leaf's spills above it */
+
+/* ---- SMALLNET BEGIN (generated by gen_small_net.py -- do not edit by hand) ----
+ * Branchless sorting networks for 4 to 16 elements, Batcher odd-even mergesort, straight-line.
+ * NET_CE moves elements (one predicate, two selects) instead of taking a min and a max, so a NaN
+ * leaves its pair alone and the output stays a permutation of the input's bit patterns.
+ * Each network is proved by the 0-1 principle in the generator before it is written here. */
+#define NET_CE(i, j) do { double x_ = a[i], y_ = a[j]; int c_ = (y_ < x_); \
+                          a[i] = c_ ? y_ : x_; a[j] = c_ ? x_ : y_; } while (0)
+/* noinline on purpose: inlined into the dispatcher this would add spill slots to a frame that is
+ * stack-probed on EVERY call, which has cost this project a round before (see CLAUDE.md). */
+__attribute__((noinline)) static void net_sort_small(double *a, long n) {
+    switch (n) {
+    case 4: NET_CE(0,1); NET_CE(2,3); NET_CE(0,2); NET_CE(1,3); NET_CE(1,2);
+            break;
+    case 5: NET_CE(0,1); NET_CE(2,3); NET_CE(0,2); NET_CE(1,3); NET_CE(1,2); NET_CE(0,4); NET_CE(2,4); NET_CE(1,2);
+            NET_CE(3,4);
+            break;
+    case 6: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(0,2); NET_CE(1,3); NET_CE(1,2); NET_CE(0,4); NET_CE(1,5);
+            NET_CE(2,4); NET_CE(3,5); NET_CE(1,2); NET_CE(3,4);
+            break;
+    case 7: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(0,2); NET_CE(1,3); NET_CE(4,6); NET_CE(1,2); NET_CE(5,6);
+            NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(2,4); NET_CE(3,5); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6);
+            break;
+    case 8: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(0,2); NET_CE(1,3); NET_CE(4,6); NET_CE(5,7);
+            NET_CE(1,2); NET_CE(5,6); NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(2,4); NET_CE(3,5);
+            NET_CE(1,2); NET_CE(3,4); NET_CE(5,6);
+            break;
+    case 9: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(0,2); NET_CE(1,3); NET_CE(4,6); NET_CE(5,7);
+            NET_CE(1,2); NET_CE(5,6); NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(2,4); NET_CE(3,5);
+            NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(0,8); NET_CE(4,8); NET_CE(2,4); NET_CE(3,5); NET_CE(6,8);
+            NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(7,8);
+            break;
+    case 10: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(0,2); NET_CE(1,3); NET_CE(4,6);
+            NET_CE(5,7); NET_CE(1,2); NET_CE(5,6); NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(2,4);
+            NET_CE(3,5); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(0,8); NET_CE(1,9); NET_CE(4,8); NET_CE(5,9);
+            NET_CE(2,4); NET_CE(3,5); NET_CE(6,8); NET_CE(7,9); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(7,8);
+            break;
+    case 11: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(0,2); NET_CE(1,3); NET_CE(4,6);
+            NET_CE(5,7); NET_CE(8,10); NET_CE(1,2); NET_CE(5,6); NET_CE(9,10); NET_CE(0,4); NET_CE(1,5); NET_CE(2,6);
+            NET_CE(3,7); NET_CE(2,4); NET_CE(3,5); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(9,10); NET_CE(0,8);
+            NET_CE(1,9); NET_CE(2,10); NET_CE(4,8); NET_CE(5,9); NET_CE(6,10); NET_CE(2,4); NET_CE(3,5); NET_CE(6,8);
+            NET_CE(7,9); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(7,8); NET_CE(9,10);
+            break;
+    case 12: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(10,11); NET_CE(0,2); NET_CE(1,3);
+            NET_CE(4,6); NET_CE(5,7); NET_CE(8,10); NET_CE(9,11); NET_CE(1,2); NET_CE(5,6); NET_CE(9,10); NET_CE(0,4);
+            NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(2,4); NET_CE(3,5); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6);
+            NET_CE(9,10); NET_CE(0,8); NET_CE(1,9); NET_CE(2,10); NET_CE(3,11); NET_CE(4,8); NET_CE(5,9); NET_CE(6,10);
+            NET_CE(7,11); NET_CE(2,4); NET_CE(3,5); NET_CE(6,8); NET_CE(7,9); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6);
+            NET_CE(7,8); NET_CE(9,10);
+            break;
+    case 13: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(10,11); NET_CE(0,2); NET_CE(1,3);
+            NET_CE(4,6); NET_CE(5,7); NET_CE(8,10); NET_CE(9,11); NET_CE(1,2); NET_CE(5,6); NET_CE(9,10); NET_CE(0,4);
+            NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(8,12); NET_CE(2,4); NET_CE(3,5); NET_CE(10,12); NET_CE(1,2);
+            NET_CE(3,4); NET_CE(5,6); NET_CE(9,10); NET_CE(11,12); NET_CE(0,8); NET_CE(1,9); NET_CE(2,10); NET_CE(3,11);
+            NET_CE(4,12); NET_CE(4,8); NET_CE(5,9); NET_CE(6,10); NET_CE(7,11); NET_CE(2,4); NET_CE(3,5); NET_CE(6,8);
+            NET_CE(7,9); NET_CE(10,12); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(7,8); NET_CE(9,10); NET_CE(11,12);
+            break;
+    case 14: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(10,11); NET_CE(12,13); NET_CE(0,2);
+            NET_CE(1,3); NET_CE(4,6); NET_CE(5,7); NET_CE(8,10); NET_CE(9,11); NET_CE(1,2); NET_CE(5,6); NET_CE(9,10);
+            NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(8,12); NET_CE(9,13); NET_CE(2,4); NET_CE(3,5);
+            NET_CE(10,12); NET_CE(11,13); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(9,10); NET_CE(11,12); NET_CE(0,8);
+            NET_CE(1,9); NET_CE(2,10); NET_CE(3,11); NET_CE(4,12); NET_CE(5,13); NET_CE(4,8); NET_CE(5,9); NET_CE(6,10);
+            NET_CE(7,11); NET_CE(2,4); NET_CE(3,5); NET_CE(6,8); NET_CE(7,9); NET_CE(10,12); NET_CE(11,13); NET_CE(1,2);
+            NET_CE(3,4); NET_CE(5,6); NET_CE(7,8); NET_CE(9,10); NET_CE(11,12);
+            break;
+    case 15: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(10,11); NET_CE(12,13); NET_CE(0,2);
+            NET_CE(1,3); NET_CE(4,6); NET_CE(5,7); NET_CE(8,10); NET_CE(9,11); NET_CE(12,14); NET_CE(1,2); NET_CE(5,6);
+            NET_CE(9,10); NET_CE(13,14); NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(3,7); NET_CE(8,12); NET_CE(9,13);
+            NET_CE(10,14); NET_CE(2,4); NET_CE(3,5); NET_CE(10,12); NET_CE(11,13); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6);
+            NET_CE(9,10); NET_CE(11,12); NET_CE(13,14); NET_CE(0,8); NET_CE(1,9); NET_CE(2,10); NET_CE(3,11); NET_CE(4,12);
+            NET_CE(5,13); NET_CE(6,14); NET_CE(4,8); NET_CE(5,9); NET_CE(6,10); NET_CE(7,11); NET_CE(2,4); NET_CE(3,5);
+            NET_CE(6,8); NET_CE(7,9); NET_CE(10,12); NET_CE(11,13); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(7,8);
+            NET_CE(9,10); NET_CE(11,12); NET_CE(13,14);
+            break;
+    case 16: NET_CE(0,1); NET_CE(2,3); NET_CE(4,5); NET_CE(6,7); NET_CE(8,9); NET_CE(10,11); NET_CE(12,13); NET_CE(14,15);
+            NET_CE(0,2); NET_CE(1,3); NET_CE(4,6); NET_CE(5,7); NET_CE(8,10); NET_CE(9,11); NET_CE(12,14); NET_CE(13,15);
+            NET_CE(1,2); NET_CE(5,6); NET_CE(9,10); NET_CE(13,14); NET_CE(0,4); NET_CE(1,5); NET_CE(2,6); NET_CE(3,7);
+            NET_CE(8,12); NET_CE(9,13); NET_CE(10,14); NET_CE(11,15); NET_CE(2,4); NET_CE(3,5); NET_CE(10,12);
+            NET_CE(11,13); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(9,10); NET_CE(11,12); NET_CE(13,14); NET_CE(0,8);
+            NET_CE(1,9); NET_CE(2,10); NET_CE(3,11); NET_CE(4,12); NET_CE(5,13); NET_CE(6,14); NET_CE(7,15); NET_CE(4,8);
+            NET_CE(5,9); NET_CE(6,10); NET_CE(7,11); NET_CE(2,4); NET_CE(3,5); NET_CE(6,8); NET_CE(7,9); NET_CE(10,12);
+            NET_CE(11,13); NET_CE(1,2); NET_CE(3,4); NET_CE(5,6); NET_CE(7,8); NET_CE(9,10); NET_CE(11,12); NET_CE(13,14);
+            break;
+    default: break;   /* the caller checks the range; n outside it is a no-op, not a wrong sort */
+    }
+}
+/* comparators per size: 4:5, 5:9, 6:12, 7:16, 8:19, 9:28, 10:32, 11:38, 12:42, 13:48, 14:53, 15:59, 16:63 */
+/* ---- SMALLNET END ---- */
+static int g_no_smallnet = 0;   /* LOGOS_NO_SMALLNET=1: short ranges go back to insertion sort, for the A/B */
+/* Read once at load, never on the sort path: this switch is live at n = 4, where two getenv calls would be
+ * several times the whole sort (the knot route's first cut cost a sorted triple 6 -> 42 ns exactly that way). */
+__attribute__((constructor)) static void smallnet_env(void) { g_no_smallnet = getenv("LOGOS_NO_SMALLNET") != NULL; }
 
 /* ---- leaf primitives (indices are signed so hi < lo is a legal empty range) */
 static void insertion_sort(double *a, long lo, long hi) {
@@ -367,7 +555,10 @@ static void quicksort(double *a, long lo, long hi, int d) {
             else                   { quicksort(a, gt + 1, hi, d); hi = lt - 1; }
         }
     }
-    insertion_sort(a, lo, hi);
+    /* the base case: a branchless network for 4 to 16 elements, insertion sort otherwise. Insertion sort's
+     * compare here mispredicts about half the time on unstructured data, which is what the leaf sorts. */
+    { long len = hi - lo + 1;
+      if (len >= 4 && len <= 16 && !g_no_smallnet) net_sort_small(a + lo, len); else insertion_sort(a, lo, hi); }
 }
 
 /* ---- integer paths ------------------------------------------------------- */
@@ -894,6 +1085,8 @@ static double av_pivot(const double *a, size_t n) {
     }
 #endif
     if (n < AV_PIV_SMALL) { double x = a[0], y = a[n / 2], z = a[n - 1]; return x < y ? (y < z ? y : (x < z ? z : x)) : (x < z ? x : (y < z ? z : y)); }
+    /* Strided on purpose. Weyl positions were tried here (2026-09-22, the suspicion that 63 strides alias with a 32-cycle wave):
+       1.00 on every row, sine and guards, two runs of 40 pairs. The wave's cost in this quicksort is not its pivot. */
     int k = n < 65536 ? 15 : 63; double s[63];
     for (int i = 0; i < k; i++) s[i] = a[(size_t)((double)(n - 1) * (i + 0.5) / k)];
     for (int i = 1; i < k; i++) { double v = s[i]; int j = i; while (j > 0 && s[j - 1] > v) { s[j] = s[j - 1]; j--; } s[j] = v; }
@@ -1003,6 +1196,12 @@ static void line_repair(double *a, size_t n) {
 #endif
 static double *flash_sort(double *a, size_t n, double mn, double mx, double *buf, ctx_t *c) {
     size_t m = n / FLASH_M_DIV; if (m < 2) m = 2; double scale = (double)(m - 1) / (mx - mn);
+    /* The SCALE must be finite, not only the range. A range narrower than about 1e-305 (any bucket of subnormals) makes
+       classes / range overflow to +inf; then every element computes x * inf = inf and the minimum computes 0 * inf = NaN,
+       and the casts below are undefined. Here that happened to put everything in class 0 and the insertion pass sorted
+       the bucket quadratically (43 ms of leaf time for 300k elements); in coarse_bucket_sort it put the MINIMUM in the
+       LAST bucket and the sort came back wrong. A comparison sort has no scale. Found 2026-09-20 by an IEEE probe. */
+    if (!isfinite(scale)) { quicksort(a, 0, (long)n - 1, 2 * log2i(n)); return a; }
     uint32_t *counts = c->aux;
     memset(counts, 0, (m + 1) * sizeof(uint32_t));
     for (size_t i = 0; i < n; i++) { size_t idx = (size_t)((a[i] - mn) * scale); counts[idx + 1]++; }
@@ -1077,6 +1276,10 @@ static double *coarse_bucket_sort(double *src, double *dst, long lo, long hi, in
     size_t k = (size_t)len < COARSE_K ? ((size_t)(len >> 1) > 2 ? (size_t)(len >> 1) : 2) : COARSE_K;
     size_t *C = c->C[depth], *S = c->S[depth], *H = c->H[depth];
     double scale = (double)(k - 1) / (mx - mn);
+    /* a subnormal-wide range: the scale overflows, the minimum computes 0 * inf = NaN, its cast is garbage and the clamp
+       below sent it to the LAST bucket. NaN-free data with subnormals came back UNSORTED from every parallel sort of 300k
+       elements or more, on the committed engine too (see flash_sort). */
+    if (!isfinite(scale)) { quicksort(src, lo, hi, 2 * log2i((size_t)len)); return src; }
     uint16_t *idx = c->idx; double *a = src, *buf = dst;
     memset(C, 0, k * sizeof(size_t));
     for (long i = lo; i <= hi; i++) { size_t b = (size_t)((a[i] - mn) * scale); if (b >= k) b = k - 1; idx[i] = (uint16_t)b; C[b]++; }
@@ -1153,7 +1356,9 @@ static double skew_probe(const double *a, size_t n) {
     double smn = INFINITY, smx = -INFINITY;
     for (int i = 0; i < M; i++) { seed = seed * 1664525u + 1013904223u; double v = a[(size_t)((double)seed / 4294967296.0 * (double)n)]; samp[i] = v; if (v < smn) smn = v; if (v > smx) smx = v; }
     if (!(smx > smn)) return 1;
+    if (!isfinite(smx - smn)) return (double)KC;   /* every finite value falls in one value-linear bin: maximal skew, so bits keying (the cast below was NaN -> long, undefined) */
     double sc = KC / (smx - smn); int Hh[KC]; memset(Hh, 0, sizeof Hh);
+    if (!isfinite(sc)) return (double)KC;          /* a subnormal-wide sample range: the same overflow, the same answer as an infinite one */
     for (int i = 0; i < M; i++) { long b = (long)((samp[i] - smn) * sc); if (b >= KC) b = KC - 1; else if (b < 0) b = 0; Hh[b]++; }
     int mxb = 0; for (int b = 0; b < KC; b++) if (Hh[b] > mxb) mxb = Hh[b];
     return (double)mxb / ((double)M / KC);
@@ -1234,10 +1439,24 @@ static void merge_4way_hybrid(double *a, double *buf, size_t a1, size_t b1, size
     memcpy(a + a1, buf + a1, (b4 - a1 + 1) * sizeof(double));
 }
 
+#define MERGE_STACK_RUNS 64
 static void merge_all_runs(double *a, double *buf, const size_t *runs, size_t n_runs) {
-    size_t capw = 2 * (n_runs + 4);
-    size_t *A = malloc(capw * sizeof(size_t)), *B = malloc(capw * sizeof(size_t));
-    if (!A || !B) { free(A); free(B); return; }
+    /* The two work lists used to be malloc'd, and a failed malloc RETURNED with the runs unmerged: a sort that came back
+       unsorted and said nothing (make faultprobe, 2026-09-20; the run-merge route, relocation and the knot route all come
+       through here). Nearly every caller has a handful of runs (the run-merge route at most MERGE_MAX_RUNS, a crossing a
+       few strands), so the lists live on the stack up to MERGE_STACK_RUNS, and past that a failed allocation folds the
+       runs in left to right, which needs no list at all: slower, never wrong. The merge kernels allocate nothing. */
+    size_t stackA[2 * (MERGE_STACK_RUNS + 4)], stackB[2 * (MERGE_STACK_RUNS + 4)], capw = 2 * (n_runs + 4);
+    size_t *A = stackA, *B = stackB, *heapA = NULL, *heapB = NULL;
+    if (n_runs > MERGE_STACK_RUNS) {
+        heapA = malloc(capw * sizeof(size_t)); heapB = malloc(capw * sizeof(size_t));
+        if (!heapA || !heapB) {
+            free(heapA); free(heapB);
+            for (size_t k = 1; k < n_runs; k++) merge_gallop(a, buf, runs[0], runs[2 * k - 1], runs[2 * k], runs[2 * k + 1]);
+            return;
+        }
+        A = heapA; B = heapB;
+    }
     memcpy(A, runs, 2 * n_runs * sizeof(size_t));
     size_t *cur = A, *next = B, cur_n = n_runs;
     while (cur_n > 1) {
@@ -1262,7 +1481,7 @@ static void merge_all_runs(double *a, double *buf, const size_t *runs, size_t n_
         }
         size_t *t = cur; cur = next; next = t; cur_n = next_n;
     }
-    free(A); free(B);
+    free(heapA); free(heapB);
 }
 
 /* ---- disjoint-run relocation (J5) --------------------------------------- */
@@ -1276,11 +1495,6 @@ static void merge_all_runs(double *a, double *buf, const size_t *runs, size_t n_
  * chains are at most n/2 (interleaved runs, where every range overlaps every
  * other, stay on the galloping run-merge). Build with -DLOGOS_NO_RELOCATE to
  * get the pre-J5 engine for an interleaved A/B (make j5bench). */
-#ifndef LOGOS_NO_RELOCATE
-#define RELOC_MIN_N 4096
-#ifndef RELOC_MIN_PER_THREAD
-#define RELOC_MIN_PER_THREAD 500000
-#endif
 /* The counting routes (lowcard, modcard, lattice) carve static per-thread ranges and merge P tables; at
    1M elements 4 threads beat 10 by 1.5-1.8x and at 3.16M 9 beat 14 by 1.1-1.4x (make smallbench). At most one
    thread per this many elements. */
@@ -1292,8 +1506,78 @@ static void merge_all_runs(double *a, double *buf, const size_t *runs, size_t n_
 #ifndef COUNT_MIN_THREADS
 #define COUNT_MIN_THREADS 3
 #endif
+/* A CEILING FOR THE HASH ROUTE ONLY (2026-09-22, `make capbench`). Both counting routes run two parallel phases with a
+ * serial merge between them, and `make profile` at 8M has 6.0-6.9 of 14 threads busy inside that phase with NONE waiting.
+ * But the two families want opposite things, measured in pairs at 1M-16M: a ceiling of 3, 6 or 8 applied to BOTH costs the
+ * LATTICE shapes 0.53-0.90 at 8M and 16M (its map phase is real parallel work and wants every thread), while the HASH
+ * route stops scaling around 8. So a ceiling was tried on the hash route ALONE (`count_threads_hash`) -- and it did not
+ * clear its own stop rule either: few_distinct read 1.06 0.94 1.01 1.12 1.04 and 1.06 0.97 1.01 1.07 1.06 over 1M-16M in
+ * two runs of 20 pairs, so 1.0 at 4M and about 1.1 at 8M, inside what 20 pairs resolve. It ships OFF. The knob stays as
+ * the A/B switch and as the record of the measurement: LOGOS_COUNT_MAX=<k> caps the hash route per sort, 0 = no ceiling
+ * (the default). What the profile actually asks for is a PARALLEL merge, not fewer threads: open direction 0a. */
+#ifndef COUNT_MAX_THREADS
+#define COUNT_MAX_THREADS 0
+#endif
+static int g_count_max = COUNT_MAX_THREADS;
 static inline int count_threads(size_t n, int P) { size_t pm = n / COUNT_MIN_PER_THREAD; if (pm < COUNT_MIN_THREADS) pm = COUNT_MIN_THREADS; return (size_t)P > pm ? (int)pm : P; }
-typedef struct { double first, last; size_t start, len; } rdesc_t;
+static inline int count_threads_hash(size_t n, int P) { int r = count_threads(n, P); if (g_count_max > 0 && r > g_count_max) r = g_count_max; return r; }
+/* (outside the relocation #ifndef: the counting routes need this whether or not relocation is compiled in;
+   inside it, -DLOGOS_NO_RELOCATE -- the pre-J5 engine that make j5bench builds -- did not compile) */
+#if defined(LOGOS_NO_RELOCATE) && !defined(LOGOS_NO_KNOT)
+#define LOGOS_NO_KNOT          /* the knot route lives inside the relocation route */
+#endif
+#if defined(LOGOS_NO_SPLITTER_TABLE) && !defined(LOGOS_NO_MODEKS)
+#define LOGOS_NO_MODEKS        /* the per-mode certificate reads the modes the splitter table found. Without this the pre-H0b engine
+                                  that make stbench builds had not compiled since that certificate was added (found 2026-09-20) */
+#endif
+#ifndef LOGOS_NO_RELOCATE
+#define RELOC_MIN_N 4096
+/* The run detector behind relocation and the knot route gives up once it holds 256 runs whose average is under a floor, and
+ * keeps room for n / floor runs. The floor used to be the run MERGE's constant (MIN_AVG_RUN_FOR_MERGE = 4096, swept for the
+ * merge by make knobbench), inherited by two routes that COPY runs. So at one thread every array of disjoint sorted blocks
+ * averaging 256 to 4095 elements was declined and sorted in full: 10.5-12.5 ns per element where blocks of 4096 took 2.0-2.4,
+ * and runs of EXACTLY 4096 passed by nothing, so the same runs rotated by 0.37 n failed by 12 elements and cost 5.8x (found by
+ * unknotprobe's ring buffer rows; the ladder is its `cliff` mode, 8.4M, 20 pairs). One thread: the knot route's own measured
+ * minimum, 256; disjoint blocks 2.6-5.5x, shuffled staircases 1.9-4.2x, runs by coarse key 3.2-5.7x, 4096 and up 0.98-1.02.
+ * P threads: the partition is already near the copy's cost there, and every lower floor was MIXED (256: 0.72-0.96 on small
+ * blocks and staircases, 1.15-1.41 on keyed runs; 1024: 0.91-0.98 against 1.25-1.47), so it stays at 4096. Measured and NOT kept:
+ * forgiving each detection chunk its partial first run, meant for runs of exactly 4096 at P threads (1.12-1.43 when a lower floor
+ * admitted them). It read 0.98-1.01 on every row: at P threads the per-thread run cap (n / floor / P + 2) binds first, since a
+ * chunk of exactly-4096 runs holds 148 of them counting the partial pieces at both ends. LOGOS_RELOC_AVG=<k> sets the floor per
+ * sort (read where relocation starts), for the ladder. */
+#ifndef RELOC_MIN_AVG_RUN_SEQ
+#define RELOC_MIN_AVG_RUN_SEQ 256
+#endif
+#ifndef RELOC_MIN_AVG_RUN_PAR
+#define RELOC_MIN_AVG_RUN_PAR MIN_AVG_RUN_FOR_MERGE
+#endif
+static size_t g_reloc_avg = RELOC_MIN_AVG_RUN_SEQ;   /* set on the calling thread where relocation starts; the detector's threads read it */
+static int g_reloc_nocopy = 0;                       /* LOGOS_RELOC_NOCOPY=1: the placements leave their output in scratch. WRONG OUTPUT BY DESIGN: the
+                                                        ceiling of a route that hands back a sorted DESCRIPTION instead of copying (./unknotprobe ... nocopy) */
+static int g_stray_on = 1;                           /* LOGOS_NO_STRAY=1 clears it */
+static int g_onerun_off = 0;                         /* LOGOS_NO_ONERUN=1 sets it: a single run declines, as before */
+static int g_onerun_copy = 0;                        /* LOGOS_ONERUN_COPY=1: one strand's strays merged back through scratch, as before */
+static size_t g_onerun_count = 0;                    /* logos_twist_last(12): sorts finished as one strand */
+#ifndef RELOC_MIN_PER_THREAD
+#define RELOC_MIN_PER_THREAD 500000
+#endif
+/* THE MOEBIUS TWIST (2026-09-20; ceiling and A/B: make twistbench). A run that lies DESCENDING in memory used to be swapped end
+ * for end the moment the detector had found it: a read and a write of every such element, before anything useful happened to
+ * it. Now the run keeps lying as it lies and its descriptor carries one orientation bit. first/last are its smallest and
+ * largest value whichever way it lies, every consumer reads a twisted strand from its far end (a backward copy where a lone
+ * piece is placed, a cursor walking down where two strands cross, a search in logical coordinates where the knot route cuts),
+ * and the detector no longer writes to the array at all, so a declined probe leaves the input exactly as it was.
+ * In a flat [start,end,...] run list the orientation rides in the top bit of the END index (RUN_TWIST); lists from the
+ * sequential leaf detector and lists in output coordinates never carry it. LOGOS_NO_TWIST=1 / -DLOGOS_NO_TWIST: reverse in
+ * place as before. */
+typedef struct { double first, last; size_t start, len; int rev; } rdesc_t;
+#define RUN_TWIST ((size_t)1 << (sizeof(size_t) * 8 - 1))
+static size_t g_twist_knot, g_twist_reloc;      /* the witness: see logos_twist_last() */
+#define RUN_END(e) ((e) & ~RUN_TWIST)
+#define RUN_REV(e) (((e) & RUN_TWIST) != 0)
+/* o[i] = x[cnt-1-i]: a twisted strand's piece, turned the right way round by the copy that was going to be made anyway */
+static void copy_rev(double *restrict o, const double *restrict x, size_t cnt) { for (size_t i = 0; i < cnt; i++) o[i] = x[cnt - 1 - i]; }
+static inline void strand_copy(double *o, const double *x, size_t cnt, int rev) { if (rev) copy_rev(o, x, cnt); else memcpy(o, x, cnt * sizeof(double)); }
 static int cmp_rdesc(const void *x, const void *y) { double a = ((const rdesc_t *)x)->first, b = ((const rdesc_t *)y)->first; return (a > b) - (a < b); }
 
 /* Sorted descriptors + chains for a flat [start,end,...] run list. chain[k] is
@@ -1302,7 +1586,8 @@ static int cmp_rdesc(const void *x, const void *y) { double a = ((const rdesc_t 
 static int runs_plan(const double *a, const size_t *runs, size_t R, rdesc_t **pd, size_t **pchain, size_t *pnchain, size_t *pmerged) {
     rdesc_t *d = malloc(R * sizeof *d); size_t *ch = malloc((R + 1) * sizeof *ch);
     if (!d || !ch) { free(d); free(ch); return 0; }
-    for (size_t k = 0; k < R; k++) { size_t s = runs[2 * k], e = runs[2 * k + 1]; d[k].first = a[s]; d[k].last = a[e]; d[k].start = s; d[k].len = e - s + 1; }
+    for (size_t k = 0; k < R; k++) { size_t s = runs[2 * k], e = RUN_END(runs[2 * k + 1]); int rv = RUN_REV(runs[2 * k + 1]);
+        d[k].first = rv ? a[e] : a[s]; d[k].last = rv ? a[s] : a[e]; d[k].start = s; d[k].len = e - s + 1; d[k].rev = rv; }
     qsort(d, R, sizeof *d, cmp_rdesc);
     size_t nc = 0, merged = 0, celems = d[0].len, cruns = 1; double cmax = d[0].last; ch[nc++] = 0;
     for (size_t k = 1; k < R; k++) {
@@ -1313,6 +1598,331 @@ static int runs_plan(const double *a, const size_t *runs, size_t R, rdesc_t **pd
     ch[nc] = R; *pd = d; *pchain = ch; *pnchain = nc; *pmerged = merged; return 1;
 }
 
+#ifndef LOGOS_NO_KNOT
+/* ---- the knot route: comparisons only where strands cross (2026-09-19; A/B: make knotbench) -------------
+ * J5 treats a chain of overlapping runs as one unit: it merges ALL of the chain, and it declines the whole
+ * array once more than half of it sits in chains. But two runs that overlap in a tenth of their range are
+ * tangled only in that tenth. Read each run as a STRAND and the run descriptors, sorted by first value, as a
+ * linked list that the sorted output walks along. Where one strand is alone in its value interval the walk is
+ * a memcpy. A CROSSING is a value interval in which two or more strands both hold elements; a knot is a group
+ * of strands joined by crossings (J5's chain). Untying a knot takes comparisons only inside its crossings.
+ *
+ * The plan is a sweep over the 2R strand endpoints in value order (a first value cuts below itself, a last
+ * value above itself). Between two consecutive cuts the set of live strands is constant, and the piece of an
+ * ascending strand between two cuts is contiguous, found by a galloping search from where its previous piece
+ * ended. An interval with one non-empty piece is a copy; one with k >= 2 is a k-way merge of exactly those
+ * pieces. Pieces are counted by the ELEMENTS they hold, so a fused run whose interval hides a hole (the defect
+ * that made J5's first cut never fire, and the reason it gap-splits) reads correctly here: over the hole its
+ * piece is empty and nothing crosses.
+ * Work: O(R log R) plan, O(n) copies, O(crossing mass * log k) comparisons.
+ *
+ * It is NOT the ledger's parallel merge sort: that put every element through a P-way merge, this merges only
+ * what crosses, and the gate bounds that. Gate: cost = sum over crossings of mass * ceil(log2 k) must be at
+ * most KNOT_COST_MAX_* times n (measured, see below); whatever J5's own gate accepts is accepted too, since
+ * there the finer plan can only do less work. Every early gate J5 has (sample, per-thread prefix) asks the
+ * knot question only when J5's own answer would be no, so shapes J5 takes, or declines for short runs, cost
+ * nothing extra. The placement's thread count follows its WORK (n + KNOT_MERGE_WEIGHT * cost), not n.
+ * Parallel placement: tiles of the output are filled by copy; two-strand crossings are merged straight from
+ * a[] into place off an atomic queue (a large one is first cut into grains at values taken from its largest
+ * piece, the same operation as one more sweep boundary); crossings of three or more strands are staged side
+ * by side and merged after the barrier with a[] as scratch.
+ * -DLOGOS_NO_KNOT removes it; LOGOS_NO_KNOT=1 disables it at runtime (J5 exactly as before);
+ * LOGOS_KNOT_MAX=<x> overrides all three cost gates (the bench's ladder uses it to find the break-even). */
+/* The cost gates, as multiples of n, set from measurement (make knotbench at 8.4M; FINDINGS 3ac). The first cut used
+ * J5's n/2 on a written prediction that the route would break even with 60-100% of the array inside crossings at 14
+ * threads. Wrong in kind: with the gate lifted, two strands with EVERY element crossing (cost 1.0n) measured 2.62x at
+ * one thread and 1.52x at 14 against the shipped engine, three live strands (1.57n) 2.44x and 1.12x, and it loses only
+ * from 3-4 live strands (1.96n: 2.48x, 0.82x) through 8 (2.95n: 1.29x, 1.05x) to 64 fully interleaved (6n: 0.79x, 0.77x).
+ * And n/2 was not merely cautious: a decline comes after the whole array has been scanned for runs, so the shapes
+ * just past it paid 4-9% for nothing (0.92-0.96 where 1.00 was predicted).
+ *
+ * But "against the shipped engine" flatters the parallel rows: on a shuffled staircase the shipped relocation scans
+ * the array and THEN declines, and that wasted scan is in the baseline. Against the PURE PARTITION (an engine copy built
+ * with -DLOGOS_NO_RELOCATE, both copy orientations, layout cancelled) the route at 14 threads is a tie on two-strand
+ * crossings (10% crossing 0.96, 20% 0.97, 60% 1.03, 100% 1.11, zigzag 1.01, 14 shards 1.08) and LOSES on three strands
+ * (0.89), while at one thread it wins 1.8-4.1x on every one of them. So the parallel gate stops at two-strand cost:
+ * three strands are then declined by the sample gate in half a millisecond and sort at the partition's speed.
+ *   parallel sorts:                      1.0n
+ *   sequential, more than MERGE_MAX_RUNS: 3.0n  (the fallback is the sequential leaf, 4-5x a merge level)
+ *   sequential, at most MERGE_MAX_RUNS:   1.0n  (the fallback is the run merge, which does the same merges without the
+ *                                               staging copy: 4 interleaved runs measured 0.955 with the gate lifted) */
+#ifndef KNOT_COST_MAX_SEQ
+#define KNOT_COST_MAX_SEQ 3.0
+#endif
+#ifndef KNOT_COST_MAX_FEW
+#define KNOT_COST_MAX_FEW 1.0
+#endif
+#ifndef KNOT_COST_MAX_PAR
+#define KNOT_COST_MAX_PAR 1.0
+#endif
+#ifndef KNOT_GRAIN_MIN
+#define KNOT_GRAIN_MIN 32768
+#endif
+/* The plan is only worth making over LONG strands. The cost gate cannot see that on its own: when runs hold two or
+ * three elements nearly every element is a run endpoint, so almost nothing "crosses", the gate says go, and the sweep
+ * (five allocations, a sort of the 2R endpoints, a galloping search per live strand per cut) ends up sorting the array
+ * the slow way. Found by make scale-full once it grew sizes below 10k: random data at n = 32 is 13 runs, and the first
+ * cut took 2431 ns where the committed engine took 781; block_perm at n = 100, 4969 against 2105. J5's chain gate
+ * never had the problem, since short random runs all overlap. So: an average run of at least this many elements, in
+ * every place the route is asked. At 256 the plan is under a tenth of any fallback (about 30 ns * R * log2 R). */
+#ifndef KNOT_MIN_AVG_RUN
+#define KNOT_MIN_AVG_RUN 256
+#endif
+#ifndef KNOT_MERGE_WEIGHT
+#define KNOT_MERGE_WEIGHT 3       /* a merged element, per level, in units of a copied one (the placement's thread cap) */
+#endif
+static int g_knot_on = 1;
+static int g_knot_gallop = 1;          /* LOGOS_NO_KNOT_GALLOP=1 clears it; read once per sort in knot_env, on the calling thread */
+static double g_knot_frac_seq = KNOT_COST_MAX_SEQ, g_knot_frac_few = KNOT_COST_MAX_FEW, g_knot_frac_par = KNOT_COST_MAX_PAR;
+/* read once per sort on the calling thread (one sort at a time, the buffer pool's contract); leaves read the globals */
+static void knot_env(void) {
+    g_knot_on = !getenv("LOGOS_NO_KNOT");
+    g_knot_gallop = !getenv("LOGOS_NO_KNOT_GALLOP");
+    const char *e = getenv("LOGOS_KNOT_MAX"); double f = e ? atof(e) : 0.0;
+    g_knot_frac_seq = f > 0 ? f : KNOT_COST_MAX_SEQ; g_knot_frac_few = f > 0 ? f : KNOT_COST_MAX_FEW; g_knot_frac_par = f > 0 ? f : KNOT_COST_MAX_PAR;
+}
+typedef struct { size_t src, len; int rev; } kpt_t;                          /* src: the piece's lowest address, whichever way it lies */
+typedef struct { size_t src, len, dst; int copy, rev; } kpiece_t;   /* copy: placed by a copy (alone in its interval, or staged for a k >= 3 merge); rev: twisted */
+typedef struct { size_t p0, k, dst, len; } kseg_t;             /* a crossing: pieces [p0, p0+k) land at dst and must be merged */
+typedef struct { kpiece_t *pc; size_t npc, cap_pc; kseg_t *sg; size_t nsg, cap_sg, n3, crossing, cost, kmax, total; int last_single; } knot_plan_t;
+static void knot_plan_free(knot_plan_t *K) { free(K->pc); free(K->sg); K->pc = NULL; K->sg = NULL; }
+/* Element c, counted in ASCENDING value order, of the strand that occupies a[st, st+ln). A TWISTED strand lies descending in
+ * memory and is read from its far end; KNOT_SRC is the lowest address of its logical range [c0, c1). */
+#define KNOT_AT(a, st, ln, rv, c) ((rv) ? (a)[(st) + (ln) - 1 - (c)] : (a)[(st) + (c)])
+#define KNOT_SRC(st, ln, rv, c0, c1) ((rv) ? (st) + (ln) - (c1) : (st) + (c0))
+/* Where a cut falls inside a strand, in those logical coordinates: the first position in [lo,hi) that is past the cut.
+ * above = 0 cuts BELOW v (elements < v stay before it), above = 1 cuts ABOVE v (elements <= v stay before it).
+ * Galloping from lo: a strand's next cut is either a few elements on or a whole piece away. */
+#define KNOT_BEFORE(x) (above ? (x) <= v : (x) < v)
+static inline size_t knot_cut(const double *a, size_t st, size_t ln, int rv, size_t lo, size_t hi, double v, int above) {
+    if (lo >= hi || !KNOT_BEFORE(KNOT_AT(a, st, ln, rv, lo))) return lo;
+    size_t j = lo, s = 1;
+    while (j + s < hi && KNOT_BEFORE(KNOT_AT(a, st, ln, rv, j + s))) { j += s; s <<= 1; }
+    size_t L = j + 1, R = j + s < hi ? j + s : hi;
+    while (L < R) { size_t m = L + ((R - L) >> 1); if (KNOT_BEFORE(KNOT_AT(a, st, ln, rv, m))) L = m + 1; else R = m; }
+    return L;
+}
+#undef KNOT_BEFORE
+static inline size_t knot_levels(size_t k) { size_t l = 0; while (((size_t)1 << l) < k) l++; return l; }
+static int knot_push_piece(knot_plan_t *K, size_t src, size_t len, size_t dst, int copy, int rev) {
+    if (K->npc == K->cap_pc) { size_t nc = K->cap_pc ? 2 * K->cap_pc : 256; kpiece_t *p = realloc(K->pc, nc * sizeof *p); if (!p) return 0; K->pc = p; K->cap_pc = nc; }
+    kpiece_t q = { src, len, dst, copy, rev }; K->pc[K->npc++] = q; return 1;
+}
+static int knot_push_seg(knot_plan_t *K, size_t p0, size_t k, size_t dst, size_t len) {
+    if (K->nsg == K->cap_sg) { size_t nc = K->cap_sg ? 2 * K->cap_sg : 64; kseg_t *p = realloc(K->sg, nc * sizeof *p); if (!p) return 0; K->sg = p; K->cap_sg = nc; }
+    kseg_t g = { p0, k, dst, len }; K->sg[K->nsg++] = g; return 1;
+}
+/* one value interval, as it will be placed: k non-empty pieces landing at K->total */
+static int knot_emit_one(knot_plan_t *K, const kpt_t *tp, size_t k, size_t seglen) {
+    if (k == 1) {
+        if (K->last_single && K->npc) {                       /* the same strand, still alone: extend its copy */
+            kpiece_t *p = &K->pc[K->npc - 1];
+            /* an untwisted strand's next piece lies after the last one in memory, a twisted strand's BEFORE it */
+            if (p->rev == tp[0].rev && (p->rev ? tp[0].src + tp[0].len == p->src : p->src + p->len == tp[0].src)) {
+                if (p->rev) p->src = tp[0].src;
+                p->len += tp[0].len; K->total += seglen; return 1; }
+        }
+        if (!knot_push_piece(K, tp[0].src, tp[0].len, K->total, 1, tp[0].rev)) return 0;
+        K->last_single = 1; K->total += seglen; return 1;
+    }
+    size_t p0 = K->npc, o = K->total;
+    /* Crossings of three or more are STAGED (copied side by side, then merged in scratch). A direct three- and four-way merge from
+       the source was built and measured on 2026-09-22 (./unknotprobe 40 8388608 ab, rows DIRECT): 0.68 on three live strands and
+       0.52 on four at one thread, two runs. One pass with a longer chain loses to three passes with a short one: every step of
+       the direct merge waits on two dependent compares and the load they choose, where the staged path is two memcpys and
+       branch-free two-way merges. */
+    for (size_t q = 0; q < k; q++) { if (!knot_push_piece(K, tp[q].src, tp[q].len, o, k >= 3, tp[q].rev)) return 0; o += tp[q].len; }
+    if (!knot_push_seg(K, p0, k, K->total, seglen)) return 0;
+    if (k >= 3) K->n3++;
+    K->last_single = 0; K->total += seglen; return 1;
+}
+/* A crossing larger than the grain is cut at values read from its largest piece, every piece at the same values:
+ * the sub-intervals are independent merges (or plain copies, where only one piece has elements). */
+static int knot_emit(knot_plan_t *K, const double *a, const kpt_t *tp, kpt_t *sub, size_t *cq, size_t k, size_t seglen, size_t grain, int emit) {
+    if (k >= 2) { K->crossing += seglen; K->cost += seglen * knot_levels(k); if (k > K->kmax) K->kmax = k; }
+    if (!emit) { K->total += seglen; return 1; }
+    if (k < 2 || seglen <= grain) return knot_emit_one(K, tp, k, seglen);
+    size_t m = (seglen + grain - 1) / grain, big = 0;
+    for (size_t q = 1; q < k; q++) if (tp[q].len > tp[big].len) big = q;
+    for (size_t q = 0; q < k; q++) cq[q] = 0;                /* cursors in each piece's logical coordinates */
+    for (size_t c = 1; c <= m; c++) {
+        size_t ks = 0, sl = 0;
+        double cv = 0; if (c < m) cv = KNOT_AT(a, tp[big].src, tp[big].len, tp[big].rev, (tp[big].len / m) * c + ((tp[big].len % m) * c) / m);
+        for (size_t q = 0; q < k; q++) {
+            size_t e = tp[q].len, c1 = c < m ? knot_cut(a, tp[q].src, tp[q].len, tp[q].rev, cq[q], e, cv, 0) : e;
+            if (c1 > cq[q]) { sub[ks].src = KNOT_SRC(tp[q].src, tp[q].len, tp[q].rev, cq[q], c1); sub[ks].len = c1 - cq[q]; sub[ks].rev = tp[q].rev; ks++; sl += c1 - cq[q]; }
+            cq[q] = c1;
+        }
+        if (ks && !knot_emit_one(K, sub, ks, sl)) return 0;
+    }
+    return 1;
+}
+/* d: run descriptors sorted by first value. emit = 0 measures only (crossing, cost, kmax). Returns 0 when there is no
+ * plan: a NaN endpoint (a NaN is always a run of its own, since every compare with it fails, and has no place in the
+ * order), more live-strand visits than a plan is worth, or no memory. */
+static int knot_plan(const double *a, const rdesc_t *d, size_t R, size_t grain, int emit, knot_plan_t *K) {
+    memset(K, 0, sizeof *K);
+    if (R < 1) return 0;
+    for (size_t i = 0; i < R; i++) if (d[i].first != d[i].first || d[i].last != d[i].last) return 0;
+    double *ls = malloc(R * sizeof(double)); size_t *cur = malloc(R * sizeof(size_t)), *act = malloc(R * sizeof(size_t)), *cq = malloc(R * sizeof(size_t));
+    kpt_t *tp = malloc(2 * R * sizeof *tp);
+    if (!ls || !cur || !act || !cq || !tp) { free(ls); free(cur); free(act); free(cq); free(tp); return 0; }
+    for (size_t i = 0; i < R; i++) { ls[i] = d[i].last; cur[i] = 0; }     /* cur: how much of strand i is consumed, in its logical coordinates */
+    sample_sort(ls, R);
+    size_t is = 0, il = 0, nact = 0, visits = 0, visit_cap = 64 * R + 65536; int ok = 1;
+    /* The sweep line visits 2R cuts in value order. A strand's FIRST value cuts below itself and its LAST value cuts
+     * above itself, so a strand's elements lie exactly between its own two cuts; at equal values the first-cut goes
+     * first, and what lies between the two is the elements equal to that value. (Cutting every endpoint below its
+     * value, the first cut of this code, put each strand's last element at the head of the NEXT interval, where it
+     * turned the whole middle of the neighbouring strand into a two-strand crossing: 98.5% crossing mass measured on
+     * a staircase built with 10%.) Firsts arrive sorted in d[], lasts in ls[]: a two-pointer merge yields the cuts. */
+    while (il < R) {
+        int above = !(is < R && d[is].first <= ls[il]); double v = above ? ls[il] : d[is].first;
+        size_t k = 0, seglen = 0;                             /* the interval that ENDS at this cut */
+        for (size_t q = 0; q < nact; q++) {
+            size_t r = act[q], c0 = cur[r], c1 = knot_cut(a, d[r].start, d[r].len, d[r].rev, c0, d[r].len, v, above);
+            cur[r] = c1;
+            if (c1 > c0) { tp[k].src = KNOT_SRC(d[r].start, d[r].len, d[r].rev, c0, c1); tp[k].len = c1 - c0; tp[k].rev = d[r].rev; k++; seglen += c1 - c0; }
+        }
+        visits += nact; if (visits > visit_cap) { ok = 0; break; }
+        if (k && !knot_emit(K, a, tp, tp + R, cq, k, seglen, grain, emit)) { ok = 0; break; }
+        if (!above) act[nact++] = is++;                       /* the strand whose first value this is goes live */
+        else {                                                /* strands ending here are fully consumed: drop them */
+            size_t w = 0; for (size_t q = 0; q < nact; q++) if (d[act[q]].last > v) act[w++] = act[q];
+            nact = w; il++;
+        }
+    }
+    free(ls); free(cur); free(act); free(cq); free(tp);
+    if (!ok) { knot_plan_free(K); return 0; }
+    return 1;
+}
+/* both pieces span the same value interval, so they interleave: a branch-free merge, no galloping (what a gallop would
+ * have skipped, the sweep already cut away as copies) */
+static void knot_merge2(const double *x, size_t nx, const double *y, size_t ny, double *o) {
+    size_t i = 0, j = 0;
+    while (i < nx && j < ny) { double xv = x[i], yv = y[j]; int ty = yv < xv; *o++ = ty ? yv : xv; j += (size_t)ty; i += (size_t)!ty; }
+    if (i < nx) memcpy(o, x + i, (nx - i) * sizeof(double));
+    else if (j < ny) memcpy(o, y + j, (ny - j) * sizeof(double));
+}
+/* The same merge with either strand TWISTED: its cursor walks down instead of up. An up-run and the down-run after it are a
+ * bitonic pair, and this is that pair's two-ended merge; the reversal a bitonic merge is usually preceded by never happens. */
+/* One loop per orientation pair, so that a twisted cursor costs what an untwisted one does: two updates per element, and the
+ * far-end address folded into the base. The first cut was ONE loop with a signed stride per strand (four updates per element);
+ * it is kept behind LOGOS_TWIST_GENERIC=1 because it is what the specialised loops were measured against (make twistbench,
+ * mode `merge`). */
+#define KNOT_MERGE2_DEF(name, XAT, YAT) \
+static void name(const double *x, size_t nx, const double *y, size_t ny, double *o) { \
+    size_t i = 0, j = 0; \
+    while (i < nx && j < ny) { double xv = XAT, yv = YAT; int ty = yv < xv; *o++ = ty ? yv : xv; j += (size_t)ty; i += (size_t)!ty; } \
+    for (; i < nx; i++) *o++ = XAT; \
+    for (; j < ny; j++) *o++ = YAT; }
+KNOT_MERGE2_DEF(knot_merge2_du, x[nx - 1 - i], y[j])
+KNOT_MERGE2_DEF(knot_merge2_ud, x[i], y[ny - 1 - j])
+KNOT_MERGE2_DEF(knot_merge2_dd, x[nx - 1 - i], y[ny - 1 - j])
+#undef KNOT_MERGE2_DEF
+static int g_twist_generic = 0;        /* LOGOS_TWIST_GENERIC=1: the strided loop. Read once per relocation attempt, on the calling thread */
+/* THE GALLOPING TWO-STRAND MERGE (2026-09-21; ceiling and A/B: make knotbench, modes `ceiling` and `gallop`). A crossing is two
+ * strands that both hold elements of one value interval, and on a staircase they alternate element by element, which is what the
+ * branch-free merge above is for. But ONE sparse strand spanning every block (a late column, a sparse index over dense pages)
+ * makes every block a crossing of a few sparse elements and the whole block, and the branch-free merge then touches every element
+ * one compare at a time: 2.4-2.7x the same array with nothing crossing, at one thread. So: while the strands alternate, eight
+ * branch-free steps; when the element KNOT_GALLOP_RUN places ahead in one strand still wins, gallop (steps of 8, 16, 32, then a
+ * bisection) and move the whole stretch with one bulk copy. The lookahead costs two predictable compares per eight elements on
+ * data that alternates. Ties go to x exactly as in the branch-free merge, so the output is the same bytes (signed zeros too).
+ * One function per orientation pair, as above; XAT is element k in ascending value order, XCPY copies cnt of them from k on.
+ * Returns the number of gallops, for the witness. LOGOS_NO_KNOT_GALLOP=1: the branch-free merge alone. */
+#ifndef KNOT_GALLOP_RUN
+#define KNOT_GALLOP_RUN 8
+#endif
+/* Only a crossing whose pieces are UNBALANCED can gallop far, so only those take this kernel: one piece at least KNOT_GALLOP_RATIO
+   times the other. A balanced crossing (every staircase) keeps the branch-free kernel exactly. The first cut ran the lookahead on
+   every crossing and read 0.948-0.980 on the staircase where four elements in five are merged (three runs, 40 to 200 pairs). */
+#ifndef KNOT_GALLOP_RATIO
+#define KNOT_GALLOP_RATIO 4
+#endif
+#define KNOT_MERGE2G_DEF(name, XAT, YAT, XCPY, YCPY) \
+static size_t name(const double *x, size_t nx, const double *y, size_t ny, double *o) { \
+    size_t i = 0, j = 0, gallops = 0; const size_t G = KNOT_GALLOP_RUN; \
+    while (i < nx && j < ny) { \
+        double xv = XAT(i), yv = YAT(j); \
+        if (i + G <= nx && XAT(i + G - 1) <= yv) {                 /* x wins the next G, ties included: gallop x */ \
+            size_t lo = i + G - 1, s = G; \
+            while (lo + s < nx && XAT(lo + s) <= yv) { lo += s; s <<= 1; } \
+            size_t hi = lo + s < nx ? lo + s : nx; \
+            while (lo + 1 < hi) { size_t m = lo + ((hi - lo) >> 1); if (XAT(m) <= yv) lo = m; else hi = m; } \
+            XCPY(o, i, hi - i); o += hi - i; i = hi; gallops++; continue; } \
+        if (j + G <= ny && YAT(j + G - 1) < xv) {                  /* y wins the next G, strictly: gallop y */ \
+            size_t lo = j + G - 1, s = G; \
+            while (lo + s < ny && YAT(lo + s) < xv) { lo += s; s <<= 1; } \
+            size_t hi = lo + s < ny ? lo + s : ny; \
+            while (lo + 1 < hi) { size_t m = lo + ((hi - lo) >> 1); if (YAT(m) < xv) lo = m; else hi = m; } \
+            YCPY(o, j, hi - j); o += hi - j; j = hi; gallops++; continue; } \
+        for (size_t st = 0; st < G && i < nx && j < ny; st++) { double a_ = XAT(i), b_ = YAT(j); int ty = b_ < a_; *o++ = ty ? b_ : a_; j += (size_t)ty; i += (size_t)!ty; } \
+    } \
+    if (i < nx) XCPY(o, i, nx - i); else if (j < ny) YCPY(o, j, ny - j); \
+    return gallops; }
+#define KG_UP(v, k) (v)[k]
+#define KG_DN(v, nv, k) (v)[(nv) - 1 - (k)]
+#define KG_CPY_UP(v, oo, k, cnt) memcpy((oo), (v) + (k), (cnt) * sizeof(double))
+#define KG_CPY_DN(v, nv, oo, k, cnt) copy_rev((oo), (v) + (nv) - (k) - (cnt), (cnt))
+#define KXU(k) KG_UP(x, k)
+#define KXD(k) KG_DN(x, nx, k)
+#define KYU(k) KG_UP(y, k)
+#define KYD(k) KG_DN(y, ny, k)
+#define KXCU(oo, k, c) KG_CPY_UP(x, oo, k, c)
+#define KXCD(oo, k, c) KG_CPY_DN(x, nx, oo, k, c)
+#define KYCU(oo, k, c) KG_CPY_UP(y, oo, k, c)
+#define KYCD(oo, k, c) KG_CPY_DN(y, ny, oo, k, c)
+KNOT_MERGE2G_DEF(knot_merge2g_uu, KXU, KYU, KXCU, KYCU)
+KNOT_MERGE2G_DEF(knot_merge2g_du, KXD, KYU, KXCD, KYCU)
+KNOT_MERGE2G_DEF(knot_merge2g_ud, KXU, KYD, KXCU, KYCD)
+KNOT_MERGE2G_DEF(knot_merge2g_dd, KXD, KYD, KXCD, KYCD)
+#undef KNOT_MERGE2G_DEF
+#undef KG_UP
+#undef KG_DN
+#undef KG_CPY_UP
+#undef KG_CPY_DN
+#undef KXU
+#undef KXD
+#undef KYU
+#undef KYD
+#undef KXCU
+#undef KXCD
+#undef KYCU
+#undef KYCD
+static atomic_size_t g_knot_gallops;   /* logos_twist_last(5): gallops made since it was last read (one add per placement worker) */
+static size_t knot_merge2x(const double *x, size_t nx, int xr, const double *y, size_t ny, int yr, double *o) {
+    if (g_knot_gallop && !g_twist_generic && (nx >= KNOT_GALLOP_RATIO * ny || ny >= KNOT_GALLOP_RATIO * nx)) {
+        if (!xr && !yr) return knot_merge2g_uu(x, nx, y, ny, o);
+        if (xr && yr) return knot_merge2g_dd(x, nx, y, ny, o);
+        return xr ? knot_merge2g_du(x, nx, y, ny, o) : knot_merge2g_ud(x, nx, y, ny, o);
+    }
+    if (!xr && !yr) { knot_merge2(x, nx, y, ny, o); return 0; }
+    if (!g_twist_generic) { if (xr && yr) knot_merge2_dd(x, nx, y, ny, o); else if (xr) knot_merge2_du(x, nx, y, ny, o); else knot_merge2_ud(x, nx, y, ny, o); return 0; }
+    ptrdiff_t ix = xr ? (ptrdiff_t)nx - 1 : 0, iy = yr ? (ptrdiff_t)ny - 1 : 0, sx = xr ? -1 : 1, sy = yr ? -1 : 1; size_t i = 0, j = 0;
+    while (i < nx && j < ny) { double xv = x[ix], yv = y[iy]; int ty = yv < xv; *o++ = ty ? yv : xv;
+        iy += sy & -(ptrdiff_t)ty; ix += sx & -(ptrdiff_t)!ty; j += (size_t)ty; i += (size_t)!ty; }
+    for (; i < nx; i++, ix += sx) *o++ = x[ix];
+    for (; j < ny; j++, iy += sy) *o++ = y[iy];
+    return 0;
+}
+/* [start,end] pairs of every piece in output coordinates, the form merge_all_runs takes (used by k >= 3 crossings only) */
+static size_t *knot_rl(const knot_plan_t *K) {
+    size_t *rl = malloc(2 * (K->npc ? K->npc : 1) * sizeof(size_t)); if (!rl) return NULL;
+    for (size_t q = 0; q < K->npc; q++) { rl[2 * q] = K->pc[q].dst; rl[2 * q + 1] = K->pc[q].dst + K->pc[q].len - 1; }
+    return rl;
+}
+/* sequential placement into buf. Order matters: every read of a[] (copies, two-strand merges) comes before the
+ * k >= 3 merges, which use a[] as scratch. */
+static void knot_place_seq(double *a, double *buf, const knot_plan_t *K, const size_t *rl) {
+    for (size_t q = 0; q < K->npc; q++) if (K->pc[q].copy) strand_copy(buf + K->pc[q].dst, a + K->pc[q].src, K->pc[q].len, K->pc[q].rev);
+    size_t gl = 0;
+    for (size_t s = 0; s < K->nsg; s++) if (K->sg[s].k == 2) { const kpiece_t *x = &K->pc[K->sg[s].p0], *y = x + 1; gl += knot_merge2x(a + x->src, x->len, x->rev, a + y->src, y->len, y->rev, buf + K->sg[s].dst); }
+    if (gl) atomic_fetch_add_explicit(&g_knot_gallops, gl, memory_order_relaxed);
+    if (K->n3) for (size_t s = 0; s < K->nsg; s++) if (K->sg[s].k >= 3) merge_all_runs(buf, a, rl + 2 * K->sg[s].p0, K->sg[s].k);
+}
+#endif
+
 /* Sequential relocation for the leaf dispatcher: copies every run into buf in
  * chain order, then merges inside multi-run chains with a[] as scratch (all
  * runs have already been copied out, so a[] is free). Returns buf, or NULL when
@@ -1320,9 +1930,21 @@ static int runs_plan(const double *a, const size_t *runs, size_t R, rdesc_t **pd
 static double *runs_relocate_f64(double *a, size_t n, double *buf, const size_t *runs, size_t n_runs) {
     rdesc_t *d; size_t *ch, nc, merged;
     if (!runs_plan(a, runs, n_runs, &d, &ch, &nc, &merged)) return NULL;
+#ifndef LOGOS_NO_KNOT
+    if (g_knot_on && n >= (size_t)KNOT_MIN_AVG_RUN * n_runs) {   /* finer than chains: copy what lies alone, merge only what crosses */
+        knot_plan_t K;
+        if (knot_plan(a, d, n_runs, n + 1, 1, &K)) {
+            double kf = n_runs > MERGE_MAX_RUNS ? g_knot_frac_seq : g_knot_frac_few;   /* few runs: the caller's run merge is the fallback */
+            int go = K.total == n && ((double)K.cost <= kf * (double)n || merged <= n / 2);
+            size_t *krl = NULL; if (go && K.n3) { krl = knot_rl(&K); if (!krl) go = 0; }
+            if (go) { knot_place_seq(a, buf, &K, krl); free(krl); knot_plan_free(&K); free(d); free(ch); return buf; }
+            free(krl); knot_plan_free(&K);
+        }
+    }
+#endif
     if (merged > n / 2) { free(d); free(ch); return NULL; }
     size_t *rl = malloc(2 * n_runs * sizeof(size_t)); if (!rl) { free(d); free(ch); return NULL; }
-    for (size_t q = 0, o = 0; q < n_runs; q++) { rl[2 * q] = o; rl[2 * q + 1] = o + d[q].len - 1; memcpy(buf + o, a + d[q].start, d[q].len * sizeof(double)); o += d[q].len; }
+    for (size_t q = 0, o = 0; q < n_runs; q++) { rl[2 * q] = o; rl[2 * q + 1] = o + d[q].len - 1; strand_copy(buf + o, a + d[q].start, d[q].len, d[q].rev); o += d[q].len; }
     for (size_t k = 0; k < nc; k++) if (ch[k + 1] - ch[k] > 1) merge_all_runs(buf, a, rl + 2 * ch[k], ch[k + 1] - ch[k]);
     free(rl); free(d); free(ch); return buf;
 }
@@ -1406,7 +2028,9 @@ static double *sort_fn(double *a, size_t n, double *buf, ctx_t *c) {
 #endif
             PATH_TAG(c, LOGOS_PATH_INT32_RADIX); lsd_radix_int32(a, n, buf, c); return a; }
     }
-    if (n <= INSERTION_SORT_THRESHOLD) { PATH_TAG(c, LOGOS_PATH_INSERTION); insertion_sort(a, 0, (long)n - 1); return a; }
+    if (n <= INSERTION_SORT_THRESHOLD) { PATH_TAG(c, LOGOS_PATH_INSERTION);
+        if (n >= 4 && n <= 16 && !g_no_smallnet) net_sort_small(a, (long)n); else insertion_sort(a, 0, (long)n - 1);
+        return a; }
 
     size_t run_cap = n / MIN_AVG_RUN_FOR_MERGE; if (run_cap < MAX_RUNS_FOR_MERGE) run_cap = MAX_RUNS_FOR_MERGE;
     size_t n_runs = 0; size_t *runs = detect_runs_limited(a, n, run_cap, MIN_AVG_RUN_FOR_MERGE, &n_runs, c);
@@ -1425,7 +2049,20 @@ static double *sort_fn(double *a, size_t n, double *buf, ctx_t *c) {
     size_t inv = 0, comps = 0;
     for (size_t i = 0; i + sample_step < n; i += sample_step) { if (a[i] > a[i + sample_step]) inv++; comps++; }
     int nearly = comps > 0 && (double)inv / comps <= NEARLY_SORTED_INV_RATIO; c->nearly = nearly;
-    if (nearly) {
+    /* The 40 pairs bound inversions at ONE stride, n/40. Disorder that is dense but shorter than the stride (an event log
+       with bounded latency, a series jittered around its own order) passes them, and the insertion sort below then
+       spends its whole budget of 8n moves before it gives up. 64 strided pairs EIGHT apart tell the two apart: the
+       budget is a mean displacement of 8, and an element displaced further than that is usually inverted with its
+       eighth neighbour. Sparse disorder shows a few percent of such pairs; disorder of reach 2 or 3, which the insertion
+       sort handles best, shows none; noise of +-20 shows a third. LOGOS_NO_DENSE_PROBE=1: the A/B. */
+    int dense = 0;
+    if (nearly && n >= 1024 && !g_no_dense_probe) { size_t st = n / 64, d = 0; for (size_t i = 0; i + 8 < n; i += st) d += a[i] > a[i + 8]; dense = d >= 16; }
+    /* TRIED 2026-09-21 and reverted: clearing c->nearly when `dense` fires, so that AVX2_TAKE lets a sequential sort use the AVX2
+       quicksort on a sloped wave with noise. Paired, one binary (./sineprobe 40 4194304 ab): 1.02, neutral. The shape's 1.19x over
+       its own values shuffled is NOT the leaf choice: with LOGOS_NO_AVX2=1 the wave and its shuffle cost the same (1.05, 1.05),
+       so the cost of the ORDER is inside the AVX2 quicksort. The 126-against-87 ms that named this gate came from a profile build. */
+    if (n >= 65536) TRACE("leaf probe: n=%zu inv=%zu/%zu nearly=%d dense=%d -> policy nearly=%d", n, inv, comps, nearly, dense, c->nearly);
+    if (nearly && !dense) {
 #ifdef LOGOS_PLAIN_INSERTION
         if (n <= MOMENTUM_THRESHOLD) { PATH_TAG(c, LOGOS_PATH_INSERTION); insertion_sort(a, 0, (long)n - 1); return a; }
 #else
@@ -1465,6 +2102,19 @@ static double *sort_fn(double *a, size_t n, double *buf, ctx_t *c) {
 #ifdef LOGOS_AVX2_LEAF
     if (n >= 32 && mx > mn && AVX2_TAKE(c, n) && avx2_qsort_f64(a, n)) { PATH_TAG(c, LOGOS_PATH_SIMD); return a; }   /* AVX2 leaf: unstructured data; nearly-sorted keeps coarse (its scatter is near-sequential, measured 1.23x better) */
 #endif
+    if (n >= FLASH_SORT_THRESHOLD && mx > mn && !isfinite(mx - mn)) {
+        /* An infinite range (a +-inf in the data, or two finite values whose difference overflows). Every value-linear
+         * map below (flash classes, coarse buckets, the gap-split pivot) computes (x - mn) * scale with scale = 0, and
+         * inf * 0 is NaN: the cast to a bucket index is undefined and the bucket that held the infinity came back
+         * UNSORTED (uniform data with a[0] = -inf at 4 threads; found 2026-09-19 by the knot harness, which is the
+         * first test to put an infinity in front of a parallel sort). The exponent-bit coarse path keys on the bit
+         * pattern, where an infinity is just the largest exponent; it needs a NaN-free array. */
+        int inf_nan = 0; for (size_t i = 0; i < n; i++) if (a[i] != a[i]) { inf_nan = 1; break; }
+        if (!inf_nan && n >= TYPED_MIN_N) { PATH_TAG(c, LOGOS_PATH_BITS_COARSE); return coarse_bits_f64(a, buf, 0, (long)n - 1, 0, 0, 0, 0, c); }
+        PATH_TAG(c, LOGOS_PATH_QUICKSORT);
+        quicksort(a, 0, (long)n - 1, 2 * log2i(n));
+        return a;
+    }
     if (n >= FLASH_SORT_THRESHOLD && mx > mn) {
         if (g_simd_f64) { PATH_TAG(c, LOGOS_PATH_SIMD); g_simd_f64(a, n); return a; }        /* SIMD leaf for large unstructured data */
         enum { SS = 64 };
@@ -1482,7 +2132,12 @@ static double *sort_fn(double *a, size_t n, double *buf, ctx_t *c) {
             PATH_TAG(c, LOGOS_PATH_GAP_SPLIT);
             double pivot = (samples[max_gap_idx - 1] + samples[max_gap_idx]) / 2;
             long i = 0, j = (long)n - 1;
-            while (i <= j) { while (i <= j && a[i] < pivot) i++; while (i <= j && a[j] >= pivot) j--; if (i < j) { double t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; } }
+            /* ONE predicate, x < pivot, for both scans. The pair it replaces, a[i] < pivot and a[j] >= pivot, BOTH fail on a NaN:
+               when the two scans met on one, neither index moved and the loop never ended. A sort that does not return, on the
+               data the header calls 'order unspecified'. Inherited from the JS engine; found 2026-09-20 because the harness hung
+               about one run in fifteen: the order inside a bucket depends on thread timing, so whether the scans meet on a NaN
+               does too. Heavy-tailed data with 1% NaN at 4 threads spun about one sort in thirty. A NaN now goes right. */
+            while (i <= j) { while (i <= j && a[i] < pivot) i++; while (i <= j && !(a[j] < pivot)) j--; if (i < j) { double t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; } }
             if (i > 1) { double *r = sort_fn(a, (size_t)i, buf, c); if (r != a) memcpy(a, buf, (size_t)i * sizeof(double)); }
             if ((size_t)i < n) { double *r = sort_fn(a + i, n - (size_t)i, buf, c); if (r != a + i) memcpy(a + i, buf, (n - (size_t)i) * sizeof(double)); }
             return a;
@@ -1530,11 +2185,15 @@ static double *leaf_f64(double *a, size_t n, double *buf, ctx_t *c) {
 #  define CPU_RELAX() __asm__ __volatile__("" ::: "memory")
 #endif
 #define BARRIER_SPIN 20000
-typedef struct { pthread_mutex_t m; pthread_cond_t cv; int count; atomic_int arrived; atomic_int gen; } barrier_t;
-static void barrier_init(barrier_t *b, int n) { pthread_mutex_init(&b->m, NULL); pthread_cond_init(&b->cv, NULL); b->count = n; atomic_init(&b->arrived, 0); atomic_init(&b->gen, 0); }
+typedef struct { pthread_mutex_t m; pthread_cond_t cv; atomic_int count; atomic_int arrived; atomic_int gen; } barrier_t;
+static void barrier_init(barrier_t *b, int n) { pthread_mutex_init(&b->m, NULL); pthread_cond_init(&b->cv, NULL); atomic_init(&b->count, n); atomic_init(&b->arrived, 0); atomic_init(&b->gen, 0); }
+/* One participant fewer: its thread could not be created. Only the thread that runs the create loop calls this, and only
+ * before its own first arrival. Whoever completes a barrier arrives no earlier than that thread does (it is one of the
+ * participants), so the completing thread always reads the final count and no arrival is ever missed. */
+static void barrier_drop(barrier_t *b) { atomic_fetch_sub_explicit(&b->count, 1, memory_order_release); }
 static void barrier_wait(barrier_t *b) {
     int g = atomic_load_explicit(&b->gen, memory_order_acquire);
-    if (atomic_fetch_add_explicit(&b->arrived, 1, memory_order_acq_rel) + 1 == b->count) {
+    if (atomic_fetch_add_explicit(&b->arrived, 1, memory_order_acq_rel) + 1 == atomic_load_explicit(&b->count, memory_order_acquire)) {
         atomic_store_explicit(&b->arrived, 0, memory_order_relaxed);
         pthread_mutex_lock(&b->m);
         atomic_store_explicit(&b->gen, g + 1, memory_order_release);   /* release spinners */
@@ -1548,6 +2207,40 @@ static void barrier_wait(barrier_t *b) {
     pthread_mutex_unlock(&b->m);
 }
 static void barrier_destroy(barrier_t *b) { pthread_mutex_destroy(&b->m); pthread_cond_destroy(&b->cv); }
+
+/* ---- thread creation can fail ---------------------------------------------------------------------------------------
+ * pthread_create returns EAGAIN under a process or pid limit (any container with one) and ENOMEM when memory is short.
+ * Until 2026-09-20 none of the 23 call sites here looked at the result: a failed creation was a join on a garbage handle,
+ * and at the six sites that meet at a barrier also a barrier that never fills. `make faultprobe` fails every creation of a
+ * cold sort in turn; before this, every such run hung or crashed.
+ *
+ * par_run: workers 1..P-1 each on a new thread, worker 0 on this one (run0 = 0: the caller has done worker 0 already),
+ * then join. A worker whose thread cannot be created runs HERE instead, after the others are under way, so the phase gets
+ * slower and never wrong. Valid wherever the workers do not wait for one another: every site without a barrier. */
+static void par_run(pthread_t *th, int P, void *(*fn)(void *), void *args, size_t stride, int run0) {
+    int made = 0, no = 0, orph[16];
+    for (int t = 1; t < P; t++) {
+        void *w = (char *)args + (size_t)t * stride;
+        if (pthread_create(&th[made], NULL, fn, w) == 0) made++;
+        else if (no < 16) orph[no++] = t;                       /* once the others are under way */
+        else fn(w);                                             /* creation has stopped working altogether: no list needed */
+    }
+    if (run0) fn(args);
+    for (int i = 0; i < no; i++) fn((char *)args + (size_t)orph[i] * stride);
+    for (int i = 0; i < made; i++) pthread_join(th[i], NULL);
+}
+/* par_spawn: the create loop for workers that DO meet at a barrier, where an orphan cannot simply be run here because its
+ * phases interleave with everyone else's. It is dropped from the barrier instead. A queue-driven phase needs nothing
+ * more, the others drain the queue; a site with static per-thread shares passes orphan[] and covers those shares on the
+ * calling thread, or declines. Returns the number of handles to join: th[0 .. made). */
+static int par_spawn(pthread_t *th, int P, void *(*fn)(void *), void *args, size_t stride, barrier_t *bar, unsigned char *orphan) {
+    int made = 0;
+    for (int t = 1; t < P; t++) {
+        if (pthread_create(&th[made], NULL, fn, (char *)args + (size_t)t * stride) == 0) made++;
+        else { if (bar) barrier_drop(bar); if (orphan) orphan[t] = 1; }
+    }
+    return made;
+}
 
 static inline int bucket_of(double x, const double *sp, int nsp) {
     if (nsp <= 32) { int b = 0; for (int i = 0; i < nsp; i++) b += (sp[i] <= x); return b; }
@@ -1611,7 +2304,11 @@ static int bt_cnt_lt_k(const bt_t *t, uint64_t k) { int lo = 0, hi = t->nsp; whi
 static int bt_build_v(bt_t *t, double vlo, double vhi, int cells, int depth) {
     if (t->nvn >= BT_MAX_NODES || t->nve + cells > BT_MAX_ENTS || !(vhi > vlo)) return -1;
     int id = t->nvn++; bt_vnode_t *nd = &t->vn[id]; nd->lo = vlo; nd->scale = cells / (vhi - vlo); nd->cells = cells; nd->base = t->nve; t->nve += cells;
-    if (!isfinite(nd->scale)) return -1;
+    /* a scale of ZERO is not a scale: an infinite range gives cells / inf = 0, which is finite, and then every cell edge is
+       -inf + c / 0 = NaN and every lookup (x - lo) * 0 = NaN lands in cell 0, whose entry was built from NaN compares. The
+       partition came back with its buckets out of order (uniform data, a[0] = -inf, 4 threads; 2026-09-19). With no value
+       table the trial falls to the key-space table, where an infinity is only the largest key. */
+    if (!isfinite(nd->scale) || !(nd->scale > 0)) return -1;
     for (int c = 0; c < cells; c++) {
         double clo = vlo + c / nd->scale, chi = (c + 1 == cells) ? vhi : vlo + (c + 1) / nd->scale;
         double w = fabs(clo) * 1e-13 + fabs(chi) * 1e-13 + 1e-300;            /* conservative widening (see above) */
@@ -1668,7 +2365,7 @@ static inline __attribute__((always_inline)) int bt_m_pred(const bt_ment_t *e, d
 }
 static int bt_build_m(bt_t *t, double vlo, double vhi) {
     if (!(vhi > vlo)) return 0;
-    t->mscale = BT_ROOT_CELLS / (vhi - vlo); if (!isfinite(t->mscale)) return 0;
+    t->mscale = BT_ROOT_CELLS / (vhi - vlo); if (!isfinite(t->mscale) || !(t->mscale > 0)) return 0;   /* zero = infinite range: see bt_build_v */
     int maxerr = 0;
     for (int c = 0; c < BT_ROOT_CELLS; c++) {
         double clo = vlo + c / t->mscale, chi = (c + 1 == BT_ROOT_CELLS) ? vhi : vlo + (c + 1) / t->mscale;
@@ -1906,6 +2603,7 @@ typedef struct { job_t *j; int t; ctx_t *ctx; } warg_t;
  * lost, because a heavy tail decays inside each binade too (buckets up to 3x their share); here a binade holds hundreds of
  * cells, and the balance check rejects any grid whose cells are too coarse for the data. The table never decreases, so
  * the partition stays correct whatever the balance. */
+static inline uint64_t total_key(double v);   /* again, outside the splitter-table block: -DLOGOS_NO_SPLITTER_TABLE compiled that one out, and the engine did not build */
 static inline __attribute__((always_inline)) int hf_lookup_kg(const job_t *j, double x) {
     uint64_t k = total_key(x);
     uint64_t d = k > j->kg_lo ? (k - j->kg_lo) >> j->kg_shift : 0;
@@ -2010,7 +2708,10 @@ static void do_buckets(job_t *j, ctx_t *ctx) {
         size_t s = j->bstart[b], nb = j->bsize[b];
         PROF(prof_stamp_t s0 = prof_stamp(); ctx->path = LOGOS_PATH_NONE;)
         if (g_simd_f64 && nb > 1) { g_simd_f64(j->dst + s, nb); memcpy(j->src + s, j->dst + s, nb * sizeof(double)); PROF(ctx->path = LOGOS_PATH_SIMD;) }  /* parallel-SIMD leaf */
-        else { double *r = nb > 1 ? leaf_f64(j->dst + s, nb, j->src + s, ctx) : j->dst + s;
+        else { double *r = j->dst + s;
+               if (nb > 1) { ctx_fit_t cf;
+                   if (ctx_fit(ctx, nb, &cf)) { r = leaf_f64(j->dst + s, nb, j->src + s, ctx); ctx_unfit(ctx, &cf); }
+                   else quicksort(j->dst + s, 0, (long)nb - 1, 2 * log2i(nb)); }      /* no memory for a context this large: a sort that needs none */
                if (r != j->src + s) memcpy(j->src + s, j->dst + s, nb * sizeof(double)); }
         PROF(double ms = prof_busy_since(ctx->tid, LOGOS_PH_BUCKETS, s0); prof_path(ctx->tid, ctx->path, nb, ms);)
     }
@@ -2283,7 +2984,14 @@ static void hf_leaves(hf_arg_t *w) {
             double *r = nb > 1 ? leaf_f64(reg, nb, out, w->ctx) : reg;
             if (r != out) memcpy(out, r, nb * sizeof(double));
         } else {
-            double *sv = malloc((ns ? ns : 1) * sizeof(double)); for (size_t i = 0; i < ns; i++) sv[i] = h->spv[h->spo[b] + i].v;
+            double *sv = malloc((ns ? ns : 1) * sizeof(double));
+            if (!sv) {            /* unchecked until 2026-09-20. No room for the spill list: lay both parts down and sort the bucket where it lies */
+                memcpy(out, reg, nb * sizeof(double)); for (size_t i = 0; i < ns; i++) out[nb + i] = h->spv[h->spo[b] + i].v;
+                quicksort(out, 0, (long)(nb + ns) - 1, 2 * log2i(nb + ns));
+                PROF(double mq = prof_busy_since(w->ctx->tid, LOGOS_PH_BUCKETS, s0); prof_path(w->ctx->tid, w->ctx->path, nb + ns, mq);)
+                continue;
+            }
+            for (size_t i = 0; i < ns; i++) sv[i] = h->spv[h->spo[b] + i].v;
             sample_sort(sv, ns);
             double *r = nb > 1 ? leaf_f64(reg, nb, out, w->ctx) : reg;
             if (r != reg) memcpy(reg, r, nb * sizeof(double));                    /* sorted region back in the buffer, out is free */
@@ -2323,13 +3031,20 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
         /* 64-byte aligned even when big_alloc falls through to malloc: `region` is a multiple of 8
            doubles, so an aligned base keeps every region start aligned and the streaming prologue
            empty for all the full-block flushes. */
-        double *nbuf = (double *)big_alloc(need * sizeof(double));
+        /* It used to ask big_alloc first and re-ask posix_memalign if the block was not 64-byte aligned, freeing the first
+           afterwards. glibc serves a block this large from mmap with a 16-byte header, so it is NEVER aligned: every cold
+           parallel sort held the 12.8 bytes per element twice at its peak (make memprobe: 34.9 -> 22.1 aux at 10M and 14
+           threads). Aligned first, and the old block goes before the new one is asked for. */
+        free(hf_buf); hf_buf = NULL; hf_buf_cap = 0;
+        double *nbuf = NULL;
+#if defined(LOGOS_HUGEPAGE) && defined(MADV_HUGEPAGE)
+        nbuf = (double *)big_alloc(need * sizeof(double));                   /* 2 MB aligned when it works, which is 64-byte aligned */
+        if (nbuf && (((uintptr_t)nbuf) & 63u)) { free(nbuf); nbuf = NULL; }
+#endif
+        if (!nbuf && posix_memalign((void **)&nbuf, 64, need * sizeof(double)) != 0) nbuf = NULL;
+        if (!nbuf) nbuf = (double *)big_alloc(need * sizeof(double));        /* unaligned beats none: only the streaming prologue cares */
         if (!nbuf) return 0;
-        if (((uintptr_t)nbuf) & 63u) {
-            double *al = NULL;
-            if (posix_memalign((void **)&al, 64, need * sizeof(double)) == 0 && al) { free(nbuf); nbuf = al; }
-        }
-        free(hf_buf); hf_buf = nbuf; hf_buf_cap = need;
+        hf_buf = nbuf; hf_buf_cap = need;
     }
     h.cur = malloc((size_t)nbk * sizeof(atomic_size_t)); h.ovf = malloc((size_t)nbk * sizeof(atomic_size_t));
     h.cnt = calloc(nbk, sizeof(size_t)); h.spo = calloc(nbk + 1, sizeof(size_t)); h.spc = calloc(nbk, sizeof(size_t)); h.bstart = calloc(nbk + 1, sizeof(size_t));
@@ -2346,7 +3061,7 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
 #endif
         barrier_init(&h.bar, P); atomic_init(&h.next, 0); atomic_init(&h.bnext, 0);
         for (int t = 0; t < P; t++) { wa[t].h = &h; wa[t].t = t; wa[t].ctx = &ctxs[t]; }
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, hf_worker, &wa[t]);
+        int hf_made = par_spawn(th, P, hf_worker, wa, sizeof wa[0], &h.bar, NULL);   /* queue-driven throughout: an orphan is only dropped from the barrier */
         PROF(prof_stamp_t s0 = prof_stamp();)
         hf_scatter(&wa[0]);
         PROF(prof_busy_since(0, LOGOS_PH_SCATTER, s0); double t1 = prof_now();)
@@ -2361,7 +3076,9 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
                 for (int b = 0; b < nbk; b++) { size_t o = atomic_load(&h.ovf[b]), c = atomic_load(&h.cur[b]); h.cnt[b] = o == SIZE_MAX ? c : o; }
                 for (int t = 0; t < P; t++) for (size_t i = 0; i < wa[t].spn; i++) h.spc[wa[t].sp[i].b]++;
                 for (int b = 0; b < nbk; b++) h.spo[b + 1] = h.spo[b] + h.spc[b];
-                { size_t *fill = calloc(nbk, sizeof(size_t)); for (int t = 0; t < P; t++) for (size_t i = 0; i < wa[t].spn; i++) { int b = wa[t].sp[i].b; h.spv[h.spo[b] + fill[b]++] = wa[t].sp[i]; } free(fill); }
+                { size_t *fill = calloc(nbk, sizeof(size_t));
+                  if (!fill) h.declined = 1;                  /* unchecked until 2026-09-20; a[] is untouched here, so declining is free */
+                  else { for (int t = 0; t < P; t++) for (size_t i = 0; i < wa[t].spn; i++) { int b = wa[t].sp[i].b; h.spv[h.spo[b] + fill[b]++] = wa[t].sp[i]; } free(fill); } }
                 size_t maxb = 1, lsz[MAX_BUCKETS];
                 for (int b = 0; b < nbk; b++) { size_t z = h.cnt[b] + h.spc[b]; lsz[b] = z; h.bstart[b + 1] = h.bstart[b] + z; if (z > maxb) maxb = z; }
                 hf_order(h.order, lsz, nbk);                          /* biggest leaf first: the last one picked up sets the finish time */
@@ -2379,7 +3096,7 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
         PROF(prof_phase(LOGOS_PH_COMBINE);)
         barrier_wait(&h.bar);
         if (!h.declined) hf_leaves(&wa[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        for (int t = 0; t < hf_made; t++) pthread_join(th[t], NULL);
         PROF(prof_phase(LOGOS_PH_BUCKETS);)
         barrier_destroy(&h.bar);
         sorted = !h.declined;
@@ -2537,9 +3254,12 @@ static void sample_read(const double *a, size_t n, size_t from, size_t to, size_
  * on any NaN, so their order never matters) and the rest goes to the AVX2 quicksort, or to the engine's own
  * scalar introsort where AVX2 is absent. No libc qsort: its callback compare is 5-10x the cost of either. */
 static size_t sample_sort(double *s, size_t m) {
-    size_t k = 0;
-    for (size_t i = 0; i < m; i++) { double v = s[i]; if (v == v) s[k++] = v; }
-    for (size_t i = k; i < m; i++) s[i] = NAN;
+    /* NaNs to the tail by SWAPPING, so every bit pattern survives. It used to compact the numbers and then write the canonical
+       NAN over the tail. Harmless on a sample; but the histogram-free leaf sorts its spills with this, and those are the
+       caller's data: a signalling NaN, a negative NaN or a payload came back as another bit pattern, so the output was not a
+       permutation of the input (16 of 672 runs of an IEEE probe, 2026-09-20). */
+    size_t k = m;
+    for (size_t i = 0; i < k; ) { if (s[i] != s[i]) { double v = s[i]; s[i] = s[--k]; s[k] = v; } else i++; }
 #ifdef LOGOS_AVX2_LEAF
     if (k >= 2 && avx2_leaf_on() && avx2_qsort_f64(s, k)) return m - k;
 #endif
@@ -2548,7 +3268,7 @@ static size_t sample_sort(double *s, size_t m) {
 }
 /* returns 1 if it sorted a[], 0 if it declined (a[] untouched) */
 static int lowcard_try_f64(double *a, size_t n, int P, const double *ext, size_t ext_m) {
-    P = count_threads(n, P);
+    P = count_threads_hash(n, P);   /* the ceiling is this route's alone: see count_threads_hash */
     double *own = NULL; const double *S = ext; size_t sm = ext_m;
     if (!ext) {                                                /* gate: strided sample distinct count */
         size_t m = n < 2048 ? n : 2048;
@@ -2596,9 +3316,7 @@ static int lowcard_try_f64(double *a, size_t n, int P, const double *ext, size_t
     }
     int sorted = 0;
     if (ok) {
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_map, &mp[t]);
-        lc_map(&mp[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        par_run(th, P, lc_map, mp, sizeof mp[0], 1);
         int aborted = 0; size_t total = 0, over = 0;
         for (int t = 0; t < P; t++) { if (mp[t].abort) aborted = 1; total += mp[t].d + (hmul ? sd : 0); over += mp[t].d; }
         TRACE("lowcard: map done, %zu entries the hash did not cover%s", over, aborted ? ", ABORTED" : "");
@@ -2624,9 +3342,7 @@ static int lowcard_try_f64(double *a, size_t n, int P, const double *ext, size_t
                 lcemit_t *em = malloc((size_t)P * sizeof(lcemit_t));
                 if (em) {
                     for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; }
-                    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &em[t]);
-                    lc_emit(&em[0]);
-                    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+                    par_run(th, P, lc_emit, em, sizeof em[0], 1);
                     free(em); sorted = 1;
                 }
             }
@@ -2743,32 +3459,146 @@ static void *mc_map_body(void *p) {
 #define LATTICE_SLOT_BYTES (sizeof(uint64_t) + sizeof(double) + sizeof(size_t))
 #define LATTICE_MIN_SLOTS 4096
 typedef struct { uint64_t *keys; double *vals; size_t *cnts; } lslots_t;
-typedef struct { const double *a; size_t lo, hi; double base, step; long margin, slots; lslots_t t; int abort; int tid; } lattice_arg_t;
+/* THE MAP PHASE CLAIMS CHUNKS (2026-09-22). Static slices (`lo = t*n/P`) assume the threads are equal; this box is a
+ * hybrid CPU (6 performance cores, 8 efficient ones) and the profile's per-thread busy times inside this phase are
+ * BIMODAL: 4.40 ms against 2.99 on quantized, 5.09 against 3.54 on mod_card_30k, 5.24 against 2.51 on few_distinct --
+ * while the one phase that already claims work from a queue, the partition's leaf sorts, reads 10.99 against 10.53
+ * (a ratio of 1.04). A statically chunked phase ends when its SLOWEST thread ends, so a third of this phase's capacity
+ * was idle. Chunks of n/(4P) are claimed with one atomic each, and an abort stops the others at their next claim
+ * instead of after their whole slice. LOGOS_LAT_STATIC_MAP=1 restores the slices: the A/B. */
+typedef struct { const double *a; size_t lo, hi; double base, step; long margin, slots; lslots_t t; int abort; int tid;
+                 atomic_size_t *next; atomic_int *abort_all; size_t n, cstep; } lattice_arg_t;
 static void *lattice_map_body(void *p);
 static void *lattice_map(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = lattice_map_body(p); PROF(prof_busy_since(((lattice_arg_t *)p)->tid, g_prof_phase, s0);) return r; }
+static int g_lat_serial_tables = 0;   /* LOGOS_LAT_SERIAL_TABLES=1: the caller allocates every thread's table, as it used to */
+static int g_lat_static_map = 0;      /* LOGOS_LAT_STATIC_MAP=1: the map takes equal slices again, as it used to */
+/* Each worker allocates and initialises ITS OWN table. It used to be the caller's loop: P mallocs of three arrays plus a
+ * memset of `slots` keys per thread, all before the spawn, which at 8M and 14 threads is 5.6 MB of serial writes inside the
+ * phase the trace puts at ~80% of this route. A failed allocation sets `abort`, which the caller already reads. */
+static int lattice_table_init(lattice_arg_t *m) {
+    if (m->t.keys) return 1;
+    m->t.keys = malloc((size_t)m->slots * sizeof(uint64_t));
+    m->t.vals = malloc((size_t)m->slots * sizeof(double));
+    m->t.cnts = calloc((size_t)m->slots, sizeof(size_t));
+    if (!m->t.keys || !m->t.vals || !m->t.cnts) return 0;
+    memset(m->t.keys, 0xFF, (size_t)m->slots * sizeof(uint64_t));
+    return 1;
+}
+static int lattice_map_range(lattice_arg_t *m, size_t lo, size_t hi);
 static void *lattice_map_body(void *p) {
-    lattice_arg_t *m = p; const double inv = 1.0 / m->step;
-    for (size_t i = m->lo; i < m->hi; i++) {
-        double x = m->a[i]; if (x != x) { m->abort = 1; return NULL; }
+    lattice_arg_t *m = p;
+    if (!lattice_table_init(m)) { m->abort = 1; if (m->abort_all) atomic_store(m->abort_all, 1); return NULL; }
+    if (!m->next) { if (!lattice_map_range(m, m->lo, m->hi)) m->abort = 1; return NULL; }   /* LOGOS_LAT_STATIC_MAP=1 */
+    for (;;) {
+        if (atomic_load_explicit(m->abort_all, memory_order_relaxed)) return NULL;
+        size_t c = atomic_fetch_add(m->next, 1), lo = c * m->cstep;
+        if (lo >= m->n) return NULL;
+        size_t hi = lo + m->cstep; if (hi > m->n) hi = m->n;
+        if (!lattice_map_range(m, lo, hi)) { m->abort = 1; atomic_store(m->abort_all, 1); return NULL; }
+    }
+}
+/* one chunk into this thread's own table; 0 = this data is not a lattice (the caller declines) */
+static int lattice_map_range(lattice_arg_t *m, size_t lo, size_t hi) {
+    const double inv = 1.0 / m->step;
+    for (size_t i = lo; i < hi; i++) {
+        double x = m->a[i]; if (x != x) return 0;
         double q = (x - m->base) * inv; double qi = (double)(long)(q + (q >= 0 ? 0.5 : -0.5));
         double err = q - qi; if (err < 0) err = -err;
         double tol = 1e-9 * (qi >= 0 ? qi : -qi) + 1e-9;
-        if (err > tol) { m->abort = 1; return NULL; }                        /* off-lattice */
-        long idx = (long)qi + m->margin; if (idx < 0 || idx >= m->slots) { m->abort = 1; return NULL; }
+        if (err > tol) return 0;                        /* off-lattice */
+        long idx = (long)qi + m->margin; if (idx < 0 || idx >= m->slots) return 0;
         uint64_t k = total_key(x), kk = m->t.keys[idx];
         if (kk == k) { m->t.cnts[idx]++; continue; }
-        if (kk != UINT64_MAX) { m->abort = 1; return NULL; }                 /* two doubles on one lattice point */
+        if (kk != UINT64_MAX) return 0;                 /* two doubles on one lattice point */
         m->t.keys[idx] = k; m->t.vals[idx] = x; m->t.cnts[idx] = 1;
     }
+    return 1;
+}
+/* THE LATTICE MERGE, IN PARALLEL (2026-09-22, found by `make amprobe` + `make profile`: the counting and lattice routes
+ * spend 98-99% of their wall in one phase where only 6.0-6.9 of 14 threads are busy and NONE are waiting -- the rest have
+ * nothing to do, because this merge sat between the two parallel phases and walked `slots x P` on one thread. Withholding
+ * threads instead was measured and rejected, `make capbench`.)
+ * Slots are value-ordered, so a slot RANGE is an output range: each range is reduced across the P tables independently,
+ * then one O(P) prefix over the per-range totals gives every range its offset in gv/gstart, and the ranges are written
+ * out in parallel. Ranges are CLAIMED with an atomic, so a worker whose thread could not be created costs speed and never
+ * correctness (par_spawn drops it from the barrier; whoever is free takes its range).
+ * MEASURED AND NOT SHIPPED (2026-09-22): 1.02-1.12 SLOWER than the serial loop at 4M-16M (`CAP_SWITCH=LOGOS_LAT_PAR_MERGE
+ * ./capbench`). The diagnosis that sent me here was wrong, and the trace says why: at 8M and 14 threads the MAP phase is
+ * 11-15 ms and this merge is ~2 ms, so it is ~10% of the route and Amdahl caps the prize there; the extra spawn (~60 us a
+ * thread), the temp arrays and the second pass over the slots eat it. The idle threads `make profile` sees are NOT here.
+ * Kept opt-in behind LOGOS_LAT_PAR_MERGE=1 as the A/B and the record. */
+#ifndef LATTICE_PMERGE_MIN_SLOTS
+#define LATTICE_PMERGE_MIN_SLOTS 8192
+#endif
+#ifndef LATTICE_PMERGE_MIN_P
+#define LATTICE_PMERGE_MIN_P 4
+#endif
+typedef struct { lattice_arg_t *mp; int P, t; long slots, nr; double *tv; size_t *tc;
+                 size_t *ne, *tot; unsigned char *cf; atomic_int *claim1, *claim2; barrier_t *bar;
+                 double *gv; size_t *gstart; } lmerge_t;
+static inline long lmerge_lo(long r, long slots, long nr) { return (long)(((size_t)r * (size_t)slots) / (size_t)nr); }
+static void *lattice_merge_worker(void *p) {
+    lmerge_t *w = p; int P = w->P; long nr = w->nr;
+    for (long r = 0; r < nr; r++) {                      /* pass 1: reduce this range across the P tables */
+        if (atomic_exchange(&w->claim1[r], 1)) continue;
+        long lo = lmerge_lo(r, w->slots, nr), hi = lmerge_lo(r + 1, w->slots, nr);
+        size_t ne = 0, tot = 0; unsigned char cf = 0;
+        for (long i = lo; i < hi; i++) {
+            uint64_t key = UINT64_MAX; size_t cnt = 0; double val = 0;
+            for (int q = 0; q < P; q++) { uint64_t kk = w->mp[q].t.keys[i]; if (kk == UINT64_MAX) continue;
+                if (key == UINT64_MAX) { key = kk; val = w->mp[q].t.vals[i]; } else if (kk != key) { cf = 1; break; }
+                cnt += w->mp[q].t.cnts[i]; }
+            if (cf) break;
+            w->tv[i] = val; w->tc[i] = cnt;
+            if (cnt) { ne++; tot += cnt; }
+        }
+        w->ne[r] = ne; w->tot[r] = tot; w->cf[r] = cf;
+    }
+    barrier_wait(w->bar);
+    for (long r = 0; r < nr; r++) if (w->cf[r]) return NULL;    /* a slot two threads disagree on: the caller falls back */
+    for (long r = 0; r < nr; r++) {                      /* pass 2: write this range's entries at its own offset */
+        if (atomic_exchange(&w->claim2[r], 1)) continue;
+        size_t ofs = 0, base = 0;
+        for (long q = 0; q < r; q++) { ofs += w->ne[q]; base += w->tot[q]; }
+        long lo = lmerge_lo(r, w->slots, nr), hi = lmerge_lo(r + 1, w->slots, nr);
+        for (long i = lo; i < hi; i++) if (w->tc[i]) { w->gv[ofs] = w->tv[i]; w->gstart[ofs] = base; base += w->tc[i]; ofs++; }
+    }
     return NULL;
+}
+static int g_lat_par_merge = 0;            /* LOGOS_LAT_PAR_MERGE=1 (opt-in: measured slower), read with the other per-sort switches */
+/* returns 1 when the parallel merge ran and filled gd/acc; 0 when the caller should run the serial loop */
+static int lattice_merge_par(lattice_arg_t *mp, int P, long slots, double *gv, size_t *gstart, pthread_t *th,
+                             size_t *pgd, size_t *pacc, int *pconflict) {
+    if (P < LATTICE_PMERGE_MIN_P || slots < LATTICE_PMERGE_MIN_SLOTS || !g_lat_par_merge) return 0;
+    double *tv = malloc((size_t)slots * sizeof(double)); size_t *tc = malloc((size_t)slots * sizeof(size_t));
+    size_t *ne = calloc((size_t)P, sizeof(size_t)), *tot = calloc((size_t)P, sizeof(size_t));
+    unsigned char *cf = calloc((size_t)P, 1);
+    atomic_int *c1 = calloc((size_t)P, sizeof(atomic_int)), *c2 = calloc((size_t)P, sizeof(atomic_int));
+    lmerge_t *wa = calloc((size_t)P, sizeof(lmerge_t));
+    if (!tv || !tc || !ne || !tot || !cf || !c1 || !c2 || !wa) { free(tv); free(tc); free(ne); free(tot); free(cf); free(c1); free(c2); free(wa); return 0; }
+    for (int q = 0; q < P; q++) { atomic_init(&c1[q], 0); atomic_init(&c2[q], 0); }
+    barrier_t bar; barrier_init(&bar, P);
+    for (int q = 0; q < P; q++) { lmerge_t w = { mp, P, q, slots, P, tv, tc, ne, tot, cf, c1, c2, &bar, gv, gstart }; wa[q] = w; }
+    int made = par_spawn(th, P, lattice_merge_worker, wa, sizeof wa[0], &bar, NULL);
+    lattice_merge_worker(&wa[0]);
+    for (int i = 0; i < made; i++) pthread_join(th[i], NULL);
+    barrier_destroy(&bar);
+    int conflict = 0; size_t gd = 0, acc = 0;
+    for (int q = 0; q < P; q++) { if (cf[q]) conflict = 1; gd += ne[q]; acc += tot[q]; }
+    TRACE("lattice: merge in parallel over %d ranges of %ld slots, %zu distinct%s", P, slots, gd, conflict ? ", CONFLICT -> serial" : "");
+    *pconflict = conflict; *pgd = gd; *pacc = acc;
+    free(tv); free(tc); free(ne); free(tot); free(cf); free(c1); free(c2); free(wa);
+    return !conflict;                                    /* a conflict: nothing was written, the caller runs the serial loop */
 }
 /* returns 1 if sorted, 0 if declined (a[] untouched). samp: sorted sample of m values. */
 static int lattice_try_f64(double *a, size_t n, int P, const double *samp, size_t m) {
     /* distinct sample values -> candidate step */
     double smin = samp[0], smax = samp[m - 1]; double step = INFINITY; size_t distinct = 1;
+    if (!isfinite(smin) || !isfinite(smax)) return 0;   /* an infinity has no lattice index: (inf - smin) / step cast to long below was undefined */
     for (size_t i = 1; i < m; i++) if (samp[i] != samp[i - 1]) { double g = samp[i] - samp[i - 1]; if (g < step) step = g; distinct++; }
     if (distinct < 3 || !(step > 0) || !isfinite(step)) return 0;
-    for (size_t i = 0; i < m; i++) { double q = (samp[i] - smin) / step, qi = (double)(long)(q + 0.5); double e = q - qi; if (e < 0) e = -e; if (e > 1e-9 * (qi + 1)) return 0; }
+    for (size_t i = 0; i < m; i++) { double q = (samp[i] - smin) / step; if (!(q < 9e15)) return 0;   /* past 2^53 an index is not exact, and an overflowed quotient cast to long is undefined */
+                                     double qi = (double)(long)(q + 0.5); double e = q - qi; if (e < 0) e = -e; if (e > 1e-9 * (qi + 1)) return 0; }
     long cap_slots = (long)(LATTICE_MAX_BYTES / LATTICE_SLOT_BYTES / (size_t)(P < 1 ? 1 : P));
     if (cap_slots > LATTICE_MAX_SLOTS) cap_slots = LATTICE_MAX_SLOTS;
     if (cap_slots < LATTICE_MIN_SLOTS) cap_slots = LATTICE_MIN_SLOTS;
@@ -2800,17 +3630,23 @@ static int lattice_try_f64(double *a, size_t n, int P, const double *samp, size_
     lattice_arg_t *mp = calloc((size_t)P, sizeof(lattice_arg_t)); pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
     if (!mp || !th) { free(mp); free(th); return 0; }
     int ok = 1;
+    PROF(int ph_save_outer = g_prof_phase;)
+    /* the map claims chunks unless LOGOS_LAT_STATIC_MAP=1 asks for the old equal slices: see lattice_arg_t */
+    atomic_size_t map_next; atomic_init(&map_next, 0);
+    atomic_int map_abort; atomic_init(&map_abort, 0);
+    size_t cstep = (n + (size_t)(4 * P) - 1) / (size_t)(4 * P); if (cstep < 4096) cstep = 4096;
     for (int t = 0; t < P; t++) {
         mp[t].a = a; PROF(mp[t].tid = t;) mp[t].lo = (size_t)t * chunk; mp[t].hi = mp[t].lo + chunk; if (mp[t].hi > n) mp[t].hi = n;
         mp[t].base = smin; mp[t].step = step; mp[t].margin = margin; mp[t].slots = slots;
-        mp[t].t.keys = malloc((size_t)slots * sizeof(uint64_t)); mp[t].t.vals = malloc((size_t)slots * sizeof(double)); mp[t].t.cnts = calloc((size_t)slots, sizeof(size_t));
-        if (!mp[t].t.keys || !mp[t].t.vals || !mp[t].t.cnts) ok = 0; else memset(mp[t].t.keys, 0xFF, (size_t)slots * sizeof(uint64_t));
+        mp[t].n = n; mp[t].cstep = cstep; mp[t].next = g_lat_static_map ? NULL : &map_next; mp[t].abort_all = &map_abort;
+        if (g_lat_serial_tables && !lattice_table_init(&mp[t])) ok = 0;   /* otherwise each worker takes its own, in parallel */
     }
     int sorted = 0;
     if (ok) {
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lattice_map, &mp[t]);
-        lattice_map(&mp[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        PROF(g_prof_phase = LOGOS_PH_LAT_MAP; prof_phase(LOGOS_PH_MODCARD);)
+        par_run(th, P, lattice_map, mp, sizeof mp[0], 1);
+        PROF(prof_phase(LOGOS_PH_LAT_MAP);)
+        TRACE("lattice: map done (%d threads, %ld slots)", P, slots);
         int aborted = 0; for (int t = 0; t < P; t++) if (mp[t].abort) aborted = 1;
         if (!aborted) {
             /* merge by index: keys must agree across threads; counts sum. Index order == value order. */
@@ -2818,27 +3654,35 @@ static int lattice_try_f64(double *a, size_t n, int P, const double *samp, size_
             lcemit_t *em = malloc((size_t)P * sizeof(lcemit_t));
             if (gv && gstart && em) {
                 size_t gd = 0, acc = 0; int conflict = 0;
-                for (long i = 0; i < slots && !conflict; i++) {
-                    uint64_t key = UINT64_MAX; size_t cnt = 0; double val = 0;
-                    for (int t = 0; t < P; t++) { uint64_t kk = mp[t].t.keys[i]; if (kk == UINT64_MAX) continue;
-                        if (key == UINT64_MAX) { key = kk; val = mp[t].t.vals[i]; } else if (kk != key) { conflict = 1; break; }
-                        cnt += mp[t].t.cnts[i]; }
-                    if (cnt) { gv[gd] = val; gstart[gd] = acc; acc += cnt; gd++; }
+                if (!lattice_merge_par(mp, P, slots, gv, gstart, th, &gd, &acc, &conflict)) {
+                    gd = 0; acc = 0; conflict = 0;
+                    for (long i = 0; i < slots && !conflict; i++) {
+                        uint64_t key = UINT64_MAX; size_t cnt = 0; double val = 0;
+                        for (int t = 0; t < P; t++) { uint64_t kk = mp[t].t.keys[i]; if (kk == UINT64_MAX) continue;
+                            if (key == UINT64_MAX) { key = kk; val = mp[t].t.vals[i]; } else if (kk != key) { conflict = 1; break; }
+                            cnt += mp[t].t.cnts[i]; }
+                        if (cnt) { gv[gd] = val; gstart[gd] = acc; acc += cnt; gd++; }
+                    }
                 }
+                PROF(prof_phase(LOGOS_PH_LAT_MERGE); g_prof_phase = LOGOS_PH_LAT_EMIT;)
+                TRACE("lattice: merge done (serial, walked %ld slots x %d threads = %ld reads)", slots, P, (long)slots * P);
                 if (!conflict && acc == n) {
                     gstart[gd] = acc;
                     for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; }
-                    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &em[t]);
-                    lc_emit(&em[0]);
-                    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+                    par_run(th, P, lc_emit, em, sizeof em[0], 1);
+                    PROF(prof_phase(LOGOS_PH_LAT_EMIT);)
+                    TRACE("lattice: emit done (%zu distinct)", gd);
                     sorted = 1;
                 }
             }
             free(gv); free(gstart); free(em);
         }
     }
+    TRACE("lattice: freeing %d tables of %ld slots (%.1f MB total)", P, slots, (double)P * (double)slots * 24.0 / 1048576.0);
     for (int t = 0; t < P; t++) { free(mp[t].t.keys); free(mp[t].t.vals); free(mp[t].t.cnts); }
     free(mp); free(th);
+    PROF(prof_phase(LOGOS_PH_LAT_FREE); g_prof_phase = ph_save_outer;)
+    TRACE("lattice: tables freed");
     return sorted;
 }
 
@@ -2897,9 +3741,7 @@ static int modcard_try_f64(double *a, size_t n, int P, const double *ext, size_t
     }
     int sorted = 0;
     if (ok) {
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, mc_map, &mp[t]);
-        mc_map(&mp[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        par_run(th, P, mc_map, mp, sizeof mp[0], 1);
         int aborted = 0; size_t tot = 0; for (int t = 0; t < P; t++) { if (mp[t].abort) aborted = 1; tot += mp[t].h.used; }
         TRACE("modcard: map phase done, %d threads, aborted=%d, %zu entries across the tables", P, aborted, tot);
         if (!aborted) {
@@ -2940,9 +3782,7 @@ static int modcard_try_f64(double *a, size_t n, int P, const double *ext, size_t
                         lc_sort_pairs(op, w, ot);        /* the OLD merge; the qsort itself is gone for good */
                         os_[0] = 0; for (size_t i = 0; i < w; i++) { ov[i] = op[i].v; os_[i + 1] = os_[i] + op[i].c; }
                         for (int t = 0; t < P; t++) { oe[t].a = a; PROF(oe[t].tid = t;) oe[t].lo = (size_t)t * chunk; oe[t].hi = oe[t].lo + chunk; if (oe[t].hi > n) oe[t].hi = n; oe[t].gv = ov; oe[t].gstart = os_; oe[t].gd = w; }
-                        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &oe[t]);
-                        lc_emit(&oe[0]);
-                        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+                        par_run(th, P, lc_emit, oe, sizeof oe[0], 1);
                         sorted = 1;
                     }
                     free(op); free(ot); free(ov); free(os_); free(oe);
@@ -2969,9 +3809,7 @@ mc_concat: ;
                 }
                 TRACE("modcard: folded to %zu distinct", gd);
                 for (int t = 0; t < P; t++) { em[t].a = a; PROF(em[t].tid = t;) em[t].lo = (size_t)t * chunk; em[t].hi = em[t].lo + chunk; if (em[t].hi > n) em[t].hi = n; em[t].gv = gv; em[t].gstart = gstart; em[t].gd = gd; }
-                for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, lc_emit, &em[t]);
-                lc_emit(&em[0]);
-                for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+                par_run(th, P, lc_emit, em, sizeof em[0], 1);
                 TRACE("modcard: emit done");
                 sorted = 1;
             }
@@ -3038,6 +3876,12 @@ static void *big_alloc(size_t bytes) {
 #endif
 }
 
+/* the histogram-free partition's region buffer exists only when that partition is compiled in (make hfbench builds without it) */
+#ifndef LOGOS_NO_HISTFREE
+#define HF_RELEASE() do { free(hf_buf); hf_buf = NULL; hf_buf_cap = 0; } while (0)
+#else
+#define HF_RELEASE() ((void)0)
+#endif
 #ifndef LOGOS_NO_POOL
 static pthread_mutex_t g_pool_m = PTHREAD_MUTEX_INITIALIZER;
 static int g_pool_busy = 0;
@@ -3057,13 +3901,16 @@ static int pool_acquire(size_t buf_bytes, size_t bidx_bytes, void **buf, uint8_t
 static void pool_release(void) { pthread_mutex_lock(&g_pool_m); g_pool_busy = 0; pthread_mutex_unlock(&g_pool_m); }
 void logos_release_buffers(void) {
     pthread_mutex_lock(&g_pool_m);
-    if (!g_pool_busy) { free(g_pool_buf); g_pool_buf = NULL; g_pool_cap = 0; free(g_pool_bidx); g_pool_bidx = NULL; g_pool_bidx_cap = 0; }
+    if (!g_pool_busy) { free(g_pool_buf); g_pool_buf = NULL; g_pool_cap = 0; free(g_pool_bidx); g_pool_bidx = NULL; g_pool_bidx_cap = 0;
+                        /* and the rest of what is kept between calls: it used to free only the 9 bytes per element above and leave the
+                           partition's 12.8 and the contexts behind, which make memprobe's "after release" column showed */
+                        HF_RELEASE(); ctx_release_all(); cnti_release_all(); }
     pthread_mutex_unlock(&g_pool_m);
 }
 #else
 static int pool_acquire(size_t a, size_t b, void **c, uint8_t **d) { (void)a; (void)b; (void)c; (void)d; return 0; }
 static void pool_release(void) {}
-void logos_release_buffers(void) {}
+void logos_release_buffers(void) { HF_RELEASE(); ctx_release_all(); cnti_release_all(); }
 #endif
 
 
@@ -3140,9 +3987,16 @@ static size_t lower_bound_d(const double *a, size_t lo, size_t hi, double v) { w
  * adjacent displaced-high elements can slip through and cost a cascade of rejections until the sequence
  * catches up, which only adds strays, never breaks the order. Kept to the front of the chunk's region in
  * dst, strays to the back. */
+static void ns_split_scan(ns_chunk_arg_t *w);
 static void *ns_split_sort(void *p) {
-    ns_chunk_arg_t *w = p; size_t lo = w->lo, hi = w->hi;
+    ns_chunk_arg_t *w = p;
     PROF(prof_stamp_t s0 = prof_stamp(); w->ctx->path = LOGOS_PATH_RUN_MERGE;)
+    ns_split_scan(w);
+    PROF(double ms = prof_busy_since(w->ctx->tid, LOGOS_PH_NEARSORTED, s0); prof_path(w->ctx->tid, w->ctx->path, w->hi - w->lo, ms);)
+    return NULL;
+}
+static void ns_split_scan(ns_chunk_arg_t *w) {
+    size_t lo = w->lo, hi = w->hi;
     size_t f = lo, b = hi; const double tlo = w->tlo, thi = w->thi; const double *a = w->a; double *dst = w->dst;
     /* Poison recovery: a displaced-high element followed within two positions by a larger displaced-high
        element passes the neighbour test and becomes the kept maximum; everything legitimate after it is
@@ -3167,8 +4021,6 @@ static void *ns_split_sort(void *p) {
         dst[--b] = v;
     }
     w->nin = f - lo; w->nstray = hi - b;
-    PROF(double ms = prof_busy_since(w->ctx->tid, LOGOS_PH_NEARSORTED, s0); prof_path(w->ctx->tid, w->ctx->path, hi - lo, ms);)
-    return NULL;
 }
 /* phase 2: one band = its sorted in-band run merged with its slice of the sorted strays, into a[] */
 typedef struct { const double *run, *strays; size_t nrun, s0, s1; double *out; int tid; } ns_merge2_t;
@@ -3184,16 +4036,37 @@ static void *ns_merge2(void *p) {
 #endif
 /* returns 1 if sorted, 0 if declined (a[] untouched) */
 #define NS_STRAYS_PARALLEL 65536
+#ifndef NS_WIDE_MIN_N
+#define NS_WIDE_MIN_N      6000000   /* from here on the near-sorted gate admits up to NEARLY_SORTED_INV_RATIO (5%); below, NS_INV_RATIO_SMALL */
+#endif
+#ifndef NS_INV_RATIO_SMALL
+#define NS_INV_RATIO_SMALL 0.025
+#endif
 static _Thread_local int ns_depth = 0;
-static int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, double inv_rate) {
+/* noinline (2026-09-22): nothing with a large frame may land in the dispatcher's. Between two rounds, with no stack array added,
+ * GCC began inlining this route (a 33 KB frame, called once) into psort_f64, whose frame went from 35,888 to 60,496 bytes: stack-clash
+ * protection probes every page of it on EVERY call, and a sort of 2 to 10 elements went from 17.5 to 85 ns (make callbench against
+ * the committed engine). An inlining decision moves when any other callee grows or shrinks; -fstack-usage prints the frame. */
+static __attribute__((noinline)) int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, double inv_rate) {
     if (P < 2 || P > 256 || ns_depth > 0) return 0;
+    int ns_gate_old = getenv("LOGOS_NS_GATE_OLD") != NULL;               /* the A/B: both gates as they were before 2026-09-20 */
+    (void)ns_gate_old;
+    if (getenv("LOGOS_NO_NEARSORTED")) return 0;                        /* the route's own A/B: what it is worth against the partition (make nsgatebench, NSG_ROUTE=1) */
     if (inv_rate < 0) {                                        /* gate: the dispatcher's 40-point strided inversion sample */
         size_t ss = n < 40 ? n : 40, st = n / ss; if (st < 1) st = 1; size_t inv = 0, comps = 0;
         for (size_t i = 0; i + st < n; i += st) { if (a[i] > a[i + st]) inv++; comps++; }
         if (comps == 0) return 0;
         inv_rate = (double)inv / comps;
     }
-    if (inv_rate > NEARLY_SORTED_INV_RATIO) return 0;
+    /* The gate, measured again on the repaired statistic (2026-09-20), as the ROUTE against the partition (LOGOS_NO_NEARSORTED; make
+       nsgatebench with NSG_ROUTE=1), 14 threads, sorted data with random swaps:
+         0.5% and 1% swaps (the statistic reads 1-2.5%): the route wins at every size, 1.07-1.48x from 1M to 2M, 1.36-2.1x from 3M up;
+         2% swaps (reads ~3.5-5%): 0.84-0.87 at 1.5M, 0.93-1.15 at 2M, 0.94-0.99 at 3-4M, and 1.33-1.41 at 6M, 1.12 at 8.4M;
+         3% swaps (reads ~5-6.5%): 0.75 at 1.5M, 0.80 at 2M, a tie from 3M; 5% swaps (reads ~8%), gate lifted: 0.71 at 8.4M.
+       The route has three spawn phases and sorts its strays once, which a few million elements do not pay back unless the strays are
+       few. So: 2.5% below NS_WIDE_MIN_N elements, 5% from there on. The old pre-gate hid all of this: without poison recovery it
+       turned away 38 of 40 inputs with 2% swaps whatever their size. */
+    if (inv_rate > ((ns_gate_old || n >= NS_WIDE_MIN_N) ? NEARLY_SORTED_INV_RATIO : NS_INV_RATIO_SMALL)) return 0;
 
 #ifndef LOGOS_NS_OLD
     /* pre-gate: the greedy scan on four 4096-element windows; if it would reject more than a quarter the
@@ -3201,9 +4074,23 @@ static int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, doub
        shuffled data, where every element sits within +-1000 of home and the partition route is the right one) */
     if (n >= 4 * 4096) {
         size_t rej = 0, tot = 0;
-        for (int w = 0; w < 4; w++) {
-            size_t lo = (n / 5) * (size_t)(w + 1) - 2048, hi = lo + 4096; double kmax = -INFINITY;
-            for (size_t i = lo; i < hi; i++) { double v = a[i], n1 = a[i + 1], n2 = a[i + 2]; if ((v >= kmax) & ((v <= n1) | (v <= n2))) kmax = v; else rej++; tot++; }
+        if (ns_gate_old) {
+            for (int w = 0; w < 4; w++) {
+                size_t lo = (n / 5) * (size_t)(w + 1) - 2048, hi = lo + 4096; double kmax = -INFINITY;
+                for (size_t i = lo; i < hi; i++) { double v = a[i], n1 = a[i + 1], n2 = a[i + 2]; if ((v >= kmax) & ((v <= n1) | (v <= n2))) kmax = v; else rej++; tot++; }
+            }
+        } else {
+            /* The route's OWN scan on the four windows, poison recovery included. The scan above has none: one displaced-high
+               element followed within two places by a larger one becomes the kept maximum and every legitimate element after
+               it in the window counts as rejected. Measured on sorted data with random swaps, 40 seeds each: this gate
+               declined 12 of 40 inputs at 1% swaps and 38 of 40 at 2% (mean rejected 18% and 48%, where the route itself
+               rejects 2% and 4%), so the route it guards was mostly unreachable on the data it was built for. */
+            double win[4096]; ns_chunk_arg_t pw; memset(&pw, 0, sizeof pw);
+            for (int w = 0; w < 4; w++) {
+                size_t lo = (n / 5) * (size_t)(w + 1) - 2048;
+                pw.a = a + lo; pw.dst = win; pw.lo = 0; pw.hi = 4096; pw.tlo = -INFINITY; pw.thi = INFINITY; pw.ctx = NULL;
+                ns_split_scan(&pw); rej += pw.nstray; tot += 4096;
+            }
         }
         if (rej * 4 > tot) return 0;
     }
@@ -3241,9 +4128,7 @@ static int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, doub
     if (ok) {
         size_t *rlo = malloc((size_t)P * sizeof(size_t)), *rhi = malloc((size_t)P * sizeof(size_t));
         for (int t = 0; t < P; t++) { rlo[t] = ca[t].lo; rhi[t] = ca[t].hi; }
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, ns_sort_chunk, &ca[t]);
-        ns_sort_chunk(&ca[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        par_run(th, P, ns_sort_chunk, ca, sizeof ca[0], 1);
         for (size_t i = 0; i < m; i++) { size_t q = SAMPLE_POS(i, m, n); samp[i] = dst[q < n ? q : n - 1]; }
         sample_sort(samp, m);
         size_t *slo = malloc((size_t)P * P * sizeof(size_t)), *shi = malloc((size_t)P * P * sizeof(size_t));
@@ -3255,9 +4140,7 @@ static int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, doub
         for (int b = 0; b < P; b++) { size_t sz = 0; for (int r = 0; r < P; r++) sz += shi[b * P + r] - slo[b * P + r]; boff[b + 1] = boff[b] + sz; }
         if (boff[P] == n) {
             for (int b = 0; b < P; b++) { ma[b].dst = dst; PROF(ma[b].tid = b;) ma[b].out = a; ma[b].P = P; ma[b].rlo = rlo; ma[b].rhi = rhi; ma[b].slo = slo + b * P; ma[b].shi = shi + b * P; ma[b].out_off = boff[b]; }
-            for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, ns_merge_band, &ma[t]);
-            ns_merge_band(&ma[0]);
-            for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+            par_run(th, P, ns_merge_band, ma, sizeof ma[0], 1);
             sorted = 1;
         }
         if (!sorted) { memcpy(a, dst, n * sizeof(double)); sorted = -1; }
@@ -3267,9 +4150,7 @@ static int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, doub
     if (ok) {
         /* 1. split + sort the in-band part of every chunk, in parallel; a[] is untouched */
         TRACE("ns: thresholds + contexts ready");
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, ns_split_sort, &ca[t]);
-        ns_split_sort(&ca[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        par_run(th, P, ns_split_sort, ca, sizeof ca[0], 1);
         size_t S = 0; for (int t = 0; t < P; t++) S += ca[t].nstray;
         TRACE("ns: split + in-band sorts done, %zu strays", S);
         if (S <= n / 4) {                                        /* more strays than that: not near-sorted, decline */
@@ -3293,9 +4174,7 @@ static int nearsorted_parallel_f64(double *a, size_t n, int P, double *dst, doub
                 size_t off = 0;
                 for (int t = 0; t < P; t++) { mg[t].run = dst + ca[t].lo; mg[t].nrun = ca[t].nin; mg[t].strays = strays; mg[t].s0 = sb[t]; mg[t].s1 = sb[t + 1]; mg[t].out = a + off; mg[t].tid = t; off += ca[t].nin + (sb[t + 1] - sb[t]); }
                 if (off == n) {
-                    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, ns_merge2, &mg[t]);
-                    ns_merge2(&mg[0]);
-                    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+                    par_run(th, P, ns_merge2, mg, sizeof mg[0], 1);
                     sorted = 1;
                     TRACE("ns: band merges done");
                 }
@@ -3339,11 +4218,17 @@ static inline int reloc_gap_split(const double *a, size_t start, size_t last, si
  * blocks (go). Many sample runs: undecidable here, run the probe. Sample-level
  * gap splitting uses a small factor because a sample step is coarse; a false
  * split only yields two disjoint pieces and never a false overlap. */
-static int reloc_sample_gate(const double *a, size_t n) {
-    enum { S = 1024, MAXR = 16 };
+static int reloc_sample_gate(const double *a, size_t n, double kfrac, double kfew) {
+    /* MAXR: what J5 judges from the sample. KMAXR: what the knot route judges (kfrac > 0). Sixteen runs was the limit
+     * because a chain verdict needs long sample runs; a crossing COST is a sum and tolerates short ones. It matters
+     * because the per-thread prefix gate below cannot see a shuffled staircase (the few blocks one thread holds
+     * rarely neighbour each other in value), so a shape beyond the cost gate was scanned in full and declined
+     * late: 3-4 live strands cost 0.91-0.95 that way, and 0.82 if taken. */
+    enum { S = 1024, MAXR = 16, KMAXR = 128 };
+    size_t maxr = kfrac > 0 ? KMAXR : MAXR;
     if (n < 4 * S) return 1;
     double s[S]; size_t step = n / S; for (size_t i = 0; i < S; i++) s[i] = a[i * step];
-    size_t runs[2 * (MAXR + 1)], R = 0, i = 0;
+    size_t runs[2 * (KMAXR + 1)], R = 0, i = 0;
     while (i < S) {
         size_t j = i + 1;
         if (j < S) {
@@ -3351,37 +4236,242 @@ static int reloc_sample_gate(const double *a, size_t n) {
             else { while (j < S && s[j] < s[j - 1] && !(j - i >= 4 && (s[j - 1] - s[j]) * (double)(j - i) > 4.0 * (s[i] - s[j - 1]))) j++;
                    for (size_t l = i, r = j - 1; l < r; l++, r--) { double t = s[l]; s[l] = s[r]; s[r] = t; } }
         }
-        if (R == MAXR) return 1;
+        if (R == maxr) return 1;
         runs[2 * R] = i; runs[2 * R + 1] = j - 1; R++; i = j;
     }
     if (R < 2) return 1;
     rdesc_t *d; size_t *ch, nc, merged;
     if (!runs_plan(s, runs, R, &d, &ch, &nc, &merged)) return 1;
+    int go = merged <= S / 2;
+#ifndef LOGOS_NO_KNOT
+    /* Most of the sample sits in chains: tangled for J5, but how much of it actually CROSSES? Up to MAXR runs the
+     * sample's verdict is final, as J5's is. Beyond that the runs are short (8-60 points), so the sample only DECLINES,
+     * and only when its estimate clears the gate by a tenth; anything nearer goes to the full scan. */
+    if (R > MAXR) go = 1;
+    if (kfrac > 0 && merged > S / 2) {                        /* chains already say go: nothing to ask */
+        knot_plan_t K;
+        if (knot_plan(s, d, R, (size_t)S + 1, 0, &K)) {
+            double kf = R > MERGE_MAX_RUNS ? kfrac : kfew;
+            if (R <= MAXR) go = (double)K.cost <= kf * (double)S;
+            else if ((double)K.cost > 1.1 * kf * (double)S) go = 0;
+            TRACE("knot: sample gate R=%zu crossing=%zu cost=%zu kmax=%zu of %d (gate %.2f) -> %s", R, K.crossing, K.cost, K.kmax, S, kf, go ? "go" : "decline");
+        }
+    }
+#else
+    (void)kfrac; (void)kfew; (void)maxr;
+#endif
     free(d); free(ch);
     TRACE("reloc: sample gate R=%zu merged=%zu/%d", R, merged, S);
-    return merged <= S / 2;
+    return go;
 }
-typedef struct { double *a; size_t lo, hi, cap, R; size_t *runs; atomic_int *abort; int tid; } rdet_arg_t;
+/* TIES IN A DESCENDING RUN (2026-09-22, tsbench's edge round). An ascending run has always taken equal neighbours; a descending one
+ * ended at the first tie, as a stable sort's must (Timsort reverses strictly descending runs only). Nothing here is stable and
+ * nothing needs to be: equal doubles read backwards are still in order, and the twist reads a descending strand from its far end.
+ * Timestamps with ~1.25% ties (two events in one quarter microsecond) cut every descending block into ~80-element pieces, under the
+ * detector's floor, and 64 shuffled blocks with every other one descending paid for a full sort: 2.4x behind a trimmed merge of the
+ * same blocks at one thread. A run still STARTS descending only on a strict fall (a tie at a run's head goes the ascending way, as
+ * before). LOGOS_DESC_STRICT=1 restores the strict test (read with the other per-sort switches, from MIN_PARALLEL up): the A/B. */
+static __attribute__((unused)) int g_desc_ties = 1;
+typedef struct { double *a; size_t lo, hi, cap, R; size_t *runs; atomic_int *abort; int tid; double kfrac; int twist, fast, kink, ties, simd; size_t kinks;
+                 size_t *stray, nstray, stray_cap; } rdet_arg_t;
+/* the stray list is taken at the FIRST stray: allocating it on every sort cost clean block shapes 4-6% (1 MB, taken and given
+   back through the heap top each call, measured 0.94-0.96 on block_perm and stairs x20 in two runs). 0 = no room: strays end runs. */
+static int stray_room(rdet_arg_t *w, size_t k) {
+    if (!w->stray_cap || w->nstray + k > w->stray_cap) return 0;
+    if (!w->stray) { w->stray = malloc(w->stray_cap * sizeof(size_t)); if (!w->stray) { w->stray_cap = 0; return 0; } }
+    return 1;
+}   /* stray: positions lifted out of ascending runs (NULL: strays end runs, as before) */   /* kfrac > 0: the knot route's cost gate; twist: leave descending runs as they lie; fast: scan in blocks of eight */
+/* THE BLOCK SCAN, VECTORIZED (2026-09-22, found by the handoff pipeline's kinks row: its plain scan beat the engine 1.20-1.27x on one
+ * strand with 1% adjacent swaps, where the trace puts this scan at 89% of the sort; the loop below compiled to thirteen scalar
+ * subsd / maxsd / comisd, the prescan's defect one level down). The eight steps are computed two at a time (SSE2, baseline x86-64) or
+ * four at a time (AVX2 where the CPU has AVX2 and FMA), and the helper advances over AS MANY blocks as pass, so the AVX2 form is one
+ * call per run and not one per block. The tests are the scalar ones exactly: `!(d >= 0)` ascending and `!(d > 0)` descending (`!(d >= 0)`
+ * where a tie continues the run), so a NaN or inf - inf fails the block and lands on the scalar line as before; and max keeps the
+ * accumulator when a step is NaN, as `d > dmax ? d : dmax` does. The run list is therefore identical to the scalar line's by
+ * construction, and the harness checks it against both the scalar scan and this scan's own scalar form.
+ * LOGOS_SCANBLOCK_SCALAR=1 (read with the other per-sort switches, from MIN_PARALLEL up): the A/B. */
+enum { RELOC_BLK_BREAK = 0, RELOC_BLK_BOUND = 1, RELOC_BLK_SHORT = 2 };   /* why the advance stopped */
+#define RELOC_BLOCKS_FN(NAME, STEP, ACCEPT, RANGE)                                                                        \
+static size_t NAME(const double *a, size_t i, size_t j, size_t n, int ties, int *pstate) {                         \
+    (void)ties;                                                                                                    \
+    for (;;) {                                                                                                     \
+        if (j + 8 > n) { *pstate = RELOC_BLK_SHORT; return j; }                                                     \
+        double dmax = 0.0; int ok = 1;                                                                              \
+        for (int k = 0; k < 8; k++) { double d = STEP; ok &= ACCEPT; dmax = d > dmax ? d : dmax; }                  \
+        int fits = !(dmax * (double)(j - i + 8) > RELOC_GAP_FACTOR * (RANGE));                                    \
+        if (ok && fits) { j += 8; continue; }                                                                      \
+        *pstate = !ok && fits ? RELOC_BLK_BREAK : RELOC_BLK_BOUND;                                                  \
+        return j;                                                                                                   \
+    }                                                                                                               \
+}
+RELOC_BLOCKS_FN(reloc_blocks_up_c, a[j + k] - a[j + k - 1], d >= 0.0, a[j - 1] - a[i])
+RELOC_BLOCKS_FN(reloc_blocks_down_c, a[j + k - 1] - a[j + k], (d > 0.0) | (ties & (d == 0.0)), a[i] - a[j - 1])
+#ifdef LOGOS_HAVE_SSE2
+#define RELOC_BLOCKS_SIMD(NAME, VEC, LOAD, SUB, MAXV, OR, CMP_BAD, MOVEMASK, ZERO, WIDE, HMAX, CUR, PREV, RANGE)          \
+static size_t NAME(const double *a, size_t i, size_t j, size_t n, int ties, int *pstate) {                         \
+    (void)ties;                                                                                                    \
+    for (;;) {                                                                                                     \
+        if (j + 8 > n) { *pstate = RELOC_BLK_SHORT; return j; }                                                     \
+        VEC acc = ZERO, bad = ZERO; const double *p = a + j;                                                        \
+        for (int k = 0; k < 8; k += WIDE) { VEC d = SUB(LOAD(CUR), LOAD(PREV));                                      \
+            bad = OR(bad, CMP_BAD); acc = MAXV(d, acc); }                                                            \
+        int ok = MOVEMASK(bad) == 0; double dmax = HMAX(acc);                                                        \
+        int fits = !(dmax * (double)(j - i + 8) > RELOC_GAP_FACTOR * (RANGE));                                       \
+        if (ok && fits) { j += 8; continue; }                                                                        \
+        *pstate = !ok && fits ? RELOC_BLK_BREAK : RELOC_BLK_BOUND;                                                   \
+        return j;                                                                                                    \
+    }                                                                                                                \
+}
+static inline double hmax2(__m128d v) { __m128d h = _mm_unpackhi_pd(v, v); return _mm_cvtsd_f64(_mm_max_pd(v, h)); }
+RELOC_BLOCKS_SIMD(reloc_blocks_up_sse2, __m128d, _mm_loadu_pd, _mm_sub_pd, _mm_max_pd, _mm_or_pd, _mm_cmpnge_pd(d, _mm_setzero_pd()),
+                  _mm_movemask_pd, _mm_setzero_pd(), 2, hmax2, p + k, p + k - 1, a[j - 1] - a[i])
+RELOC_BLOCKS_SIMD(reloc_blocks_down_sse2_strict, __m128d, _mm_loadu_pd, _mm_sub_pd, _mm_max_pd, _mm_or_pd, _mm_cmpngt_pd(d, _mm_setzero_pd()),
+                  _mm_movemask_pd, _mm_setzero_pd(), 2, hmax2, p + k - 1, p + k, a[i] - a[j - 1])
+RELOC_BLOCKS_SIMD(reloc_blocks_down_sse2_ties, __m128d, _mm_loadu_pd, _mm_sub_pd, _mm_max_pd, _mm_or_pd, _mm_cmpnge_pd(d, _mm_setzero_pd()),
+                  _mm_movemask_pd, _mm_setzero_pd(), 2, hmax2, p + k - 1, p + k, a[i] - a[j - 1])
+#pragma GCC push_options
+#pragma GCC target("avx2,fma,popcnt")
+#include <immintrin.h>
+static inline double hmax4(__m256d v) { __m128d lo = _mm256_castpd256_pd128(v), hi = _mm256_extractf128_pd(v, 1); lo = _mm_max_pd(lo, hi);
+                                        __m128d h = _mm_unpackhi_pd(lo, lo); return _mm_cvtsd_f64(_mm_max_pd(lo, h)); }
+RELOC_BLOCKS_SIMD(reloc_blocks_up_avx2, __m256d, _mm256_loadu_pd, _mm256_sub_pd, _mm256_max_pd, _mm256_or_pd,
+                  _mm256_cmp_pd(d, _mm256_setzero_pd(), _CMP_NGE_UQ), _mm256_movemask_pd, _mm256_setzero_pd(), 4, hmax4, p + k, p + k - 1, a[j - 1] - a[i])
+RELOC_BLOCKS_SIMD(reloc_blocks_down_avx2_strict, __m256d, _mm256_loadu_pd, _mm256_sub_pd, _mm256_max_pd, _mm256_or_pd,
+                  _mm256_cmp_pd(d, _mm256_setzero_pd(), _CMP_NGT_UQ), _mm256_movemask_pd, _mm256_setzero_pd(), 4, hmax4, p + k - 1, p + k, a[i] - a[j - 1])
+RELOC_BLOCKS_SIMD(reloc_blocks_down_avx2_ties, __m256d, _mm256_loadu_pd, _mm256_sub_pd, _mm256_max_pd, _mm256_or_pd,
+                  _mm256_cmp_pd(d, _mm256_setzero_pd(), _CMP_NGE_UQ), _mm256_movemask_pd, _mm256_setzero_pd(), 4, hmax4, p + k - 1, p + k, a[i] - a[j - 1])
+#pragma GCC pop_options
+#endif
+static int g_scan_scalar = 0;            /* LOGOS_SCANBLOCK_SCALAR=1: the scalar block test, read per sort from MIN_PARALLEL up */
+static inline size_t reloc_blocks_up(const double *a, size_t i, size_t j, size_t n, int simd, int *pstate) {
+#ifdef LOGOS_HAVE_SSE2
+    if (simd == 2) return reloc_blocks_up_avx2(a, i, j, n, 0, pstate);
+    if (simd == 1) return reloc_blocks_up_sse2(a, i, j, n, 0, pstate);
+#else
+    (void)simd;
+#endif
+    return reloc_blocks_up_c(a, i, j, n, 0, pstate);
+}
+static inline size_t reloc_blocks_down(const double *a, size_t i, size_t j, size_t n, int simd, int ties, int *pstate) {
+#ifdef LOGOS_HAVE_SSE2
+    if (simd == 2) return ties ? reloc_blocks_down_avx2_ties(a, i, j, n, ties, pstate) : reloc_blocks_down_avx2_strict(a, i, j, n, ties, pstate);
+    if (simd == 1) return ties ? reloc_blocks_down_sse2_ties(a, i, j, n, ties, pstate) : reloc_blocks_down_sse2_strict(a, i, j, n, ties, pstate);
+#else
+    (void)simd;
+#endif
+    return reloc_blocks_down_c(a, i, j, n, ties, pstate);
+}
 static void *reloc_detect_worker_body(void *p);
 static void *reloc_detect_worker(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = reloc_detect_worker_body(p); PROF(prof_busy_since(((rdet_arg_t *)p)->tid, LOGOS_PH_RELOC_PROBE, s0);) return r; }
 static void *reloc_detect_worker_body(void *p) {
-    rdet_arg_t *w = p; double *a = w->a; size_t n = w->hi, i = w->lo, next_check = 2;
+    rdet_arg_t *w = p; double *a = w->a; size_t n = w->hi, i = w->lo, next_check = 2; const int ties = w->ties;
     while (i < n) {
-        size_t j = i + 1;
-        if (j < n) {
-            if (a[j] >= a[i]) { while (j < n && a[j] >= a[j - 1] && !reloc_gap_split(a, i, j - 1, j)) j++; }
-            else { while (j < n && a[j] < a[j - 1] && !(j - i >= RELOC_MIN_BODY && (a[j - 1] - a[j]) * (double)(j - i) > RELOC_GAP_FACTOR * (a[i] - a[j - 1]))) j++;
-                   for (size_t l = i, r = j - 1; l < r; l++, r--) { double t = a[l]; a[l] = a[r]; a[r] = t; } }
+        /* THE SWING AT A RUN'S HEAD (stray mode): a run that starts with a stray below it, [stray, x, x+1, ...], has no body for the
+           gap test to read, and its interval reached down to the stray (blocks with 1% strays read to the end and then declined on
+           crossing cost). If the first step dwarfs the next two, the head is a stray and the run starts after it. */
+        if (w->stray_cap && i + 4 < n) {
+            double r1 = a[i + 3] - a[i + 1], r2 = a[i + 4] - a[i + 2];
+            if (a[i + 1] <= a[i + 2] && a[i + 2] <= a[i + 3] && r1 > 0 && fabs(a[i + 1] - a[i]) * 2.0 > RELOC_GAP_FACTOR * r1 && stray_room(w, 1)) { w->stray[w->nstray++] = i; i++; continue; }
+            if (a[i + 2] <= a[i + 3] && a[i + 3] <= a[i + 4] && r2 > 0 && fabs(a[i + 2] - a[i + 1]) * 2.0 > RELOC_GAP_FACTOR * r2 && fabs(a[i + 2] - a[i]) * 2.0 > RELOC_GAP_FACTOR * r2 && stray_room(w, 2)) {
+                w->stray[w->nstray++] = i; w->stray[w->nstray++] = i + 1; i += 2; continue; }   /* two strays at the head */
         }
-        w->runs[2 * w->R] = i; w->runs[2 * w->R + 1] = j - 1; w->R++;
+        size_t j = i + 1, tw = 0;
+        if (j < n) {
+            /* THE SCAN IN BLOCKS OF EIGHT (2026-09-21, make twistbench mode `scan`). The profile put this loop at 47-49% of the run
+             * routes at one thread (1.1 ns per element for a read): one dependent compare, one multiply and one call per element.
+             * Since the twist it writes nothing, so eight elements can be taken at once whenever a bound PROVES the scalar test
+             * accepts each of them: all eight steps go the run's way, and the LARGEST step times the LARGEST count the block can
+             * reach stays under the gap limit for the SMALLEST range it can have (the range only grows inside a run). Rounding is
+             * monotone in every operand, so the bound holds in floating point as it does on paper; a NaN or inf - inf fails the
+             * sign test and lands on the scalar line, which is unchanged. The run list is therefore identical by construction.
+             * After a block fails, eight scalar steps pass before the next attempt, so data that hugs the limit cannot thrash.
+             * THE BREAK (2026-09-22, found by the triple-reversal weld, tsbench mode `weld`: on one strand with 1% adjacent swaps the
+             * weld's plain scan beat the engine, and the trace put this scan at 89% of the sort). A block that fails only because one
+             * step goes the WRONG WAY still proves the steps before that step: a prefix of the block has a largest step no larger, a
+             * count no larger and a range no smaller. So the scan jumps to the break, the scalar line takes the break and one step more,
+             * and a block is tried again; a block that fails the gap BOUND keeps the eight. The run list is identical by construction,
+             * as before, and a fast advance now clears the one-step `nolook` a lifted stray sets, which a block of eight could otherwise
+             * carry eight elements past the step it was meant for. LOGOS_FASTSCAN_HOLD8=1 = the old hold (fast == 1): the A/B. */
+            if (a[j] >= a[i]) {
+                size_t hold = 0; int nolook = 0;   /* nolook: a[j-2] is a lifted stray this step, so no test may read it */
+                while (j < n) {
+                    if (w->fast && !hold && j - i >= RELOC_MIN_BODY && j + 8 <= n) {
+                        int st; size_t j2 = reloc_blocks_up(a, i, j, n, w->simd, &st);
+                        if (j2 != j) { j = j2; nolook = 0; }
+                        if (st == RELOC_BLK_BREAK && w->fast == 2) {       /* the break: the steps before it are proven, jump to it */
+                            size_t kf = 0; while (a[j + kf] - a[j + kf - 1] >= 0.0) kf++;   /* the block's own test: inf - inf stops it here too */
+                            if (kf) { j += kf; nolook = 0; }
+                            hold = 2;
+                        } else if (st != RELOC_BLK_SHORT) hold = 8;
+                        if (j >= n) break;        /* the advance ended exactly at the chunk's end: the scalar line must not read a[n] */
+                    }
+                    int look2 = !nolook; nolook = 0;
+                    if (a[j] >= a[j - 1] && !reloc_gap_split(a, i, j - 1, j)) { j++; if (hold) hold--; }
+                    /* A KINK (Reidemeister move I; ceiling and A/B: make strandprobe): one adjacent pair swapped inside a run that
+                     * otherwise goes on, [.. 4 6 5 7 ..]. It used to end the run; a few thousand of them pushed the average run
+                     * under the detector's floor and an array of sorted blocks paid for a full sort (4.0-5.6x at one thread).
+                     * The misplaced element sits next to its hole, so the pair is swapped back where it stands and the strand
+                     * stays contiguous: every search and offset of the plan still holds. Both neighbours must agree (the element
+                     * before the pair and the one after it), so noise is not bubbled and a turn into a descending run is not
+                     * mistaken for one. Never across a chunk's end: the next chunk's thread may be writing there. */
+                    else if (look2 && w->kink && j + 1 < n && j >= i + 2 && a[j] < a[j - 1] && a[j] >= a[j - 2] && a[j - 1] <= a[j + 1]) {
+                        double x = a[j]; a[j] = a[j - 1]; a[j - 1] = x; w->kinks++; }
+                    /* A STRAY (see stray_compact), in three forms. Its position is recorded, the run reads on past it, and the hole is closed
+                       before the plan is made. Never the last element of a chunk. The first cut lifted only the first form: a stray ABOVE
+                       the run was accepted into it (a gap split ended the run before it, or a[j+1] ended it after it), so the runs stayed
+                       ~100 long, their intervals spanned the range, and the chain gate stopped the scan at eight runs. */
+                    else if (w->stray_cap && j + 1 < n && j >= i + 4 && a[j] < a[j - 1] && a[j + 1] >= a[j - 1] && !reloc_gap_split(a, i, j - 1, j + 1) && stray_room(w, 1)) {
+                        w->stray[w->nstray++] = j; j += 2; nolook = 1; if (hold) hold = hold > 2 ? hold - 2 : 0; }    /* below the run: a[j] breaks it, a[j+1] resumes it */
+                    else if (w->stray_cap && j + 1 < n && j >= i + 4 && a[j] >= a[j - 1] && a[j + 1] >= a[j - 1] && !reloc_gap_split(a, i, j - 1, j + 1) && stray_room(w, 1)) {
+                        w->stray[w->nstray++] = j; j += 2; nolook = 1; if (hold) hold = hold > 2 ? hold - 2 : 0; }    /* a gap up: a[j] far above, a[j+1] resumes */
+                    else if (look2 && w->stray_cap && j + 1 < n && j >= i + 4 && a[j] < a[j - 1] && a[j] >= a[j - 2] && a[j + 1] >= a[j] && !reloc_gap_split(a, i, j - 2, j) && stray_room(w, 1)) {
+                        w->stray[w->nstray++] = j - 1; j += 1; nolook = 1; if (hold) hold--; }                         /* above the run: a[j-1] was the stray, a[j] continues from a[j-2] and the run goes on past it */
+                    else if (w->stray_cap && j + 2 < n && j >= i + 4 && a[j] == a[j] && a[j + 1] == a[j + 1] && a[j + 2] >= a[j - 1] && !reloc_gap_split(a, i, j - 1, j + 2) && stray_room(w, 2)) {
+                        w->stray[w->nstray++] = j; w->stray[w->nstray++] = j + 1; j += 3; nolook = 1; if (hold) hold = hold > 3 ? hold - 3 : 0; }   /* two strays side by side, a[j+2] resumes */
+                    else break;
+                }
+            }
+            else { size_t hold = 0;
+                   while (j < n) {
+                       if (w->fast && !hold && j - i >= RELOC_MIN_BODY && j + 8 <= n) {
+                           int st; size_t j2 = reloc_blocks_down(a, i, j, n, w->simd, ties, &st);
+                           j = j2;
+                           if (st == RELOC_BLK_BREAK && w->fast == 2) {    /* the break, as in an ascending run */
+                               size_t kf = 0; for (;;) { double d = a[j + kf - 1] - a[j + kf]; if (!((d > 0.0) | (ties & (d == 0.0)))) break; kf++; }
+                               j += kf; hold = 2;
+                           } else if (st != RELOC_BLK_SHORT) hold = 8;
+                           if (j >= n) break;     /* as above: the loop condition the old `continue` re-checked */
+                       }
+                       if ((a[j] < a[j - 1] || (ties && a[j] == a[j - 1])) && !(j - i >= RELOC_MIN_BODY && (a[j - 1] - a[j]) * (double)(j - i) > RELOC_GAP_FACTOR * (a[i] - a[j - 1]))) { j++; if (hold) hold--; }
+                       else if (w->kink && j + 1 < n && j >= i + 2 && a[j] > a[j - 1] && a[j] < a[j - 2] && a[j - 1] > a[j + 1]) {   /* the same kink in a run that lies descending */
+                           double x = a[j]; a[j] = a[j - 1]; a[j - 1] = x; w->kinks++; }
+                       else break;
+                   }
+                   if (w->twist) { if (j - i >= 2) tw = RUN_TWIST; }          /* the twist: the run stays as it lies (a NaN's run of one has no direction) */
+                   else for (size_t l = i, r = j - 1; l < r; l++, r--) { double t = a[l]; a[l] = a[r]; a[r] = t; } }
+        }
+        /* A RUN OF ONE OR TWO, in stray mode, is strays: a run that STARTS with a stray is two elements whose interval spans the
+           range, and the chain gate below read it as one tangle and stopped the scan (blocks with 1% strays bailed at R = 4). */
+        if (w->stray_cap && j - i <= 2 && a[i] == a[i] && a[j - 1] == a[j - 1] && stray_room(w, j - i)) {   /* never a NaN: it keeps the route it had */
+            for (size_t q = i; q < j; q++) w->stray[w->nstray++] = q;
+            i = j; continue; }
+        w->runs[2 * w->R] = i; w->runs[2 * w->R + 1] = (j - 1) | tw; w->R++;
         size_t seen = j - w->lo;
-        if (w->R >= w->cap || (w->R >= 256 && seen < w->R * MIN_AVG_RUN_FOR_MERGE) || atomic_load(w->abort)) { atomic_store(w->abort, 1); return NULL; }
+        /* strays arriving faster than the cap allows: the scan would read on until the cap and decline there (3% strays paid 7%
+           for a scan it threw away). Past a thirty-second of the array the density is known well enough to stop now. */
+        if (w->stray_cap && seen > (w->hi - w->lo) / 32 && w->nstray * 64 > seen) { atomic_store(w->abort, 1); return NULL; }
+        if (w->R >= w->cap || (w->R >= 256 && seen < w->R * g_reloc_avg) || atomic_load(w->abort)) { atomic_store(w->abort, 1); return NULL; }
         if (w->R == next_check) {
             rdesc_t *d; size_t *ch, nc, merged;
             if (runs_plan(a, w->runs, w->R, &d, &ch, &nc, &merged)) {
                 TRACE("gate [%zu..%zu) R=%zu seen=%zu chains=%zu merged=%zu", w->lo, w->hi, w->R, seen, nc, merged);
+                int stop = merged > seen / 2;
+#ifndef LOGOS_NO_KNOT
+                /* chains cover most of this prefix. J5 stops here; the knot route stops only if what CROSSES is too much */
+                if (stop && w->kfrac > 0 && seen >= (size_t)KNOT_MIN_AVG_RUN * w->R) { knot_plan_t K; if (knot_plan(a, d, w->R, seen + 1, 0, &K) && (double)K.cost <= w->kfrac * (double)seen) stop = 0; }
+#endif
                 free(d); free(ch);
-                if (merged > seen / 2) { atomic_store(w->abort, 1); return NULL; }
+                if (stop) { atomic_store(w->abort, 1); return NULL; }
             }
             next_check <<= 1;
         }
@@ -3391,22 +4481,25 @@ static void *reloc_detect_worker_body(void *p) {
 }
 /* Flat [start,end,...] list of the whole array's runs (malloc'd), or NULL when a
  * thread's gate said "not block-permuted". */
-static size_t *detect_runs_parallel(double *a, size_t n, int P, size_t *n_runs) {
-    size_t run_cap = n / MIN_AVG_RUN_FOR_MERGE; if (run_cap < MAX_RUNS_FOR_MERGE) run_cap = MAX_RUNS_FOR_MERGE;
+static size_t g_kink_count = 0;         /* logos_twist_last(4): kinks the detector swapped back, summed over the scans since it was last read */
+static size_t *detect_runs_parallel(double *a, size_t n, int P, size_t *n_runs, double kfrac, int twist, int fast, int kink, size_t **pstray, size_t *pnstray) {
+    size_t run_cap = n / g_reloc_avg; if (run_cap < MAX_RUNS_FOR_MERGE) run_cap = MAX_RUNS_FOR_MERGE;
     if (n < MIN_PARALLEL) P = 1;
     size_t chunk = (n + (size_t)P - 1) / (size_t)P, cap = run_cap / (size_t)P + 2;
     rdet_arg_t *w = calloc((size_t)P, sizeof *w); pthread_t *th = malloc((size_t)P * sizeof *th); atomic_int abort_flag; atomic_init(&abort_flag, 0);
     *n_runs = 0; if (!w || !th) { free(w); free(th); return NULL; }
     int ok = 1;
-    for (int t = 0; t < P; t++) { w[t].a = a; PROF(w[t].tid = t;) w[t].lo = (size_t)t * chunk; w[t].hi = w[t].lo + chunk > n ? n : w[t].lo + chunk; w[t].cap = cap; w[t].abort = &abort_flag;
-                                  w[t].runs = malloc(2 * cap * sizeof(size_t)); if (!w[t].runs) ok = 0; }
+    for (int t = 0; t < P; t++) { w[t].a = a; PROF(w[t].tid = t;) w[t].lo = (size_t)t * chunk; w[t].hi = w[t].lo + chunk > n ? n : w[t].lo + chunk; w[t].cap = cap; w[t].abort = &abort_flag; w[t].kfrac = kfrac; w[t].twist = twist; w[t].fast = fast; w[t].kink = kink; w[t].ties = g_desc_ties; w[t].simd = g_scan_scalar ? 0 : logos_simd_kind(); w[t].kinks = 0;
+                                  w[t].runs = malloc(2 * cap * sizeof(size_t)); if (!w[t].runs) ok = 0;
+                                  w[t].stray = NULL; w[t].nstray = 0; w[t].stray_cap = 0; }
+    if (pstray) { *pstray = NULL; *pnstray = 0; }
+    if (ok && pstray && P == 1) w[0].stray_cap = n / 64 + 1;             /* the list itself is taken at the first stray (stray_room) */   /* no memory: strays end runs, as before */
     if (ok) {
         /* chunk 0 first, on the caller's thread: interleaved data fails its gate within a few runs,
            so the common decline never pays for spawning P-1 threads (milliseconds on a loaded box) */
         reloc_detect_worker(&w[0]);
         if (!atomic_load(&abort_flag)) {
-            for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, reloc_detect_worker, &w[t]);
-            for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+            par_run(th, P, reloc_detect_worker, w, sizeof w[0], 0);
         }
     }
     size_t *runs = NULL, R = 0;
@@ -3414,25 +4507,38 @@ static size_t *detect_runs_parallel(double *a, size_t n, int P, size_t *n_runs) 
         size_t total = 0; for (int t = 0; t < P; t++) total += w[t].R;
         runs = malloc(2 * (total + 1) * sizeof(size_t));
         if (runs) for (int t = 0; t < P; t++) for (size_t k = 0; k < w[t].R; k++) {
-            size_t s = w[t].runs[2 * k], e = w[t].runs[2 * k + 1];
-            if (R > 0 && runs[2 * R - 1] + 1 == s && a[s] >= a[s - 1] && !reloc_gap_split(a, runs[2 * R - 2], s - 1, s)) runs[2 * R - 1] = e;   /* stitch across the chunk boundary */
-            else { runs[2 * R] = s; runs[2 * R + 1] = e; R++; }
+            size_t s = w[t].runs[2 * k], ev = w[t].runs[2 * k + 1]; int rv = RUN_REV(ev), stitched = 0;
+            /* stitch across the chunk boundary: two pieces of one run, lying the same way. A descending run that straddled a
+               boundary used to become two disjoint runs, because each chunk reversed its own part; untouched, it is one strand. */
+            if (R > 0 && RUN_END(runs[2 * R - 1]) + 1 == s && RUN_REV(runs[2 * R - 1]) == rv) {
+                size_t p0 = runs[2 * R - 2];
+                if (!rv) stitched = a[s] >= a[s - 1] && !reloc_gap_split(a, p0, s - 1, s);
+                else stitched = (a[s] < a[s - 1] || (g_desc_ties && a[s] == a[s - 1])) && !(s - p0 >= RELOC_MIN_BODY && (a[s - 1] - a[s]) * (double)(s - p0) > RELOC_GAP_FACTOR * (a[p0] - a[s - 1]));
+            }
+            if (stitched) runs[2 * R - 1] = ev;
+            else { runs[2 * R] = s; runs[2 * R + 1] = ev; R++; }
         }
     }
-    for (int t = 0; t < P; t++) free(w[t].runs);
+    if (runs && pstray && w[0].stray && w[0].nstray) { *pstray = w[0].stray; *pnstray = w[0].nstray; w[0].stray = NULL; }
+    for (int t = 0; t < P; t++) { g_kink_count += w[t].kinks; free(w[t].runs); free(w[t].stray); }
     free(w); free(th); *n_runs = R; return runs;
 }
 
-typedef struct { double *a, *dst; size_t n, R, nc; int P, t; const rdesc_t *d; const size_t *off, *ch, *rl; atomic_size_t *next; barrier_t *bar; } reloc_arg_t;
+typedef struct { double *a, *dst; size_t n, R, nc; int P, t; const rdesc_t *d; const size_t *off, *ch, *rl; atomic_size_t *next; barrier_t *bar;
+                 const unsigned char *orphan; int copyback; } reloc_arg_t;   /* orphan: the caller only. Tiles of workers whose thread could not be created */
+#define TILE_IS_MINE(w, q) ((q) == (w)->t || ((w)->orphan && (w)->orphan[q]))
 static void *reloc_worker(void *p) {
     reloc_arg_t *w = p; size_t n = w->n; int P = w->P;
-    size_t lo = (size_t)w->t * n / P, hi = (size_t)(w->t + 1) * n / P;
     PROF(prof_stamp_t s0 = prof_stamp();)
     /* phase 1: fill dst[lo,hi) from the pieces of runs that land there (balanced, sequential streams) */
-    { size_t q = 0; while (q < w->R && w->off[q] + w->d[q].len <= lo) q++;
+    for (int tq = 0; tq < P; tq++) { if (!TILE_IS_MINE(w, tq)) continue;
+      size_t lo = (size_t)tq * n / P, hi = (size_t)(tq + 1) * n / P;
+      size_t q = 0; while (q < w->R && w->off[q] + w->d[q].len <= lo) q++;
       for (; q < w->R && w->off[q] < hi; q++) {
           size_t ds = w->off[q] > lo ? w->off[q] : lo, de = w->off[q] + w->d[q].len < hi ? w->off[q] + w->d[q].len : hi;
-          memcpy(w->dst + ds, w->a + w->d[q].start + (ds - w->off[q]), (de - ds) * sizeof(double)); } }
+          size_t o = ds - w->off[q], cnt = de - ds;                     /* the run's logical range [o, o+cnt): a twisted run holds it at its far end */
+          if (!w->d[q].rev) memcpy(w->dst + ds, w->a + w->d[q].start + o, cnt * sizeof(double));
+          else copy_rev(w->dst + ds, w->a + w->d[q].start + (w->d[q].len - o - cnt), cnt); } }
     PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s0); double t1 = prof_now();)
     if (P > 1) barrier_wait(w->bar);
     PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t1); prof_stamp_t s2 = prof_stamp();)
@@ -3446,27 +4552,378 @@ static void *reloc_worker(void *p) {
     if (P > 1) barrier_wait(w->bar);
     PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t3); prof_stamp_t s4 = prof_stamp();)
     /* phase 3: copy back */
-    memcpy(w->a + lo, w->dst + lo, (hi - lo) * sizeof(double));
+    if (w->copyback) for (int tq = 0; tq < P; tq++) { if (!TILE_IS_MINE(w, tq)) continue;
+      size_t lo = (size_t)tq * n / P, hi = (size_t)(tq + 1) * n / P; memcpy(w->a + lo, w->dst + lo, (hi - lo) * sizeof(double)); }
     PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s4);)
     return NULL;
 }
 
+#ifndef LOGOS_NO_KNOT
+/* ---- the knot route's parallel placement (plan and rationale: see knot_plan) ---- */
+typedef struct { double *a, *dst; size_t n; int P, t; const knot_plan_t *K; const size_t *rl; atomic_size_t *nx2, *nx3; barrier_t *bar;
+                 const unsigned char *orphan; int copyback; } knot_arg_t;    /* orphan: as in reloc_arg_t; copyback: 0 when the caller merges the output back itself */
+static void *knot_worker(void *p) {
+    knot_arg_t *w = p; const knot_plan_t *K = w->K; size_t n = w->n; int P = w->P;
+    PROF(prof_stamp_t s0 = prof_stamp();)
+    /* A1: this thread's tile of the output, from the copy pieces that land in it (balanced, sequential streams) */
+    for (int tq = 0; tq < P; tq++) { if (!TILE_IS_MINE(w, tq)) continue;
+      size_t lo = (size_t)tq * n / P, hi = (size_t)(tq + 1) * n / P, L = 0, H = K->npc;
+      while (L < H) { size_t m = L + ((H - L) >> 1); if (K->pc[m].dst + K->pc[m].len <= lo) L = m + 1; else H = m; }
+      for (size_t q = L; q < K->npc && K->pc[q].dst < hi; q++) {
+          const kpiece_t *pc = &K->pc[q]; if (!pc->copy) continue;
+          size_t ds = pc->dst > lo ? pc->dst : lo, de = pc->dst + pc->len < hi ? pc->dst + pc->len : hi;
+          size_t o = ds - pc->dst, cnt = de - ds;
+          if (!pc->rev) memcpy(w->dst + ds, w->a + pc->src + o, cnt * sizeof(double));
+          else copy_rev(w->dst + ds, w->a + pc->src + (pc->len - o - cnt), cnt); } }
+    /* A2: two-strand crossings, merged straight from a[] into place; a[] is only read until the barrier */
+    size_t s, gl = 0;
+    while ((s = atomic_fetch_add(w->nx2, 1)) < K->nsg) {
+        const kseg_t *g = &K->sg[s]; if (g->k != 2) continue;
+        const kpiece_t *x = &K->pc[g->p0], *y = x + 1;
+        gl += knot_merge2x(w->a + x->src, x->len, x->rev, w->a + y->src, y->len, y->rev, w->dst + g->dst);
+    }
+    if (gl) atomic_fetch_add_explicit(&g_knot_gallops, gl, memory_order_relaxed);
+    PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s0); double t1 = prof_now();)
+    if (P > 1) barrier_wait(w->bar);
+    PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t1); prof_stamp_t s2 = prof_stamp();)
+    /* B: crossings of three or more strands, staged side by side in dst; a[] is free scratch now */
+    if (K->n3) {
+        while ((s = atomic_fetch_add(w->nx3, 1)) < K->nsg) { const kseg_t *g = &K->sg[s]; if (g->k >= 3) merge_all_runs(w->dst, w->a, w->rl + 2 * g->p0, g->k); }
+        PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s2); double t3 = prof_now();)
+        if (P > 1) barrier_wait(w->bar);
+        PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t3); s2 = prof_stamp();)
+    }
+    /* C: copy back */
+    if (w->copyback) for (int tq = 0; tq < P; tq++) { if (!TILE_IS_MINE(w, tq)) continue;
+      size_t lo = (size_t)tq * n / P, hi = (size_t)(tq + 1) * n / P; memcpy(w->a + lo, w->dst + lo, (hi - lo) * sizeof(double)); }
+    PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s2);)
+    return NULL;
+}
+#endif
+
+#ifndef LOGOS_NO_KNOT
+/* ===================== the knot route, LITERALLY: the array as a linked list (opt-in, LOGOS_KNOT_LIST=1) =====================
+ * The route was first described as "convert the array to a linked list, find the runs, untie the knots". What shipped keeps
+ * the idea and not the structure: an array of run descriptors, pieces placed by copies and merges. This is the structure taken
+ * at its word, built to be measured against that (./twistbench 60 8388608 list):
+ *   1. every element gets a LINK, a 32-bit index: inside an ascending piece next[i] = i + 1, inside a TWISTED piece
+ *      next[i] = i - 1. In a list the twist costs nothing at all: a descending run is a run whose links point the other way;
+ *   2. a crossing is untied by RELINKING: the pieces' sublists are merged by rewriting links, no element moves;
+ *   3. the units are stitched tail to head in output order. The array is now one sorted linked list;
+ *   4. the list is walked out into dst (one thread: from the head, all n elements, through every stitch; P threads: each
+ *      unit from its own head, since a list cannot be entered in the middle) and dst is copied back.
+ * The walk is given its best known form: next is GUESSED (cur + 1, or cur - 1 inside a twisted run) and the load only checks
+ * the guess, so inside a run the chain of dependent loads that makes a linked list slow is broken by the branch predictor.
+ * LOGOS_LIST_PLAIN=1 walks by the pointer alone, to show what the guess is worth.
+ * It reuses the knot plan for WHERE the strands cross; what it replaces is the placement. It costs 4 more bytes per element.
+ * Returns 0 (nothing touched) when the links cannot be allocated or n does not fit 32 bits: the array placement runs instead. */
+#define LIST_END 0xFFFFFFFFu
+typedef struct { uint32_t head, tail; size_t len, dst, lo, hi, seg; int rev; } lunit_t;       /* seg == SIZE_MAX: part of a lone piece, a[lo, hi) */
+static size_t g_list_count = 0;                         /* logos_twist_last(3): how many placements went through the list */
+static inline void list_link_range(uint32_t *nx, size_t lo, size_t hi, int rev) {
+    if (rev) for (size_t i = lo; i < hi; i++) nx[i] = (uint32_t)i - 1u; else for (size_t i = lo; i < hi; i++) nx[i] = (uint32_t)i + 1u;
+}
+/* merge two sublists by relinking. x is the earlier piece and wins ties, as in knot_merge2. Returns the head, sets *ptail. */
+static uint32_t list_merge(const double *a, uint32_t *nx, uint32_t x, size_t cx, uint32_t xt, uint32_t y, size_t cy, uint32_t yt, uint32_t *ptail) {
+    uint32_t head, tail;
+    if (a[y] < a[x]) { head = y; y = nx[y]; cy--; } else { head = x; x = nx[x]; cx--; }
+    tail = head;
+    while (cx && cy) {
+        if (a[y] < a[x]) { nx[tail] = y; tail = y; y = nx[y]; cy--; }
+        else             { nx[tail] = x; tail = x; x = nx[x]; cx--; }
+    }
+    if (cx) { nx[tail] = x; *ptail = xt; } else if (cy) { nx[tail] = y; *ptail = yt; } else *ptail = tail;
+    return head;
+}
+/* write cnt elements, in list order from cur, to o[]. The last element's link is never read (it may be a stitch in progress). */
+static void list_walk(const double *a, const uint32_t *nx, uint32_t cur, size_t cnt, double *o, int plain) {
+    if (!cnt) return;
+    if (plain) { for (size_t k = 0; k + 1 < cnt; k++) { o[k] = a[cur]; cur = nx[cur]; } o[cnt - 1] = a[cur]; return; }
+    uint32_t step = 1u;                                   /* +1 in an ascending run, -1 (as 0xFFFFFFFF) in a twisted one */
+    for (size_t k = 0; k + 1 < cnt; k++) {
+        o[k] = a[cur];
+        uint32_t real = nx[cur], guess = cur + step, ne = real ^ guess;
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+        /* Without this the compiler notes that guess == real on the path where they compare equal, continues from `real`, and the
+           chain of dependent loads is back (read in the assembly: the first cut measured exactly what the plain walk does).
+           Laundering the difference keeps the equality to ourselves: on the common path cur comes from cur + step alone. */
+        __asm__ volatile("" : "+r"(ne));
+#endif
+        if (__builtin_expect(ne != 0, 0)) {                /* the link leaves the run: follow it, and learn which way the next run lies */
+            guess = real;
+            if (k + 2 < cnt) step = nx[real] == real + 1u ? 1u : (uint32_t)0 - 1u;
+        }
+        cur = guess;
+    }
+    o[cnt - 1] = a[cur];
+}
+typedef struct { double *a, *dst; uint32_t *nx; size_t n; const knot_plan_t *K; lunit_t *u; size_t nu; atomic_size_t *q1, *q2, *q3; barrier_t *bar; int P, t, plain; } list_arg_t;
+#define LIST_COPY_CHUNK ((size_t)1 << 18)
+static void *list_worker(void *p) {
+    list_arg_t *w = p; const knot_plan_t *K = w->K; uint32_t *nx = w->nx; size_t k;
+    PROF(prof_stamp_t s0 = prof_stamp();)
+    /* 1: links, and every crossing untied by relinking. Units are disjoint in a[] and in next[], so this needs no order. */
+    while ((k = atomic_fetch_add(w->q1, 1)) < w->nu) {
+        lunit_t *u = &w->u[k];
+        if (u->seg == SIZE_MAX) { list_link_range(nx, u->lo, u->hi, u->rev); continue; }
+        const kseg_t *g = &K->sg[u->seg]; uint32_t head = 0, tail = 0; size_t cnt = 0;
+        for (size_t q = 0; q < g->k; q++) {
+            const kpiece_t *pc = &K->pc[g->p0 + q];
+            list_link_range(nx, pc->src, pc->src + pc->len, pc->rev);
+            uint32_t h = (uint32_t)(pc->rev ? pc->src + pc->len - 1 : pc->src), tl = (uint32_t)(pc->rev ? pc->src : pc->src + pc->len - 1);
+            if (!q) { head = h; tail = tl; cnt = pc->len; }
+            else { head = list_merge(w->a, nx, head, cnt, tail, h, pc->len, tl, &tail); cnt += pc->len; }
+        }
+        u->head = head; u->tail = tail;
+    }
+    PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s0); double t1 = prof_now();)
+    if (w->P > 1) barrier_wait(w->bar);
+    PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t1); prof_stamp_t s2 = prof_stamp();)
+    /* 2: the stitch (one thread; it writes unit TAILS only, which no walker reads), and the walk */
+    if (w->t == 0) { for (size_t q = 0; q + 1 < w->nu; q++) nx[w->u[q].tail] = w->u[q + 1].head; nx[w->u[w->nu - 1].tail] = LIST_END; }
+    if (w->P == 1) list_walk(w->a, nx, w->u[0].head, w->n, w->dst, w->plain);            /* the whole list, from its head */
+    else while ((k = atomic_fetch_add(w->q2, 1)) < w->nu) list_walk(w->a, nx, w->u[k].head, w->u[k].len, w->dst + w->u[k].dst, w->plain);
+    PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s2); double t3 = prof_now();)
+    if (w->P > 1) barrier_wait(w->bar);
+    PROF(prof_wait(w->t, LOGOS_PH_RELOCATE, prof_now() - t3); prof_stamp_t s4 = prof_stamp();)
+    /* 3: copy back */
+    size_t nch = (w->n + LIST_COPY_CHUNK - 1) / LIST_COPY_CHUNK;
+    while ((k = atomic_fetch_add(w->q3, 1)) < nch) { size_t lo = k * LIST_COPY_CHUNK, hi = lo + LIST_COPY_CHUNK > w->n ? w->n : lo + LIST_COPY_CHUNK; memcpy(w->a + lo, w->dst + lo, (hi - lo) * sizeof(double)); }
+    PROF(prof_busy_since(w->t, LOGOS_PH_RELOCATE, s4);)
+    return NULL;
+}
+static int knot_place_list(double *a, double *dst, size_t n, const knot_plan_t *K, int P, int plain) {
+    if (n >= (size_t)LIST_END - 1 || !K->npc) return 0;
+    size_t grain = P > 1 ? n / ((size_t)P * 8) : n; if (grain < 65536) grain = 65536;
+    size_t nu = K->nsg; for (size_t q = 0; q < K->npc; q++) if (K->pc[q].copy) nu += (K->pc[q].len + grain - 1) / grain;   /* an upper bound: staged k >= 3 pieces are counted too */
+    uint32_t *nx = malloc(n * sizeof(uint32_t)); lunit_t *u = malloc((nu ? nu : 1) * sizeof *u);
+    list_arg_t *w = malloc((size_t)P * sizeof *w); pthread_t *th = malloc((size_t)P * sizeof *th);
+    if (!nx || !u || !w || !th) { free(nx); free(u); free(w); free(th); return 0; }
+    size_t m = 0, s = 0;
+    for (size_t q = 0; q < K->npc; ) {
+        if (s < K->nsg && K->sg[s].p0 == q) { lunit_t x = { 0, 0, K->sg[s].len, K->sg[s].dst, 0, 0, s, 0 }; u[m++] = x; q += K->sg[s].k; s++; continue; }
+        const kpiece_t *pc = &K->pc[q++];
+        for (size_t c0 = 0; c0 < pc->len; c0 += grain) {                       /* a lone piece's address is known at any offset, so it can be entered there */
+            size_t c1 = c0 + grain > pc->len ? pc->len : c0 + grain, lo = pc->rev ? pc->src + pc->len - c1 : pc->src + c0, hi = lo + (c1 - c0);
+            lunit_t x = { (uint32_t)(pc->rev ? hi - 1 : lo), (uint32_t)(pc->rev ? lo : hi - 1), c1 - c0, pc->dst + c0, lo, hi, SIZE_MAX, pc->rev }; u[m++] = x;
+        }
+    }
+    barrier_t bar; atomic_size_t q1, q2, q3; atomic_init(&q1, 0); atomic_init(&q2, 0); atomic_init(&q3, 0);
+    if (P > 1) barrier_init(&bar, P);
+    for (int t = 0; t < P; t++) { list_arg_t x = { a, dst, nx, n, K, u, m, &q1, &q2, &q3, &bar, P, t, plain }; w[t] = x; }
+    int made = par_spawn(th, P, list_worker, w, sizeof w[0], P > 1 ? &bar : NULL, NULL);   /* every phase is queue-driven: an orphan is dropped from the barrier and the others drain its share */
+    list_worker(&w[0]);
+    for (int t = 0; t < made; t++) pthread_join(th[t], NULL);
+    if (P > 1) barrier_destroy(&bar);
+    TRACE("knot, as a linked list: %zu units, %zu links of 4 bytes, P=%d%s", m, n, P, plain ? ", plain pointer walk" : "");
+    g_list_count++;
+    free(nx); free(u); free(w); free(th);
+    return 1;
+}
+#endif
+
 /* Returns 1 with a[] sorted, or 0 (a[] still a permutation of the input; the
  * caller continues on the normal path). dst: n-element scratch. */
+/* STRAYS INSIDE STRANDS (2026-09-21; ceiling: ./strandprobe 30 8388608 strays, A/B: ./unknotprobe 40 8388608 ab STRAY; off with
+ * LOGOS_NO_STRAY=1). Sorted blocks with a few late records in them used to pay for a full sort: every stray ended a run, and a few
+ * thousand of them pushed the average run under the detector's floor. The detector now LIFTS a stray where it finds one (an element
+ * below the run whose successor resumes it; one a gap above it; one accepted into the run whose successor falls back to the run;
+ * and any run of one or two elements, which is what a run that starts with a stray looks like), records its position, and reads
+ * on. Before the plan is made the holes are closed in one pass over the array, so every run stays contiguous and shorter and every
+ * search and offset of the plan holds. The strays are sorted apart (a small sort)
+ * and merged back IN PLACE OF the copy-back pass: the placement writes n - S elements into scratch, and one merge writes all n
+ * back. Sequential sorts only, at most n / 64 strays, ascending runs only (a stray inside a twisted run still ends it). If the plan
+ * declines after the holes were closed, the strays are written into the holes and the array is a permutation again. */
+static size_t g_stray_count = 0;            /* logos_twist_last(10): strays lifted by routes that completed; calling thread */
+static void stray_compact(double *a, size_t *runs, size_t R, const size_t *sp, size_t S, double *st) {
+    size_t w = 0, q = 0;                     /* one pass, left to right: every write lands below every unread element */
+    for (size_t k = 0; k < R; k++) {
+        size_t s = runs[2 * k], e = RUN_END(runs[2 * k + 1]), tw = runs[2 * k + 1] & RUN_TWIST, ns = w, p = s;
+        while (q < S && sp[q] < s) { st[q] = a[sp[q]]; q++; }                 /* strays between runs */
+        while (q < S && sp[q] <= e) { size_t len = sp[q] - p; memmove(a + w, a + p, len * sizeof(double)); w += len; st[q] = a[sp[q]]; p = sp[q] + 1; q++; }
+        memmove(a + w, a + p, (e + 1 - p) * sizeof(double)); w += e + 1 - p;
+        runs[2 * k] = ns; runs[2 * k + 1] = (w - 1) | tw;
+    }
+    while (q < S) { st[q] = a[sp[q]]; q++; }
+}
+/* the inverse, when the plan declines after the holes were closed: expand from the right, strays back at their positions */
+static void stray_restore(double *a, size_t n, const size_t *sp, size_t S, const double *st) {
+    size_t w = n - S, q = S;
+    for (size_t p = n; p-- > 0;) { if (q > 0 && sp[q - 1] == p) a[p] = st[--q]; else a[p] = a[--w]; }
+}
+static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, double *vmin, double *vmax);
+/* the strays sorted, then merged with the placed n - S elements of dst into a: this pass replaces the copy-back */
+static void stray_finish(double *a, const double *dst, size_t m, double *st, size_t S) {
+    ns_depth++; psort_f64(st, S, 1, NULL, NULL, NULL, NULL); ns_depth--;
+    size_t i = 0, o = 0;
+    for (size_t q = 0; q < S; q++) {
+        double v = st[q]; size_t lo = i, hi = m;
+        while (lo < hi) { size_t mid = lo + ((hi - lo) >> 1); if (dst[mid] < v) lo = mid + 1; else hi = mid; }
+        if (lo > i) { memcpy(a + o, dst + i, (lo - i) * sizeof(double)); o += lo - i; i = lo; }
+        a[o++] = v;
+    }
+    if (i < m) memcpy(a + o, dst + i, (m - i) * sizeof(double));
+}
+
+/* ONE STRAND, STRAYS PUT BACK IN PLACE (2026-09-22, tsbench's edge round). When the detector leaves one run and lifted strays, the
+ * strand is one sorted sequence stored with holes where the strays were. It used to be finished in three full passes: holes closed,
+ * the strand copied to scratch, the sorted strays merged back (20.7 of 34 ms on a strand with 1% adjacent swaps, whose 820 strays
+ * each sit one or two positions from home). The short-reach route's put-back applies unchanged: a strand element's final place is its
+ * rank in the strand plus the strays below it, so between two events (a hole, a stray's insertion point) every element moves by the
+ * SAME amount, and the array is a list of segments, each one memmove. Segments that move left go first, left to right; then those
+ * that move right, right to left; then each stray is written to its slot (reach_place_strays argues why nothing unread is
+ * overwritten). One stray costs one memmove of the span it travels, so strays near home cost almost nothing. The positions are a
+ * permutation whatever the binary searches answer, so a NaN in the strand costs order, never elements. LOGOS_ONERUN_COPY=1: the
+ * three passes, for the A/B. */
+typedef struct { size_t src, len, dst; } sseg_t;
+static void strand_place_strays(double *a, size_t n, const size_t *sp, size_t S, const double *T, sseg_t *sg, size_t *tpos) {
+    size_t ns = 0, ti = 0, cb = 0;
+    for (size_t k = 0; k <= S; k++) {                                 /* piece k: between hole k-1 and hole k */
+        size_t lo = k ? sp[k - 1] + 1 : 0, hi = k < S ? sp[k] : n, p = lo;
+        if (hi <= lo) continue;
+        while (ti < S && p < hi && T[ti] <= a[hi - 1]) {               /* this stray sorts before some element of this piece */
+            size_t L = p, R = hi; double v = T[ti];
+            while (L < R) { size_t m = L + ((R - L) >> 1); if (a[m] < v) L = m + 1; else R = m; }
+            if (L > p) { sg[ns].src = p; sg[ns].len = L - p; sg[ns].dst = cb + (p - lo) + ti; ns++; }
+            tpos[ti] = cb + (L - lo) + ti; ti++; p = L;
+        }
+        if (hi > p) { sg[ns].src = p; sg[ns].len = hi - p; sg[ns].dst = cb + (p - lo) + ti; ns++; }
+        cb += hi - lo;
+    }
+    for (; ti < S; ti++) tpos[ti] = cb + ti;                           /* above every strand element */
+    for (size_t i = 0; i < ns; i++) if (sg[i].dst < sg[i].src) memmove(a + sg[i].dst, a + sg[i].src, sg[i].len * sizeof(double));
+    for (size_t i = ns; i-- > 0;) if (sg[i].dst > sg[i].src) memmove(a + sg[i].dst, a + sg[i].src, sg[i].len * sizeof(double));
+    for (size_t i = 0; i < S; i++) a[tpos[i]] = T[i];
+}
+
 static int relocate_try_f64(double *a, size_t n, int P, double *dst) {
-    if (!reloc_sample_gate(a, n)) { TRACE("reloc: sample gate declined"); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
-    size_t R = 0; size_t *runs = detect_runs_parallel(a, n, P, &R);
-    TRACE("reloc: detect_runs_parallel -> %s, R=%zu", runs ? "runs" : "bail", R);
-    if (!runs) { PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
-    if (R < 2) { free(runs); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
+    { const char *e = getenv("LOGOS_RELOC_AVG"); long v = e ? atol(e) : 0;
+      g_reloc_avg = v >= 16 ? (size_t)v : (P > 1 && n >= MIN_PARALLEL) ? RELOC_MIN_AVG_RUN_PAR : RELOC_MIN_AVG_RUN_SEQ; }
+#ifndef LOGOS_NO_KNOT
+    int kpar = P > 1 && n >= MIN_PARALLEL;
+    double kfrac = g_knot_on ? (kpar ? g_knot_frac_par : g_knot_frac_seq) : 0.0, kfew = kpar ? kfrac : g_knot_frac_few;
+#else
+    double kfrac = 0.0, kfew = 0.0;
+#endif
+    if (!reloc_sample_gate(a, n, kfrac, kfew)) { TRACE("reloc: sample gate declined"); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
+#ifdef LOGOS_NO_TWIST
+    int twist = 0;
+#else
+    int twist = !getenv("LOGOS_NO_TWIST");      /* read where the route starts, never on a small sort's path: this is reached from RELOC_MIN_N up */
+#endif
+#ifndef LOGOS_NO_KNOT
+    g_twist_generic = twist && getenv("LOGOS_TWIST_GENERIC") != NULL;
+#endif
+#ifdef LOGOS_NO_FASTSCAN
+    int fast = 0;
+#else
+    int fast = getenv("LOGOS_NO_FASTSCAN") ? 0 : getenv("LOGOS_FASTSCAN_HOLD8") ? 1 : 2;   /* 1: eight scalar steps after any failed block */
+#endif
+#ifdef LOGOS_NO_KINK
+    int kink = 0;
+#else
+    int kink = !getenv("LOGOS_NO_KINK");
+#endif
+    size_t R = 0, *sp = NULL, S = 0; int stray_on = g_stray_on && (P == 1 || n < MIN_PARALLEL) && ns_depth == 0;
+    size_t *runs = detect_runs_parallel(a, n, P, &R, kfrac, twist, fast, kink, stray_on ? &sp : NULL, &S);
+    TRACE("reloc: detect_runs_parallel -> %s, R=%zu, strays=%zu", runs ? "runs" : "bail", R, S);
+    if (!runs) { free(sp); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
+    /* ONE STRAND (2026-09-22, found by tsbench's kinks row): one sorted strand with 1% adjacent swaps. The detector swapped the kinks
+       back and lifted the tangled ones as strays, which left ONE run, and a plan needs two: the route declined and the leaf re-sorted an
+       array that was sorted but for 820 elements (0.11 against a merge sort that only reverses and bypasses; 0.90 against std::sort).
+       One run and no strays is a sorted array (or its mirror); one run with strays is placed by the strays' own merge. LOGOS_NO_ONERUN=1:
+       off, for the A/B (./tsbench ... onerun). */
+    if (R == 1 && !g_onerun_off) {
+        size_t s0 = runs[0], e0 = RUN_END(runs[1]); int rv0 = RUN_REV(runs[1]);
+        if (!S && s0 == 0 && e0 == n - 1) {
+            if (rv0) for (size_t l = 0, r = n - 1; l < r; l++, r--) { double x = a[l]; a[l] = a[r]; a[r] = x; }
+            TRACE("reloc: one run, %s: done", rv0 ? "descending" : "ascending"); free(runs); g_onerun_count++; PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 1;
+        }
+        if (S && S < n) {
+            double *st1 = malloc(S * sizeof(double));
+            if (st1 && !rv0 && !g_onerun_copy) {                      /* in place: one memmove per segment (strand_place_strays) */
+                sseg_t *sg = malloc((2 * S + 2) * sizeof *sg); size_t *tpos = malloc(S * sizeof *tpos);
+                if (sg && tpos) {
+                    for (size_t q = 0; q < S; q++) st1[q] = a[sp[q]];
+                    ns_depth++; psort_f64(st1, S, 1, NULL, NULL, NULL, NULL); ns_depth--;
+                    strand_place_strays(a, n, sp, S, st1, sg, tpos);
+                    TRACE("reloc: one run and %zu strays: put back in place", S); g_stray_count += S; g_onerun_count++;
+                    free(sg); free(tpos); free(st1); free(sp); free(runs); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 1;
+                }
+                free(sg); free(tpos);                                  /* no room for the plan: the three passes below */
+            }
+            if (st1) {
+                stray_compact(a, runs, 1, sp, S, st1);            /* the strand now fills [0, n - S) */
+                strand_copy(dst, a, n - S, rv0);                   /* the merge reads it from scratch and writes the array */
+                stray_finish(a, dst, n - S, st1, S);
+                TRACE("reloc: one run and %zu strays: merged", S); g_stray_count += S; g_onerun_count++;
+                free(st1); free(sp); free(runs); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 1;
+            }
+        }
+    }
+    if (R < 2) { free(runs); free(sp); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }
+    /* strays: close the holes before the plan reads the runs; a decline below puts them back into the holes */
+    double *st = NULL; size_t n_eff = n;
+    if (S) {
+        st = malloc(S * sizeof(double));
+        if (!st) { free(sp); free(runs); PROF(prof_phase(LOGOS_PH_RELOC_PROBE);) return 0; }   /* nothing moved yet: the runs hold strays, not a plan */
+        stray_compact(a, runs, R, sp, S, st); n_eff = n - S;
+    }
+#define STRAY_BAIL() do { if (S) stray_restore(a, n, sp, S, st); free(st); free(sp); } while (0)
+    int cb = !g_reloc_nocopy && !S;                    /* the placements copy back themselves unless the strays' merge does it, or the ceiling switch is set */
     rdesc_t *d; size_t *ch, nc, merged;
     int ok = runs_plan(a, runs, R, &d, &ch, &nc, &merged); free(runs);
     PROF(prof_phase(LOGOS_PH_RELOC_PROBE);)
-    if (!ok) return 0;
+    if (!ok) { STRAY_BAIL(); return 0; }
+    size_t ntw = 0; for (size_t q = 0; q < R; q++) ntw += (size_t)d[q].rev;
     TRACE("reloc: plan chains=%zu merged=%zu (gate n/2=%zu)", nc, merged, n / 2);
-    if (merged > n / 2) { free(d); free(ch); return 0; }
+#ifndef LOGOS_NO_KNOT
+    if (kfrac > 0 && n >= (size_t)KNOT_MIN_AVG_RUN * R) {
+        int Pk = n < MIN_PARALLEL ? 1 : P;
+        size_t grain = n + 1;
+        if (Pk > 1) { grain = n / ((size_t)Pk * 8); if (grain < KNOT_GRAIN_MIN) grain = KNOT_GRAIN_MIN; }
+        knot_plan_t K;
+        if (knot_plan(a, d, R, grain, 1, &K)) {
+            /* Thread policy: relocation's one thread per RELOC_MIN_PER_THREAD elements was measured on pure copies, which
+             * are bandwidth-bound. A merge is compute-bound, about three copies' worth per element per level, and the first
+             * cut of this route inherited the copy cap: at 1M it placed on 2 threads what the partition it displaced sorted
+             * on 10, and the heavily crossed shapes LOST there (80% crossing 0.84, three strands 0.94) while winning 1.2-1.5x
+             * at 8.4M where the cap does not bind. So the cap counts work, not elements. */
+            { size_t work = n + KNOT_MERGE_WEIGHT * K.cost, pm = work / RELOC_MIN_PER_THREAD; if (pm < 1) pm = 1; if ((size_t)Pk > pm) Pk = (int)pm; }
+            double kf = R > MERGE_MAX_RUNS ? kfrac : kfew;
+            int go = K.total == n_eff && ((double)K.cost <= kf * (double)n || merged <= n / 2);
+            TRACE("knot: R=%zu chains=%zu in-chains=%zu | crossing=%zu cost=%zu kmax=%zu pieces=%zu merges=%zu (k>=3: %zu) gate %.2f -> %s",
+                  R, nc, merged, K.crossing, K.cost, K.kmax, K.npc, K.nsg, K.n3, kf, go ? "untie" : "decline");
+            size_t *krl = NULL; knot_arg_t *kw = NULL; pthread_t *kth = NULL; unsigned char *korph = NULL;
+            if (go && K.n3) { krl = knot_rl(&K); if (!krl) go = 0; }
+            /* the literal linked list, opt-in (see knot_place_list); it declines without touching anything and the array placement follows */
+            if (go && !S && cb && getenv("LOGOS_KNOT_LIST") && knot_place_list(a, dst, n, &K, Pk, getenv("LOGOS_LIST_PLAIN") != NULL)) {
+                g_twist_knot += ntw;                                  /* twisted strands, consumed as links that point the other way */
+                free(krl); knot_plan_free(&K); free(d); free(ch); return 1; }
+            if (go) { kw = malloc((size_t)Pk * sizeof *kw); kth = malloc((size_t)Pk * sizeof *kth); korph = calloc((size_t)Pk, 1); if (!kw || !kth || !korph) go = 0; }
+            if (go) {
+                barrier_t kbar; atomic_size_t nx2, nx3; atomic_init(&nx2, 0); atomic_init(&nx3, 0);
+                if (Pk > 1) barrier_init(&kbar, Pk);
+                for (int t = 0; t < Pk; t++) { knot_arg_t w = { a, dst, n_eff, Pk, t, &K, krl, &nx2, &nx3, &kbar, NULL, cb }; kw[t] = w; }
+                int kmade = par_spawn(kth, Pk, knot_worker, kw, sizeof kw[0], Pk > 1 ? &kbar : NULL, korph);   /* as in relocation */
+                kw[0].orphan = korph;
+                knot_worker(&kw[0]);
+                for (int t = 0; t < kmade; t++) pthread_join(kth[t], NULL);
+                if (Pk > 1) barrier_destroy(&kbar);
+                TRACE("knot: copies + crossing merges + copyback done (P=%d), %zu of %zu strands twisted, %zu strays", Pk, ntw, R, S);
+                g_twist_knot += ntw;
+                if (S) { stray_finish(a, dst, n_eff, st, S); g_stray_count += S; }
+                free(st); free(sp);
+                free(kw); free(kth); free(korph); free(krl); knot_plan_free(&K); free(d); free(ch);
+                return 1;
+            }
+            free(kw); free(kth); free(korph); free(krl); knot_plan_free(&K);
+        }
+    }
+#endif
+    if (merged > n / 2) { free(d); free(ch); STRAY_BAIL(); return 0; }
     size_t *off = malloc(R * sizeof(size_t)), *rl = malloc(2 * R * sizeof(size_t));
-    if (!off || !rl) { free(d); free(ch); free(off); free(rl); return 0; }
+    if (!off || !rl) { free(d); free(ch); free(off); free(rl); STRAY_BAIL(); return 0; }
     for (size_t q = 0, o = 0; q < R; q++) { off[q] = o; rl[2 * q] = o; rl[2 * q + 1] = o + d[q].len - 1; o += d[q].len; }
     /* Relocation's parallel form has a serial middle (plan) and a spawn; below RELOC_MIN_PER_THREAD elements
        per thread it lost to the sequential form (block_perm 316k: 1.4 vs 1.0 ms with 3 threads; 1M: 2.5 vs 2.7
@@ -3474,20 +4931,411 @@ static int relocate_try_f64(double *a, size_t n, int P, double *dst) {
     if (n < MIN_PARALLEL) P = 1;
     { size_t pm = n / RELOC_MIN_PER_THREAD; if (pm < 1) pm = 1; if ((size_t)P > pm) P = (int)pm; }
     barrier_t bar; atomic_size_t next; atomic_init(&next, 0);
-    reloc_arg_t *wa = malloc((size_t)P * sizeof *wa); pthread_t *th = malloc((size_t)P * sizeof *th);
-    if (!wa || !th) { free(wa); free(th); free(off); free(rl); free(d); free(ch); return 0; }
+    reloc_arg_t *wa = malloc((size_t)P * sizeof *wa); pthread_t *th = malloc((size_t)P * sizeof *th); unsigned char *orphan = calloc((size_t)P, 1);
+    if (!wa || !th || !orphan) { free(wa); free(th); free(orphan); free(off); free(rl); free(d); free(ch); STRAY_BAIL(); return 0; }
     if (P > 1) barrier_init(&bar, P);
-    for (int t = 0; t < P; t++) { reloc_arg_t w = { a, dst, n, R, nc, P, t, d, off, ch, rl, &next, &bar }; wa[t] = w; }
-    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, reloc_worker, &wa[t]);   /* same assumption as psort_f64 */
+    for (int t = 0; t < P; t++) { reloc_arg_t w = { a, dst, n_eff, R, nc, P, t, d, off, ch, rl, &next, &bar, NULL, cb }; wa[t] = w; }
+    /* static output tiles and a barrier: an orphan is dropped from the barrier and the caller fills and copies back its tile */
+    int rel_made = par_spawn(th, P, reloc_worker, wa, sizeof wa[0], P > 1 ? &bar : NULL, orphan);
+    wa[0].orphan = orphan;
     reloc_worker(&wa[0]);
-    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
-    TRACE("reloc: copy+merge+copyback done (P=%d)", P);
+    for (int t = 0; t < rel_made; t++) pthread_join(th[t], NULL);
+    TRACE("reloc: copy+merge+copyback done (P=%d), %zu of %zu runs twisted, %zu strays", P, ntw, R, S);
+    g_twist_reloc += ntw;
+    if (S) { stray_finish(a, dst, n_eff, st, S); g_stray_count += S; }
+    free(st); free(sp);
+#undef STRAY_BAIL
     if (P > 1) barrier_destroy(&bar);
-    free(wa); free(th); free(off); free(rl); free(d); free(ch);
+    free(wa); free(th); free(orphan); free(off); free(rl); free(d); free(ch);
     return 1;
 }
 #endif
 
+
+/* ===================== short reach: sort where it lies, repair only the seams =====================
+ * The knot route priced how many strands cross. This route prices how FAR the disorder reaches. In an event log whose
+ * records arrive with bounded latency, in a series shuffled inside small windows, in anything jittered around its own
+ * order, every element already sits near its final place: no inverted pair is further apart than some reach rho, and
+ * rho is a few thousand positions in an array of millions. The partition does not know that. It samples, scatters all
+ * n elements into a second buffer (the writes happen to land nearly in order, so it is fast, but it is still a pass out
+ * and a pass back) and sorts 33k-element buckets there.
+ *
+ * If rho is small the scatter is unnecessary: cut the array into index blocks of B >= 4 rho, sort every block WHERE IT
+ * LIES, in parallel (a flash sort of the route's own: see reach_sort_direct), and then look only at the seams. For the seam between sorted blocks L
+ * and R: y = the elements of L greater than R[0], x = the elements of R less than the last of L, both by binary search.
+ * Merging those two pieces in place sorts L u R, and what crosses a seam rightward is matched by what crosses leftward,
+ * so nothing else moves. The seams are independent, and the result is globally sorted, as long as every block keeps an
+ * untouched middle. That is GUARANTEED here rather than hoped for: with m(k) the median of sorted block k, an element
+ * of block k below m(k-1) or above m(k+1) is a STRAY and is set aside first; what is left of block k lies in
+ * [m(k-1), m(k+1)], so x(k) counts elements below m(k), y(k+1) counts elements above it, and m(k) itself is in neither.
+ *
+ * Strays (one late event, a zero in a column of timestamps) are what a sample cannot see, and they decide the cost:
+ *   none: block sort + seams, in place. No n-sized buffer is ever asked for.
+ *   a few, found by the block sorts: they are sorted apart and put back by ONE in-place shift pass. Between two strays
+ *     every element moves by the same amount, so the pass is a handful of memmoves over exactly the span the strays
+ *     travel, which is the movement any algorithm owes them. (The first cut merged them through a second buffer: two
+ *     parallel passes, +36 ms at one thread and +12 ms at 14 for a single stray.)
+ *   in many blocks, in a sort wider than four threads: the serial shift pass costs what the route saves there. Eight probe
+ *     blocks are held against their fences before a thread is started or an element moved (0.05-0.1 ms); two that break
+ *     one decline. Up to four threads strays are simply put back (1.5-1.8x at one thread with strays in every block).
+ *   more than n/32, or medians that do not ascend: not this structure. Decline; the rest of the dispatcher gets an
+ *     array of sorted blocks, which its run routes like.
+ *
+ * The gate reads the dispatcher's sample and four small windows, never the array. Sample indices i and i+L sit
+ * |frac(L phi)| n positions apart; for the Fibonacci lags 144, 233, 377, 610, 987, 1597 that is 0.31%, 0.19%, 0.12%,
+ * 0.073%, 0.045% and 0.028% of n, a ladder of distances. The reach estimate is the smallest rung from which no distance
+ * shows more than REACH_TAU inverted pairs (a stray inverts its pair at every distance, so the tolerance is what lets a
+ * few strays through). Random data fails the first rung, which the shared sample has already read, so it pays nothing.
+ * Then four 4096-element windows must show DENSE adjacent descents: sparse disorder on sorted data is the near-sorted
+ * route's kind and is left to it.
+ *
+ * Ceilings first (make reachhunt, FINDINGS 3af): told the structure, blocks + seams beat the shipped engine 1.28-1.37x
+ * at one thread and 1.18-1.24x at 14 on the two bounded-displacement shapes of the zoo; cut decomposition and chunk
+ * relocation were measured beside it and are not built. MEASURED as built (make reachbench, 8.4M, route off / on in one
+ * binary): event log with latency < 4096 ms 1.91 / 1.31 (1 / 14 threads), 2048-element shuffled windows 2.22 / 1.38, noise
+ * of +-1000 2.05 / 1.33, latency < 512 ms 2.38 / 1.49; more at 30M (2.1-2.9 / 1.5-1.8); guards 0.98-1.03 against the engine
+ * before it, layout cancelled. It weighs 0.10 bytes per element at one thread and 1.33 at 14 (make memprobe), against
+ * 15.5 and 23.2. Off at runtime with LOGOS_NO_REACH=1, at compile time with -DLOGOS_NO_REACH. f64 only; above ~117M
+ * elements the ladder's finest rung is coarser than a block may be and the gate declines. */
+#if (defined(LOGOS_STRIDE_SAMPLE) || defined(LOGOS_NO_SODO)) && !defined(LOGOS_NO_REACH)
+#define LOGOS_NO_REACH                /* the gate is a ladder of Weyl lags over the shared sample: no Weyl sample, no route */
+#endif
+#ifndef LOGOS_NO_REACH
+#ifndef REACH_MIN_N
+#define REACH_MIN_N      (1u << 18)
+#endif
+#ifndef REACH_TAU
+#define REACH_TAU        0.02         /* inverted share of the sampled pairs a rung may show and still count as past the reach */
+#endif
+#ifndef REACH_BLOCK
+#define REACH_BLOCK      32768        /* a block, its scratch and its context stay in L2: the size of a partition leaf */
+#endif
+#ifndef REACH_BLOCK_MAX
+#define REACH_BLOCK_MAX  131072       /* past this the block sort is no longer an in-cache sort and the route has no edge */
+#endif
+#define REACH_MIN_BLOCKS 8
+#ifndef REACH_DENSE
+#define REACH_DENSE      0.25         /* adjacent descents in the probe windows; below this the disorder is sparse */
+#endif
+#define REACH_STRAY_DIV  32           /* more strays than n/32: decline */
+#define REACH_PROBES     8
+#ifndef REACH_TOLERANT_P
+#define REACH_TOLERANT_P  4
+#endif
+static _Thread_local int g_reach_last = LOGOS_REACH_NOT_TRIED;      /* logos_reach_last(): what this route did on the last top-level f64 sort */
+/* The ladder. Returns the reach estimate in elements, 0 when even the longest rung is inverted too often. raw[] is the
+ * dispatcher's gate sample in Weyl order; it is 2048 points from six threads up and 384 at one, which has room for two
+ * rungs only, so below 2048 the ladder reads its own points (the first m are the same ones; ~20 us, and only for data
+ * that has already passed the first rung). Positions are computed once; every rung after that is compares. */
+#define REACH_LADDER_M 2048
+/* noinline: its two 16 KB arrays would otherwise land in the dispatcher's frame, whose prologue probes every page of it on EVERY
+   call, the three-element ones included (measured: +2 probes, +0.8 ns at n = 0 and 1, before this attribute). */
+static __attribute__((noinline)) size_t reach_from_sample(const double *a, size_t n, const double *raw, size_t m, int mirror) {   /* mirror: the ladder of the array read back to front */
+    static const unsigned short LAG[6] = { 144, 233, 377, 610, 987, 1597 };
+    double own[REACH_LADDER_M]; size_t pos[REACH_LADDER_M];
+    if (n < REACH_LADDER_M) return 0;
+    if (m < REACH_LADDER_M) { int nan = 0; sample_read(a, n, 0, REACH_LADDER_M, REACH_LADDER_M, own, &nan); if (nan) return 0; raw = own; }
+    m = REACH_LADDER_M;
+    for (size_t i = 0; i < m; i++) pos[i] = SAMPLE_POS(i, m, n);
+    size_t best = 0;
+    for (int k = 0; k < 6; k++) {
+        size_t L = LAG[k], inv = 0, comps = 0, dist = 0;
+        for (size_t i = 0; i + L < m; i++) {
+            size_t p0 = pos[i], p1 = pos[i + L]; if (p0 == p1) continue;
+            size_t d = p1 > p0 ? p1 - p0 : p0 - p1; if (d > n / 2) continue;              /* a wrapped pair: a whole array apart, not this rung */
+            comps++; dist = d; { double lo_ = p1 > p0 ? raw[i] : raw[i + L], hi_ = p1 > p0 ? raw[i + L] : raw[i]; if (mirror ? lo_ < hi_ : lo_ > hi_) inv++; }   /* lo_: the EARLIER position */
+        }
+        if (comps < 64 || (double)inv > REACH_TAU * (double)comps) break;
+        best = dist;
+    }
+    return best;
+}
+static size_t reach_upper_bound(const double *a, size_t lo, size_t hi, double v) { while (lo < hi) { size_t m = lo + ((hi - lo) >> 1); if (a[m] <= v) lo = m + 1; else hi = m; } return lo; }
+typedef struct { size_t src, len, dst; } reach_seg_t;
+typedef struct {
+    double *a, *T, *fence; size_t n, B, S; int K, go, leafmode, tolerant;   /* go: 0 decline, 1 seams only, 2 seams, then the strays are put back */
+    size_t *lo, *hi, *x, *y;                                           /* per block: core [lo,hi) and the seam counts */
+    atomic_size_t nblk, nseam, nstrayblk;
+    barrier_t *bar;
+} reach_job_t;
+typedef struct { reach_job_t *j; ctx_t *ctx; double *scratch; int tid; } reach_arg_t;
+static inline size_t reach_s(const reach_job_t *j, int k) { return (size_t)k * j->B; }
+static inline size_t reach_e(const reach_job_t *j, int k) { return k + 1 == j->K ? j->n : (size_t)(k + 1) * j->B; }
+/* A block is sorted by the leaf, and the leaf's flash and coarse sorts map values linearly onto classes: one stray (a
+ * zero in a column of timestamps) stretches that map until every real element lands in one class. Measured on the first
+ * cut: the block sorts of latency + 0.01% strays took 15.7 ms at 14 threads against 9.2 without the strays, a sentinel
+ * shape 27 against 10. So a block is first held against two FENCES, the estimated medians of its neighbours (nine
+ * strided elements each, read before any thread starts): min and max in one pass over a block the sort is about to load
+ * anyway, and only a block that breaks a fence is split three ways, its few strays sorted apart from its core. The
+ * block comes out fully sorted either way, so a fence that is wrong costs time and nothing else. */
+static inline double reach_est_median(const double *p, size_t len) {
+    double w[9]; size_t st = len / 9; for (int i = 0; i < 9; i++) w[i] = p[(size_t)i * st + st / 2];
+    insertion_sort(w, 0, 8); return w[4];
+}
+/* four independent chains each way: the compiler keeps them in registers and the pass runs at the speed of the loads */
+static void reach_minmax(const double *p, size_t nb, double *mn, double *mx) {
+    double l0 = p[0], l1 = l0, l2 = l0, l3 = l0, h0 = l0, h1 = l0, h2 = l0, h3 = l0; size_t i = 0;
+    for (; i + 4 <= nb; i += 4) { double v0 = p[i], v1 = p[i + 1], v2 = p[i + 2], v3 = p[i + 3];
+        l0 = v0 < l0 ? v0 : l0; l1 = v1 < l1 ? v1 : l1; l2 = v2 < l2 ? v2 : l2; l3 = v3 < l3 ? v3 : l3;
+        h0 = v0 > h0 ? v0 : h0; h1 = v1 > h1 ? v1 : h1; h2 = v2 > h2 ? v2 : h2; h3 = v3 > h3 ? v3 : h3; }
+    for (; i < nb; i++) { l0 = p[i] < l0 ? p[i] : l0; h0 = p[i] > h0 ? p[i] : h0; }
+    l0 = l1 < l0 ? l1 : l0; l2 = l3 < l2 ? l3 : l2; h0 = h1 > h0 ? h1 : h0; h2 = h3 > h2 ? h3 : h2;
+    *mn = l2 < l0 ? l2 : l0; *mx = h2 > h0 ? h2 : h0;
+}
+static int reach_breaks_fence(const reach_job_t *j, int k) {
+    double mn, mx; reach_minmax(j->a + reach_s(j, k), reach_e(j, k) - reach_s(j, k), &mn, &mx);
+    return (k > 0 && mn < j->fence[k - 1]) || (k + 1 < j->K && mx > j->fence[k + 1]);
+}
+/* The block sort proper. A block of this route is known to be densely disordered and, strays aside, spread over its own
+ * range, so sort_fn's prescan, run detection and probes (about 2 of its ~12 ns per element) are skipped and the block
+ * goes straight to a kernel: the AVX2 quicksort in a sequential sort, a flash sort otherwise. sort_fn's 40-pair probe
+ * also MISJUDGES these blocks when the reach is under its stride of n/40: it calls a block with latency < 512 nearly
+ * sorted, tries an insertion sort that gives up after 8n moves, and keeps the quicksort away (latency_512 at 14
+ * threads: 1.97x between the two block sorts, make reachbench with RB_OFF/RB_ON).
+ * The flash here is the engine's with two differences. Its classes are counted before anything is scattered, and a class
+ * above REACH_FLASH_MAXPOP sends the block to the general leaf instead: a block that straddles a quiet hour holds two
+ * clusters, the spread check between sample quantiles passes it, and the insertion pass would be quadratic inside a
+ * class. And a NaN indexes class 0 by a compare, not by the cast of a NaN. Returns 0 when the block is not its kind. */
+#define REACH_FLASH_MAXPOP 48
+static int reach_sort_direct(reach_arg_t *w, double *p, size_t nb, double mn, double mx, int mode) {
+    (void)mode;                                                        /* read by the AVX2 leaf only */
+    if (nb < FLASH_SORT_THRESHOLD || !(mx > mn) || !isfinite(mx - mn)) return 0;
+    if ((mx - mn) < (double)COUNTING_SORT_K * (double)nb) {           /* integers over a small span: the general leaf counts them, which no sort beats */
+        int ints = 1; size_t st8 = nb / 8; for (int q = 0; q < 8 && ints; q++) { double v = p[(size_t)q * st8]; ints = v == floor(v); }
+        if (ints) return 0;       /* (the first cut sent EVERY small span there: a series with unit spacing, i + noise, spans just under its length,
+                                     and its blocks took the general leaf: 293 ms at one thread on 64-element windows, 76 through this kernel) */
+    }
+#ifdef LOGOS_AVX2_LEAF
+    if (mode == 1 && w->ctx->seq && avx2_leaf_on() && avx2_qsort_f64(p, nb)) { PATH_TAG(w->ctx, LOGOS_PATH_SIMD); return 1; }
+#endif
+    { size_t st = nb / 32, desc = 0; for (size_t i = 0; i + 1 < nb && !desc; i += st) desc = p[i] > p[i + 1];
+      if (!desc) return 0; }                                         /* no descent in 32 looks: perhaps sorted already, which the general leaf settles in one pass */
+    /* Disorder that reaches two or three places is an insertion sort's: under two moves per element, where the flash below
+       makes three passes (noise of +-2 at one thread: 0.81 against the shipped engine with flash alone, which sorts that
+       shape by insertion). 64 strided pairs FOUR apart tell: reach 4 shows none inverted, noise of +-8 shows a quarter.
+       The momentum sort gives up past 8n moves and leaves a permutation behind, so a wrong guess costs time only. */
+    { size_t st = nb / 64, d4 = 0; for (size_t i = 0; i + 4 < nb; i += st) d4 += p[i] > p[i + 4];
+      if (d4 <= 3 && insertion_sort_momentum(p, 0, (long)nb - 1)) { PATH_TAG(w->ctx, LOGOS_PATH_INSERTION); return 1; } }
+    size_t m = nb; double scale = (double)(m - 1) / (mx - mn);
+    if (!isfinite(scale) || !(scale > 0)) return 0;
+    ctx_fit_t cf; if (!ctx_fit(w->ctx, nb, &cf)) return 0;
+    uint32_t *cnt = w->ctx->aux; double *buf = w->scratch; int ok = 1;
+    memset(cnt, 0, (m + 1) * sizeof(uint32_t));
+    for (size_t i = 0; i < nb; i++) { double d = (p[i] - mn) * scale; size_t idx = d >= 0 ? (size_t)d : 0; cnt[idx + 1]++; }
+    uint32_t big = 0; for (size_t i = 1; i <= m; i++) { if (cnt[i] > big) big = cnt[i]; cnt[i] += cnt[i - 1]; }
+    if (big > REACH_FLASH_MAXPOP) ok = 0;
+    else {
+        for (size_t i = 0; i < nb; i++) { double v = p[i], d = (v - mn) * scale; size_t idx = d >= 0 ? (size_t)d : 0; buf[cnt[idx]++] = v; }
+        insertion_sort(buf, 0, (long)nb - 1);
+        memcpy(p, buf, nb * sizeof(double));
+        PATH_TAG(w->ctx, LOGOS_PATH_FLASH);
+    }
+    ctx_unfit(w->ctx, &cf);
+    return ok;
+}
+static void reach_sort_range(reach_arg_t *w, double *p, size_t nb) {
+    ctx_fit_t cf; if (nb < 2) return;
+    if (ctx_fit(w->ctx, nb, &cf)) { double *r = leaf_f64(p, nb, w->scratch, w->ctx); if (r != p) memcpy(p, r, nb * sizeof(double)); ctx_unfit(w->ctx, &cf); }
+    else quicksort(p, 0, (long)nb - 1, 2 * log2i(nb));
+}
+static void reach_blocks(reach_arg_t *w) {
+    reach_job_t *j = w->j; size_t k;
+    while ((k = atomic_fetch_add(&j->nblk, 1)) < (size_t)j->K) {
+        size_t s = reach_s(j, (int)k), nb = reach_e(j, (int)k) - s; double *p = j->a + s;
+        PROF(prof_stamp_t s0 = prof_stamp(); w->ctx->path = LOGOS_PATH_NONE;)
+        double bmn, bmx; reach_minmax(p, nb, &bmn, &bmx);
+        double flo = k > 0 ? j->fence[k - 1] : -INFINITY, fhi = k + 1 < (size_t)j->K ? j->fence[k + 1] : INFINITY;
+        if (bmn < flo || bmx > fhi) {                                   /* lows | core | highs, then each part on its own */
+            size_t lt = 0, gt = nb, i = 0;
+            while (i < gt) { double v = p[i]; if (v < flo) { p[i] = p[lt]; p[lt] = v; lt++; i++; } else if (v > fhi) { gt--; p[i] = p[gt]; p[gt] = v; } else i++; }
+            reach_sort_range(w, p, lt); reach_sort_range(w, p + gt, nb - gt);
+            /* the core is what the block would have been without its strays: the same kernel, on its own range (the first cut gave it
+               to the general leaf: 242 of 256 blocks of latency + 0.01% strays took 206 ms at one thread, against ~55 for clean blocks) */
+            if (gt - lt > 1) { double cmn, cmx; reach_minmax(p + lt, gt - lt, &cmn, &cmx);
+                if (!(j->leafmode && reach_sort_direct(w, p + lt, gt - lt, cmn, cmx, j->leafmode))) reach_sort_range(w, p + lt, gt - lt); }
+            atomic_fetch_add_explicit(&j->nstrayblk, 1, memory_order_relaxed);
+        } else if (!(j->leafmode && reach_sort_direct(w, p, nb, bmn, bmx, j->leafmode))) reach_sort_range(w, p, nb);
+        PROF(double ms = prof_busy_since(w->tid, LOGOS_PH_BUCKETS, s0); prof_path(w->tid, w->ctx->path, nb, ms);)
+    }
+}
+/* One seam: the y elements at the end of core k-1 and the x at the start of core k, merged in place. The output runs
+ * through the end of core k-1 and then JUMPS the stray slots between the two cores (no strays: the jump is zero). It
+ * can never overtake the read pointer in R: after i elements from tmp and q from R it stands q - (y - i) <= q slots
+ * into R. When tmp is empty the output stands exactly on the read pointer and the rest of R is already in place. */
+static void reach_seams(reach_arg_t *w) {
+    reach_job_t *j = w->j; size_t k; double *tmp = w->scratch;
+    while ((k = atomic_fetch_add(&j->nseam, 1)) < (size_t)j->K) {
+        if (k == 0 || !j->y[k]) continue;
+        PROF(prof_stamp_t s0 = prof_stamp();)
+        size_t y = j->y[k], x = j->x[k]; double *o = j->a + j->hi[k - 1] - y, *oe = j->a + j->hi[k - 1];
+        memcpy(tmp, o, y * sizeof(double));
+        const double *p = tmp, *pe = tmp + y, *r = j->a + j->lo[k], *re = r + x;
+        while (p < pe && r < re) { double v; if (*r < *p) v = *r++; else v = *p++; *o++ = v; if (o == oe) o = j->a + j->lo[k]; }
+        while (p < pe) { *o++ = *p++; if (o == oe) o = j->a + j->lo[k]; }
+        PROF(prof_busy_since(w->tid, LOGOS_PH_NEARSORTED, s0);)
+    }
+}
+/* Between the block sorts and the seams, on the calling thread while the others wait at the barrier: medians, fences,
+ * strays, seam counts. Everything is checked, so data this route should never have met (a NaN the sample missed makes
+ * every binary search meaningless) ends in a decline or in a permutation, never in a write out of bounds. */
+static void reach_plan(reach_job_t *j) {
+    double *a = j->a; int K = j->K; size_t S = 0;
+    j->go = 0;
+    for (int k = 0; k < K; k++) {
+        size_t s = reach_s(j, k), e = reach_e(j, k), mid = s + (e - s) / 2;
+        double mlo = k > 0 ? a[reach_s(j, k - 1) + (reach_e(j, k - 1) - reach_s(j, k - 1)) / 2] : a[s];
+        double mhi = k + 1 < K ? a[reach_s(j, k + 1) + (reach_e(j, k + 1) - reach_s(j, k + 1)) / 2] : a[e - 1];
+        if (!(mlo <= a[mid]) || !(a[mid] <= mhi)) { TRACE("reach: medians do not ascend at block %d -> decline", k); return; }
+        size_t lo = k > 0 ? lower_bound_d(a, s, e, mlo) : s, hi = k + 1 < K ? reach_upper_bound(a, s, e, mhi) : e;
+        if (!(lo <= mid && mid < hi)) { TRACE("reach: core of block %d lost its median -> decline", k); return; }
+        j->lo[k] = lo; j->hi[k] = hi; S += (lo - s) + (e - hi);
+    }
+    if (S > j->n / REACH_STRAY_DIV) { TRACE("reach: %zu strays of %zu -> decline", S, j->n); return; }
+    j->x[0] = j->y[0] = 0; j->y[K] = 0;
+    for (int k = 1; k < K; k++) {
+        double lfirst = a[j->lo[k]], llast = a[j->hi[k - 1] - 1]; j->x[k] = j->y[k] = 0;
+        if (!(lfirst < llast)) continue;
+        j->y[k] = j->hi[k - 1] - reach_upper_bound(a, j->lo[k - 1], j->hi[k - 1], lfirst);
+        j->x[k] = lower_bound_d(a, j->lo[k], j->hi[k], llast) - j->lo[k];
+    }
+    for (int k = 0; k < K; k++) if (j->x[k] + j->y[k + 1] >= j->hi[k] - j->lo[k]) { TRACE("reach: block %d keeps no middle -> decline", k); return; }
+    j->S = S; j->go = S ? 2 : 1;
+}
+/* The strays go back in, in place. The cores are one sorted sequence now, stored with holes where the strays were; the
+ * strays are sorted in T. A core element's final place is its rank among the cores plus the strays below it, so between
+ * two consecutive events (a hole, a stray's insertion point) every element moves by the SAME amount: the array is a list
+ * of segments, each one memmove. Order: segments that move left, left to right; then segments that move right, right to
+ * left. A left-mover lands on holes or on where an earlier left-mover used to be, never on a right-mover's source (its
+ * target starts past that source's end), and a right-mover's target ends where its right neighbour's final place
+ * begins, which by then holds nothing unread. Then every stray is written to its slot. One stray costs one memmove of
+ * the span it travels. sg[] and tpos[] were sized before anything moved: from here on nothing can fail. */
+static void reach_place_strays(reach_job_t *j, reach_seg_t *sg, size_t *tpos) {
+    double *a = j->a; const double *T = j->T; size_t S = j->S, ns = 0, ti = 0, cb = 0;
+    for (int k = 0; k < j->K; k++) {
+        size_t lo = j->lo[k], hi = j->hi[k], p = lo;
+        while (ti < S && p < hi && T[ti] <= a[hi - 1]) {                /* this stray sorts before some element of this core */
+            size_t q = lower_bound_d(a, p, hi, T[ti]);
+            if (q > p) { sg[ns].src = p; sg[ns].len = q - p; sg[ns].dst = cb + (p - lo) + ti; ns++; }
+            tpos[ti] = cb + (q - lo) + ti; ti++; p = q;
+        }
+        if (hi > p) { sg[ns].src = p; sg[ns].len = hi - p; sg[ns].dst = cb + (p - lo) + ti; ns++; }
+        cb += hi - lo;
+    }
+    for (; ti < S; ti++) tpos[ti] = cb + ti;                            /* above every core element (and any NaN among them) */
+    for (size_t i = 0; i < ns; i++) if (sg[i].dst < sg[i].src) memmove(a + sg[i].dst, a + sg[i].src, sg[i].len * sizeof(double));
+    for (size_t i = ns; i-- > 0;) if (sg[i].dst > sg[i].src) memmove(a + sg[i].dst, a + sg[i].src, sg[i].len * sizeof(double));
+    for (size_t i = 0; i < S; i++) a[tpos[i]] = T[i];
+}
+static void *reach_worker(void *p) {
+    reach_arg_t *w = p; reach_job_t *j = w->j;
+    reach_blocks(w);
+    if (j->bar) { barrier_wait(j->bar); barrier_wait(j->bar); }       /* all blocks sorted; then the caller has planned */
+    if (j->go) reach_seams(w);
+    return NULL;
+}
+/* returns 1 if a[] is sorted; 0 if it declined, and then a[] is a permutation of what it was (possibly with blocks sorted) */
+static int reach_try_f64(double *a, size_t n, int P, size_t reach) {
+    if (!reach || ns_depth > 0 || (n < REACH_MIN_N && !g_reach_relax) || getenv("LOGOS_NO_REACH")) return 0;
+    g_reach_last = LOGOS_REACH_DECLINED_GATE;
+    size_t B = REACH_BLOCK; if (4 * reach > B) B = (4 * reach + 4095) & ~(size_t)4095;
+    if (B > REACH_BLOCK_MAX || n / B < (g_reach_relax ? 2u : (unsigned)REACH_MIN_BLOCKS)) { TRACE("reach: %zu needs blocks of %zu -> decline", reach, B); return 0; }
+    { size_t desc = 0, tot = 0;                                        /* dense or sparse? four windows, the near-sorted pre-gate's */
+      for (int w = 0; w < 4; w++) { size_t lo = (n / 5) * (size_t)(w + 1) - 2048, hi = lo + 4096; for (size_t i = lo; i < hi; i++) { desc += a[i] > a[i + 1]; tot++; } }
+      if ((double)desc < REACH_DENSE * (double)tot) { TRACE("reach: %zu descents in %zu -> sparse, decline", desc, tot); return 0; } }
+    int K = (int)(n / B); if (P > K) P = K; if (P < 1) P = 1;
+    size_t maxlen = n - (size_t)(K - 1) * B;                           /* the last block takes the remainder, under 2B */
+    reach_job_t j; memset(&j, 0, sizeof j); j.a = a; j.n = n; j.B = B; j.K = K;
+    { const char *lm = getenv("LOGOS_REACH_LEAF"); j.leafmode = lm ? atoi(lm) : 2; }   /* the A/B: 0 = every block through the general leaf, 1 = the AVX2 quicksort in a sequential sort */
+    atomic_init(&j.nblk, 0); atomic_init(&j.nseam, 0); atomic_init(&j.nstrayblk, 0);
+    j.fence = malloc((size_t)K * sizeof(double));
+    if (!j.fence) { g_reach_last = LOGOS_REACH_DECLINED_NOMEM; return 0; }
+    /* Strays show before a thread is started or an element moved: eight blocks spread over the array, min and max against
+       their fences. Two that break a fence end it, so data with strays everywhere pays for two blocks and six medians
+       (~0.05 ms at 8M); clean data reads all eight, which the block sorts were about to load anyway. The first cut found
+       strays by sorting: a late decline of ~3 ms at 14 threads. */
+    /* How many strays are worth putting back depends on the thread count. The shift pass that returns them is serial, at most
+       ~0.7 ns per element; what the route saves is ~7 ns per element at one thread and ~0.4 at fourteen. Up to four threads
+       strays are simply put back (n/32 of them at most): 1.5-1.8x at one thread and 1.07-1.56x at four on every stray shape of
+       the bench. Wider sorts ask eight probe blocks first and decline when two hold strays. Strays the probe did not see are
+       put back as well: a rule that stopped the block phase when strays kept turning up was measured DOMINATED (strays in 28%
+       of the blocks at 14 threads: 1.24x against the partition when put back, 0.78x when the phase stopped itself). */
+    j.tolerant = P <= REACH_TOLERANT_P;
+    int probe_bad = 0;
+    for (int q = 0; q < REACH_PROBES && probe_bad < 2 && !j.tolerant; q++) { int k = (int)(((size_t)q * 2 + 1) * (size_t)K / (2 * REACH_PROBES));
+        for (int d = -1; d <= 1; d += 2) if (k + d >= 0 && k + d < K) j.fence[k + d] = reach_est_median(a + reach_s(&j, k + d), reach_e(&j, k + d) - reach_s(&j, k + d));
+        probe_bad += reach_breaks_fence(&j, k); }
+    if (probe_bad >= 2) { TRACE("reach: reach %zu, but probe blocks hold strays -> decline", reach); free(j.fence); g_reach_last = LOGOS_REACH_DECLINED_PROBE; return 0; }
+    for (int k = 0; k < K; k++) j.fence[k] = reach_est_median(a + reach_s(&j, k), reach_e(&j, k) - reach_s(&j, k));
+#ifndef LOGOS_NO_SEAM
+    /* THE SEAM (2026-09-21): a noisy ring buffer read from the wrong slot passes the ladder (one pair per rung straddles the seam),
+       and the first cut sorted all 256 blocks before its plan saw that the medians do not ascend (100 ms at one thread, then the
+       knot route). The fences are those medians, read before anything is sorted: ascending everywhere but at ONE block, where they
+       drop by most of the range, means a rotation. The seam is the largest step down inside those two blocks; the dispatcher
+       rotates once and enters again. Sequential sorts only (the pass eats the gain at 14 threads). LOGOS_NO_SEAM=1: off. */
+    if (ns_depth == 0 && !g_seamed && !g_reach_relax && K >= 4 && !getenv("LOGOS_NO_SEAM")) {
+        int drops = 0, kd = -1; double fmin = j.fence[0], fmax = j.fence[0];
+        for (int k = 0; k < K; k++) { if (j.fence[k] < fmin) fmin = j.fence[k]; if (j.fence[k] > fmax) fmax = j.fence[k]; if (k + 1 < K && j.fence[k + 1] < j.fence[k]) { drops++; kd = k; } }
+        if (drops == 1 && kd >= 1 && kd + 2 < K && j.fence[kd] - j.fence[kd + 1] >= 0.5 * (fmax - fmin)) {
+            size_t lo = reach_s(&j, kd), hi = reach_e(&j, kd + 1) - 1, best = lo; double bd = -INFINITY;
+            for (size_t q = lo; q < hi; q++) { double d = a[q] - a[q + 1]; if (d > bd) { bd = d; best = q; } }
+            /* at P threads the rotation is one thread's pass and a parallel partition is cheap: decline BEFORE the block phase instead,
+               which the route used to run in full and then throw away (0.75 at 14 threads on a noisy ring buffer, tsbench) */
+            if (bd > 0) { if (P == 1) g_reach_seam = best + 1; TRACE("reach: the fences drop once, at block %d: a rotation, seam %zu (%s)", kd, best + 1, P == 1 ? "rotate" : "decline"); free(j.fence); g_reach_last = LOGOS_REACH_DECLINED_GATE; return 0; }
+        }
+    }
+#endif
+    size_t *meta = malloc(4 * ((size_t)K + 2) * sizeof(size_t)); reach_arg_t *wa = calloc((size_t)P, sizeof *wa);
+    ctx_t *ctxs = calloc((size_t)P, sizeof *ctxs); pthread_t *th = malloc((size_t)P * sizeof *th);
+    void *pb = NULL; uint8_t *pbi = NULL; int pooled = 0; double *scr = NULL;
+    if (meta && wa && ctxs && th) { pooled = pool_acquire((size_t)P * maxlen * sizeof(double), 0, &pb, &pbi); scr = pooled ? (double *)pb : malloc((size_t)P * maxlen * sizeof(double)); }
+#ifndef LOGOS_NO_CTX_POOL
+    int ctx_mark = g_ctx_next;
+#endif
+    int nctx = 0, sorted = 0;
+    g_reach_last = LOGOS_REACH_DECLINED_NOMEM;
+    if (scr) for (; nctx < P; nctx++) if (!ctx_init(&ctxs[nctx], maxlen, 0)) break;
+    if (scr && nctx == P) {
+        j.lo = meta; j.hi = meta + (K + 2); j.x = meta + 2 * (K + 2); j.y = meta + 3 * (K + 2);
+        barrier_t bar; if (P > 1) { barrier_init(&bar, P); j.bar = &bar; }
+        for (int t = 0; t < P; t++) { wa[t].j = &j; wa[t].ctx = &ctxs[t]; wa[t].scratch = scr + (size_t)t * maxlen; wa[t].tid = t; ctxs[t].seq = (P == 1); PROF(ctxs[t].tid = t;) }
+        TRACE("reach: reach %zu -> %d blocks of %zu, %d threads", reach, K, B, P);
+        /* queue-driven phases that meet at a barrier: a thread that cannot be created is dropped from it, the rest drain the queues */
+        int made = par_spawn(th, P, reach_worker, wa, sizeof wa[0], j.bar, NULL);
+        reach_blocks(&wa[0]);
+        if (j.bar) barrier_wait(j.bar);
+        TRACE("reach: %d blocks sorted, %zu held strays", K, (size_t)atomic_load(&j.nstrayblk));
+        reach_plan(&j);
+        g_reach_last = j.go ? (j.go == 2 ? LOGOS_REACH_SORTED_STRAYS : LOGOS_REACH_SORTED) : LOGOS_REACH_DECLINED_PLAN;
+        reach_seg_t *sg = NULL; size_t *tpos = NULL;
+        if (j.go == 2) {                                               /* set the strays aside and sort them; everything their return needs is taken NOW */
+            j.T = malloc(j.S * sizeof(double)); tpos = malloc(j.S * sizeof(size_t)); sg = malloc(((size_t)K + j.S + 1) * sizeof *sg);
+            if (!j.T || !tpos || !sg) { TRACE("reach: no memory for %zu strays -> decline", j.S); j.go = 0; g_reach_last = LOGOS_REACH_DECLINED_NOMEM; }
+            else {
+                size_t w = 0;
+                for (int k = 0; k < K; k++) { size_t s = reach_s(&j, k), e = reach_e(&j, k);
+                    memcpy(j.T + w, a + s, (j.lo[k] - s) * sizeof(double)); w += j.lo[k] - s; memcpy(j.T + w, a + j.hi[k], (e - j.hi[k]) * sizeof(double)); w += e - j.hi[k]; }
+                ns_depth++; logos_sort_f64(j.T, j.S, j.S >= NS_STRAYS_PARALLEL ? P : 1); ns_depth--;
+                TRACE("reach: %zu strays set aside and sorted", j.S);
+            }
+        }
+        if (j.bar) barrier_wait(j.bar);                                 /* release the workers into the seams, or home */
+        if (j.go) reach_seams(&wa[0]);
+        for (int t = 0; t < made; t++) pthread_join(th[t], NULL);
+        if (j.bar) barrier_destroy(&bar);
+        if (j.go == 2) reach_place_strays(&j, sg, tpos);
+        sorted = j.go != 0;
+        TRACE("reach: %s (%zu strays)", sorted ? "done" : "declined after the block phase", j.S);
+        free(j.T); free(tpos); free(sg);
+    }
+    for (int t = 0; t < nctx; t++) ctx_free(&ctxs[t]);
+#ifndef LOGOS_NO_CTX_POOL
+    g_ctx_next = ctx_mark;                                             /* the bundles are free again: whoever sorts next starts where this route started */
+#endif
+    if (pooled) pool_release(); else free(scr);
+    free(meta); free(wa); free(ctxs); free(th); free(j.fence);
+    return sorted;
+}
+#endif
 
 /* ---- sample once, decide once (default since 2026-09-11; -DLOGOS_NO_SODO restores the per-gate samples; A/B: make sodobench) ----
  * The fixed-order dispatcher draws five samples (2048 for the low-cardinality gate, 2048 for the
@@ -3506,7 +5354,7 @@ static int relocate_try_f64(double *a, size_t n, int P, double *dst) {
 #define LOGOS_SODO 1
 #endif
 #ifdef LOGOS_SODO
-typedef struct { size_t m, mfull, distinct, f1, f2; double chao1, inv_rate, ks; int has_nan; double *sorted; } sodo_t;
+typedef struct { size_t m, mfull, distinct, f1, f2, reach; double chao1, inv_rate, inv_all, ks; int has_nan; double *sorted; } sodo_t;
 /* stage 1: the first SODO_GATE_M points of the Weyl sequence (a prefix of a low-discrepancy sequence is
    itself equidistributed) answer every gate; the cheapest routes never pay for the partition's sample */
 #define SODO_GATE_M 2048
@@ -3515,9 +5363,19 @@ static int sodo_sample(const double *a, size_t n, size_t mfull, sodo_t *S) {
     double *raw = malloc(m * sizeof(double)); S->sorted = malloc(mfull * sizeof(double)); if (!raw || !S->sorted) { free(raw); free(S->sorted); S->sorted = NULL; return 0; }
     sample_read(a, n, 0, m, mfull, raw, &S->has_nan);
     /* inversion rate over Fibonacci-lag pairs, wrapped pairs skipped */
-    { const size_t L = 144; size_t inv = 0, comps = 0;
-      for (size_t i = 0; i + L < m; i++) { size_t p0 = SAMPLE_POS(i, mfull, n), p1 = SAMPLE_POS(i + L, mfull, n); if (p1 <= p0) continue; comps++; if (raw[i] > raw[i + L]) inv++; }
-      S->inv_rate = comps ? (double)inv / (double)comps : 1.0; }
+    /* inv_all reads EVERY pair of the lag, in position order. The later sample index is the EARLIER position here
+     * (frac(144 * 0.618...) = 0.99689, a step of -0.31% of n), so the `p1 <= p0` test above it, meant to drop the few pairs
+     * that wrap around the array, drops all but those: inv_rate has been answered by 7 pairs, a whole array apart, where the
+     * note above promises ~1900 (found 2026-09-20, when the short-reach gate wanted the same statistic at other lags and the
+     * counts came back 7 and 3). inv_rate is left as it was until its own A/B; the short-reach gate reads inv_all. */
+    { const size_t L = 144; size_t inv = 0, comps = 0, inva = 0, compsa = 0;
+      for (size_t i = 0; i + L < m; i++) { size_t p0 = SAMPLE_POS(i, mfull, n), p1 = SAMPLE_POS(i + L, mfull, n); if (p1 == p0) continue;
+          compsa++; if (p1 > p0 ? raw[i] > raw[i + L] : raw[i + L] > raw[i]) inva++;
+          if (p1 > p0) { comps++; if (raw[i] > raw[i + L]) inv++; } }
+      S->inv_rate = comps ? (double)inv / (double)comps : 1.0; S->inv_all = compsa ? (double)inva / (double)compsa : 1.0; }
+#ifndef LOGOS_NO_REACH
+    if (n >= REACH_MIN_N && !S->has_nan && S->inv_all <= REACH_TAU) S->reach = reach_from_sample(a, n, raw, m, 0);   /* random data stops at the first rung, already read */
+#endif
     memcpy(S->sorted, raw, m * sizeof(double)); free(raw);
     if (sample_sort(S->sorted, m)) S->has_nan = 1;
     double *s = S->sorted; size_t d = 0, f1 = 0, f2 = 0;
@@ -3564,9 +5422,15 @@ static int sodo_extend(const double *a, size_t n, sodo_t *S) {
  * DENSE_SPAN_MULT * n, or ANY repeat. Repeats are refused rather than handled because a value that
  * repeats is by definition cardinality-limited, and the counting routes above already own that case
  * and do it better. -DLOGOS_NO_DENSEINT removes the route; LOGOS_NO_DENSE=1 disables it at runtime. */
+static size_t g_dense_count = 0;       /* logos_twist_last(6): arrays the dense-integer bitmap placed; sequential sorts, calling thread */
 #ifndef LOGOS_NO_DENSEINT
 #ifndef DENSE_SPAN_MULT
-#define DENSE_SPAN_MULT 4            /* a span of 4n is a 4n-bit map: 4 MB at 8M, still cache-friendly */
+/* 16, from a ladder (2026-09-21, ./mcbench 40 8388608 span): n distinct integers over s x n at ONE thread, the bitmap against the leaf
+   (an int32 radix there): 5.0x at 6n, 4.3x at 8n, 3.9x at 12n, 3.3x at 16n, 2.9x at 24n, 1.2x at 32n, a tie near 96n. What the gate
+   must give back costs more as the map grows, because every fresh page is a fault: random integers with repeats 0.99 at 16n and 0.73
+   at 64n, one planted repeat 0.89 and 0.73. The budget is the largest where the clean spreads win 1.5x and no guard drops under
+   0.85. It was 4, from a guess about the cache: the map fits nowhere near it and still wins, because the leaf it replaces is slow. */
+#define DENSE_SPAN_MULT 16
 #endif
 #ifndef DENSE_MIN_N
 #define DENSE_MIN_N 65536
@@ -3575,7 +5439,7 @@ static int sodo_extend(const double *a, size_t n, sodo_t *S) {
 
 /* Does the sample say this is worth a pass? Every sampled value integral, essentially no repeats, and
  * a sampled span within the budget. All three are already computed or one subtraction away. */
-static int dense_gate(const double *samp, size_t m, size_t n) {
+static int dense_gate(const double *samp, size_t m, size_t n, double mult) {
     if (m < 256) return 0;
     size_t rep_ = 0;
     for (size_t i = 0; i < m; i++) {
@@ -3589,12 +5453,14 @@ static int dense_gate(const double *samp, size_t m, size_t n) {
      * makes the real decision. An earlier version scaled this bound with m*m, which quietly turned the
      * route off at one thread (where the sample is small) -- the one place it was meant to fire. */
     double span = samp[m - 1] - samp[0] + 1.0;
-    return span > 0 && span <= (double)DENSE_SPAN_MULT * (double)n;
+    return span > 0 && span <= mult * (double)n;
 }
 
 static int dense_int_try_f64(double *a, size_t n, const double *samp, size_t m) {
     if (n < DENSE_MIN_N || getenv("LOGOS_NO_DENSE")) return 0;
-    if (!samp || !dense_gate(samp, m, n)) return 0;
+    double mult = DENSE_SPAN_MULT;                                   /* LOGOS_DENSE_SPAN=<k>: the span budget, k x n (the ladder of 2026-09-21) */
+    { const char *e = getenv("LOGOS_DENSE_SPAN"); if (e) { double v = atof(e); if (v >= 1 && v <= 256) mult = v; } }
+    if (!samp || !dense_gate(samp, m, n, mult)) return 0;
 
     /* ONE pass, not two. The first version computed the true extremes in a pass of its own and then
      * set bits in a second, which made a DECLINE cost two passes: measured 0.60 on dense integers
@@ -3610,7 +5476,7 @@ static int dense_int_try_f64(double *a, size_t n, const double *samp, size_t m) 
     double topd = samp[m - 1] + (double)n;
     if (!(topd < DENSE_INT_MAX)) return 0;
     uint64_t span = (uint64_t)((int64_t)topd - base) + 1;
-    if (span > (uint64_t)(DENSE_SPAN_MULT + 2) * (uint64_t)n) return 0;
+    if ((double)span > (mult + 2.0) * (double)n) return 0;
 
     size_t words = (size_t)((span + 63) / 64);
     uint64_t *bits = calloc(words, sizeof(uint64_t));
@@ -3642,6 +5508,7 @@ static int dense_int_try_f64(double *a, size_t n, const double *samp, size_t m) 
     }
     free(bits);
     TRACE("dense-int: %zu values, window %llu, emitted %zu", n, (unsigned long long)span, out);
+    g_dense_count += out == n;
     return out == n;
 }
 #endif
@@ -3705,9 +5572,7 @@ static int tail_merge_par_f64(double *a, size_t n, size_t d, int P) {
     int ok = buf && sc && sg && th;
     if (ok) {
         for (int t = 0; t < P; t++) { sc[t].a = a; sc[t].buf = buf; sc[t].lo = n * (size_t)t / (size_t)P; sc[t].hi = n * (size_t)(t + 1) / (size_t)P; sc[t].bad = 0; }
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, tail_scan, &sc[t]);
-        tail_scan(&sc[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        par_run(th, P, tail_scan, sc, sizeof sc[0], 1);
         for (int t = 0; t < P; t++) if (sc[t].bad) ok = 0;
     }
     if (ok) {
@@ -3721,9 +5586,7 @@ static int tail_merge_par_f64(double *a, size_t n, size_t d, int P) {
             sg[t].pre = pre; sg[t].tail = tail; sg[t].i0 = i0; sg[t].i1 = i1; sg[t].j0 = j0; sg[t].j1 = j1; sg[t].out = a + i0 + j0;
             j0 = j1;
         }
-        for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, tail_merge_seg, &sg[t]);
-        tail_merge_seg(&sg[0]);
-        for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+        par_run(th, P, tail_merge_seg, sg, sizeof sg[0], 1);
     }
     if (pooled) pool_release(); else free(buf);
     free(sc); free(sg); free(th);
@@ -3822,16 +5685,13 @@ static inline size_t streams_cell(double x, double lo, double inv) {
     return (size_t)t;
 }
 
-static int streams_try_f64(double *a, size_t n, double *buf, ctx_t *c, const double *bnd, int nm, double lo, double hi) {
-    if (nm < 2 || getenv("LOGOS_NO_STREAMS")) return 0;
-    int nb = nm - 1;
-
-    /* Gate: do the modes ascend in ARRIVAL order? A jittered, strictly increasing set of positions, so the probe
-     * cannot alias with a periodic layout and needs no sort of its own. */
+/* The stream route's gate, as a function so that it can be asked about the MIRROR image too (mirror = 1: do the modes DESCEND
+ * in arrival order?). 1024 jittered, strictly increasing positions; more than 2% out of order, or a NaN, says no. */
+static __attribute__((noinline)) int streams_arrival_ok(const double *a, size_t n, const double *bnd, int nb, int nm, int mirror) {
     enum { SM = 1024 };
     size_t stride = n / SM;
-    double last[STREAMS_MAX_MODES]; for (int q = 0; q < nm; q++) last[q] = -INFINITY;
-    size_t descents = 0;
+    double last[STREAMS_MAX_MODES]; for (int q = 0; q < nm; q++) last[q] = mirror ? INFINITY : -INFINITY;
+    size_t wrong = 0;
     for (size_t i = 0; i < SM; i++) {
         uint64_t h = (uint64_t)(i + 1) * 0x9e3779b97f4a7c15ULL; h ^= h >> 29;
         size_t p = i * stride + (stride ? (size_t)(h % stride) : 0);
@@ -3839,10 +5699,19 @@ static int streams_try_f64(double *a, size_t n, double *buf, ctx_t *c, const dou
         double x = a[p];
         if (x != x) return 0;
         int md = streams_mode(x, bnd, nb);
-        if (x < last[md]) descents++;
+        if (mirror ? x > last[md] : x < last[md]) { if (++wrong > SM / 50) return 0; }   /* more than 2% out of order: stop reading */
         last[md] = x;
     }
-    if (descents > SM / 50) return 0;                        /* more than 2% out of order: not ascending streams */
+    return wrong <= SM / 50;
+}
+/* noinline: a 13 KB frame; see nearsorted_parallel_f64. */
+static __attribute__((noinline)) int streams_try_f64(double *a, size_t n, double *buf, ctx_t *c, const double *bnd, int nm, double lo, double hi) {
+    if (nm < 2 || getenv("LOGOS_NO_STREAMS")) return 0;
+    int nb = nm - 1;
+
+    /* Gate: do the modes ascend in ARRIVAL order? A jittered, strictly increasing set of positions, so the probe
+     * cannot alias with a periodic layout and needs no sort of its own. */
+    if (!streams_arrival_ok(a, n, bnd, nb, nm, 0)) return 0;
 
     /* Pass 1: mode per element, cached, and counted. a[] is not touched until the final copy. */
     uint8_t *mc = (uint8_t *)malloc(n);
@@ -3898,7 +5767,7 @@ static int streams_try_f64(double *a, size_t n, double *buf, ctx_t *c, const dou
     }
     TRACE("streams: buckets checked");
     memcpy(a, buf, n * sizeof(double));
-    TRACE("streams: %d modes, %zu of %d sampled descents, %d buckets needed a sort, table %d, %zu ambiguous lookups", nm, descents, (int)SM, dirty, use_tab, amb);
+    TRACE("streams: %d modes, arrival probe passed, %d buckets needed a sort, table %d, %zu ambiguous lookups", nm, dirty, use_tab, amb);
     return 1;
 }
 #endif
@@ -3906,6 +5775,359 @@ static int streams_try_f64(double *a, size_t n, double *buf, ctx_t *c, const dou
 /* vstart/vnbk non-NULL: partition only, leaving the buckets unsorted, and report their boundaries.
  * *vnbk is set to 0 whenever the array came out FULLY sorted instead -- every other route in this
  * dispatcher produces sorted output, so 0 means "there is nothing left to do". */
+/* ===================== one orientation bit for the WHOLE array =====================
+ * The twist carries a bit per run. This is the same bit for the array. Every cheap route reads order in ONE direction, and the
+ * prescan's `descending` test is exact, so a newest-first log with one late record fired no gate and paid for a full sort:
+ * a shape against its own mirror image cost 2.0x (short reach), 2.7x (sorted prefix plus tail) and 3.1x (interleaved streams)
+ * at one thread (make mirrorprobe). The plain answer: reverse once, then let the dispatcher see what it knows how to read.
+ * Where and when, both from measurements: BEHIND relocation, because the twist already sorts mirrored blocks as they lie and
+ * a pass in front of them costs 10-23%; only when the sample's writhe says mirrored (inv_all >= MIRROR_INV_MIN, which noise
+ * at 0.50 never reaches) AND a directional gate fires ON THE MIRROR IMAGE, because a pass that buys nothing costs 5-14%; and
+ * on sequential sorts only, because at 14 threads the pass eats the gain (1.41 -> 1.15 on short reach, nothing elsewhere).
+ * LOGOS_NO_MIRROR=1 / -DLOGOS_NO_MIRROR: off. logos_mirror_count(): how often it fired. A/B: ./mirrorprobe 40 8388608 ab. */
+#ifndef MIRROR_INV_MIN
+#define MIRROR_INV_MIN 0.90
+#endif
+#define MIRROR_MIN_N (1u << 16)
+static size_t g_mirror_count = 0;
+size_t logos_mirror_count(int reset) { size_t r = g_mirror_count; if (reset) g_mirror_count = 0; return r; }
+#if defined(LOGOS_SODO) && !defined(LOGOS_NO_MIRROR)
+static int g_mirrored = 0;             /* re-entry guard; written on the calling thread only, one top-level sort at a time */
+/* noinline: nothing of this may land in the dispatcher's frame (make callbench). Returns which gate fired, 0 for none. */
+static __attribute__((noinline)) int mirror_gate(const double *a, size_t n, double inv_all, const double *st_bnd, int st_nm) {
+    if (getenv("LOGOS_NO_MIRROR")) return 0;
+    /* (1) the mirror image of a sorted prefix: a DESCENDING SUFFIX of at least half the array. The scan stops at the first
+     *     ascent from the end, so it is long only when it is about to pay. */
+#ifndef LOGOS_NO_TAILROUTE
+    if (inv_all >= MIRROR_INV_MIN && !getenv("LOGOS_NO_TAIL")) { size_t i = n - 1; while (i > 0 && a[i - 1] >= a[i]) i--; if (n - i >= n / 2 && n >= TAIL_MIN_N) return 1; }
+#endif
+    (void)inv_all; (void)a; (void)n;          /* a build with every directional route compiled out has nothing to ask */
+#ifndef LOGOS_NO_REACH
+    /* (2) the mirror image of short reach: the same ladder, every comparison turned round */
+    if (inv_all >= MIRROR_INV_MIN && n >= REACH_MIN_N && !getenv("LOGOS_NO_REACH") && reach_from_sample(a, n, NULL, 0, 1) > 0) return 2;
+#endif
+#ifndef LOGOS_NO_STREAMS
+    /* (3) the mirror image of interleaved ascending streams: the modes DESCEND in arrival order */
+    if (st_nm >= 2 && n >= STREAMS_MIN_N && !getenv("LOGOS_NO_STREAMS") && streams_arrival_ok(a, n, st_bnd, st_nm - 1, st_nm, 1)) return 3;
+#else
+    (void)st_bnd; (void)st_nm;
+#endif
+    return 0;
+}
+#endif
+
+/* THE LOOP-BACK: R0 on the sphere (Kauffman & Lambropoulou, "Hard Unknots and Collapsing Tangles": a knot diagram lives on the
+ * sphere, where the outer region is a region like any other, and some diagrams that are hard in the plane are easy there).
+ * Close the array into a ring, so that walking forward past its end arrives at its start, and a sorted array read from the
+ * wrong place (a ring buffer dumped from physical slot 0, a log that wrapped) is ONE ascending strand across the wrap. Read
+ * in the plane it is two runs, and the engine paid for them: the tail route merged the second run in element by element,
+ * 2.0x the sort of the same array unrotated at one thread and 2.6x at 14 (make unknotprobe, mode `ring`).
+ * The gate is exact and nearly free. The prescan has just walked the ascending prefix [0, d) to its first descent. If the
+ * array also ENDS in an ascending run [s, n) whose last element is no larger than a[0], that run continues into the prefix
+ * across the wrap: rotate it to the front once and enter the dispatcher again, which then sees one sorted prefix of
+ * n - s + d elements (a ring buffer: the whole array, and the prescan returns; a wrapped log with a random stretch: the tail
+ * route's shape). On other data the first comparison fails (a[n-1] > a[0] on anything that ascends overall) or the backward
+ * walk stops within an element or two. It fires only when the joined strand is at least half the array, and, when the prefix
+ * alone already is, only when the suffix it saves sorting is at least n / 16 (a rotation costs about 1.4 passes; sorting
+ * that much of a tail costs more). At P threads only when the strand leaves at most n / 16 outside it: the rotation is one
+ * thread's pass, and a large remainder handed to the parallel tail route lost to the partition (0.51 at 1M on 30% prefix +
+ * noise + 40% suffix). LOGOS_NO_LOOPBACK=1 / -DLOGOS_NO_LOOPBACK: off. logos_twist_last(7): how often it fired. */
+#ifndef LOOPBACK_MIN_N
+#define LOOPBACK_MIN_N 4096
+#endif
+static __attribute__((unused)) size_t g_loop_count = 0;   /* logos_twist_last(7); calling thread, one top-level sort at a time (the pool's contract) */
+static __attribute__((unused)) int g_looped = 0;          /* re-entry guard */
+/* a := a[s..n) ++ a[0..s): the shorter part through scratch (the pool's buffer when it is free), the longer by one memmove;
+   three reversals in place when no scratch can be had, so a failed allocation costs time and never the answer */
+static void rotate_left_f64(double *a, size_t n, size_t s) {
+    size_t k = n - s, m = k < s ? k : s;
+    void *pb = NULL; uint8_t *pbi = NULL; int pooled = pool_acquire(m * sizeof(double), 0, &pb, &pbi);
+    double *t = pooled ? (double *)pb : (double *)malloc(m * sizeof(double));
+    if (t) {
+        if (k <= s) { memcpy(t, a + s, k * sizeof(double)); memmove(a + k, a, s * sizeof(double)); memcpy(a, t, k * sizeof(double)); }
+        else        { memcpy(t, a, s * sizeof(double)); memmove(a, a + s, k * sizeof(double)); memcpy(a + k, t, s * sizeof(double)); }
+        if (pooled) pool_release(); else free(t);
+        return;
+    }
+    for (size_t l = 0, r = s - 1; l < r; l++, r--) { double x = a[l]; a[l] = a[r]; a[r] = x; }
+    for (size_t l = s, r = n - 1; l < r; l++, r--) { double x = a[l]; a[l] = a[r]; a[r] = x; }
+    for (size_t l = 0, r = n - 1; l < r; l++, r--) { double x = a[l]; a[l] = a[r]; a[r] = x; }
+}
+#ifndef LOGOS_NO_LOOPBACK
+/* noinline: nothing of this may land in the dispatcher's frame (make callbench). d: the prescan's first descent, 0 < d < n.
+   Returns the rotation to make (s, the joined strand's start), or 0. */
+static __attribute__((noinline)) size_t loopback_gate(const double *a, size_t n, size_t d, int par) {
+    if (!(a[n - 1] <= a[0])) return 0;                                  /* the end does not continue into the start (or a NaN is there) */
+    size_t s = n - 1; while (s > d && a[s - 1] <= a[s]) s--;            /* [s, n) ascends */
+    size_t L = n - s;
+    if (L + d < n / 2) return 0;
+    if (d >= n / 2 && L < n / 16) return 0;                             /* the tail route has this already; the rotation would save too little */
+    if (par && n - (L + d) > n / 16) return 0;                          /* P threads: the rotation is one thread's pass, and a big tail left for the
+                                                                           parallel tail route lost to the partition (0.51 on 30% + noise + 40%) */
+    if (getenv("LOGOS_NO_LOOPBACK")) return 0;                          /* read only when about to fire */
+    return s;
+}
+#endif
+
+#if !defined(LOGOS_NO_SEAM) || !defined(LOGOS_NO_WAVE)
+/* ===================== the sample in POSITION order: the seam route and the wave route =====================
+ * Every dispatcher gate reads the shared sample sorted by VALUE, which throws the positions away. Put the same 2048 points back in
+ * position order and two more shapes become readable at the cost of one small sort (about 0.1 ms):
+ *   SEAM   a noisy ring buffer read from the wrong slot: the largest drop between consecutive points marks the seam, and each side
+ *          is nearly sorted (few inverted adjacent pairs). The loop-back covers the EXACT case in the prescan; this one needs the
+ *          sample because noise stops the prescan within two elements. Rotate once, enter the dispatcher again: the short-reach
+ *          route takes it from there (ceiling 1.29, a told rotation 1.17 at one thread: make unknotprobe, mode ring).
+ *   WAVE   a seasonal series with drift: monotone at the sample's resolution (a few dozen long pieces of the SMOOTHED sample, each
+ *          direction held for many points) but broken by noise at the element's, so the run detector sees runs of two. Each piece
+ *          is a strand whose disorder is short reach; the pieces overlap in value (a crest and the trough after it share a range).
+ *          So: cut the array at the pieces' extrema, sort each piece where it lies (a descending piece reversed first, then the
+ *          short-reach route, relaxed to a few blocks; the full dispatcher where that declines), and place the sorted pieces with
+ *          the knot sweep, which copies what lies alone and merges only where pieces cross. The composed route's ceiling was
+ *          measured at 2.1-3.7x at one thread (experiments/SHORT_REACH.md). Sequential sorts only.
+ * Both are behind relocation, the mirror and the streams; both re-read the sample (no lifetime games with the gates' copy) and only
+ * for sequential sorts of a million elements and up whose lag-144 inversion rate is under WAVE_INV_MAX (noise reads 0.50). Switches:
+ * LOGOS_NO_SEAM=1, LOGOS_NO_WAVE=1; witnesses logos_twist_last(9) and (8). */
+#ifndef WAVE_MIN_N
+#define WAVE_MIN_N (1u << 20)
+#endif
+#ifndef WAVE_INV_MAX
+#define WAVE_INV_MAX 0.45
+#endif
+#ifndef WAVE_COST_MAX
+#define WAVE_COST_MAX 1.5
+#endif
+typedef struct { size_t pos; double v; } psamp_t;
+static psamp_t *sample_by_pos(const double *a, size_t n, size_t m) {
+    psamp_t *s = malloc(m * sizeof *s), *t = malloc(m * sizeof *s); size_t *cnt = calloc(m + 1, sizeof(size_t)); double *raw = malloc(m * sizeof(double));
+    if (!s || !t || !cnt || !raw) { free(s); free(t); free(cnt); free(raw); return NULL; }
+    int nan = 0; sample_read(a, n, 0, m, m, raw, &nan);
+    if (nan) { free(s); free(t); free(cnt); free(raw); return NULL; }
+    for (size_t i = 0; i < m; i++) { t[i].pos = SAMPLE_POS(i, m, n); t[i].v = raw[i]; size_t key = (size_t)((double)t[i].pos / (double)n * (double)m); if (key >= m) key = m - 1; cnt[key + 1]++; }
+    for (size_t i = 0; i < m; i++) cnt[i + 1] += cnt[i];
+    for (size_t i = 0; i < m; i++) { size_t key = (size_t)((double)t[i].pos / (double)n * (double)m); if (key >= m) key = m - 1; s[cnt[key]++] = t[i]; }
+    for (size_t i = 1; i < m; i++) { psamp_t x = s[i]; size_t j = i; while (j > 0 && s[j - 1].pos > x.pos) { s[j] = s[j - 1]; j--; } s[j] = x; }   /* bucketed by position already: a few swaps */
+    free(t); free(cnt); free(raw);
+    return s;
+}
+static size_t g_wave_count = 0;
+#ifndef LOGOS_NO_SEAM
+/* noinline: nothing of this may land in the dispatcher's frame (make callbench) */
+static __attribute__((noinline)) size_t seam_gate(const double *a, size_t n, const psamp_t *s, size_t m) {
+    if (getenv("LOGOS_NO_SEAM")) return 0;
+    (void)n;
+    size_t k = 0; double drop = -INFINITY, vmin = s[0].v, vmax = s[0].v;
+    for (size_t i = 0; i < m; i++) { if (s[i].v < vmin) vmin = s[i].v; if (s[i].v > vmax) vmax = s[i].v; }
+    for (size_t i = 0; i + 1 < m; i++) { double d = s[i].v - s[i + 1].v; if (d > drop) { drop = d; k = i; } }
+    if (!(drop >= 0.5 * (vmax - vmin)) || !isfinite(drop)) return 0;
+    if (k + 1 < m / 16 || m - (k + 1) < m / 16) return 0;                  /* a rotation by under a sixteenth is not worth a pass */
+    size_t inv = 0;                                                        /* adjacent pairs on the same side of the seam */
+    for (size_t i = 0; i + 1 < m; i++) if (i != k && s[i].v > s[i + 1].v) inv++;
+    if (inv > m / 100) return 0;
+    size_t lo = s[k].pos, hi = s[k + 1].pos, best = lo; double bd = -INFINITY;
+    for (size_t p = lo; p < hi; p++) { double d = a[p] - a[p + 1]; if (d > bd) { bd = d; best = p; } }
+    return bd > 0 ? best + 1 : 0;
+}
+#endif
+#ifndef LOGOS_NO_WAVE
+/* pieces of the smoothed sample: sm = a median of five (a mean of sixteen turned the single step of a ROTATION into a descending
+   piece, and the wave route then sorted a rotated near-sorted array in three pieces for nothing), dir[i] = sign(sm[i+1] - sm[i]), a
+   piece is a stretch of one direction at least WAVE_MIN_PIECE points long (shorter flips are absorbed). Returns the piece count. */
+#define WAVE_MIN_PIECE 8
+static size_t wave_pieces(const psamp_t *s, size_t m, size_t *starts, int *dirs, size_t maxp) {
+    double *sm = malloc(m * sizeof(double)); if (!sm) return 0;
+    for (size_t i = 0; i < m; i++) { double w5[5]; size_t lo = i >= 2 ? i - 2 : 0, hi = i + 3 <= m ? i + 3 : m, c = 0;
+        for (size_t j = lo; j < hi; j++) w5[c++] = s[j].v;
+        for (size_t x = 1; x < c; x++) { double v = w5[x]; size_t y = x; while (y > 0 && w5[y - 1] > v) { w5[y] = w5[y - 1]; y--; } w5[y] = v; }
+        sm[i] = w5[c / 2]; }
+    size_t np = 0; int cur = 0; size_t run = 0, st = 0;
+    for (size_t i = 0; i + 1 < m; i++) {
+        int d = sm[i + 1] > sm[i] ? 1 : sm[i + 1] < sm[i] ? -1 : 0; if (!d) d = cur;
+        if (d == cur) { run++; continue; }
+        if (cur == 0) { cur = d; run = 1; st = 0; continue; }
+        /* a change of direction: count how long it holds */
+        size_t hold = 0; for (size_t j = i; j + 1 < m && hold < WAVE_MIN_PIECE; j++) { int dj = sm[j + 1] > sm[j] ? 1 : sm[j + 1] < sm[j] ? -1 : 0; if (dj == d || dj == 0) hold++; else break; }
+        if (hold < WAVE_MIN_PIECE) continue;                               /* a wobble: the piece goes on */
+        if (np == maxp) { free(sm); return 0; }
+        starts[np] = st; dirs[np] = cur; np++; st = i; cur = d; run = 1;
+    }
+    if (np == maxp) { free(sm); return 0; }
+    starts[np] = st; dirs[np] = cur; np++; starts[np] = m;
+    free(sm); return np;
+}
+#ifndef LOGOS_NO_REACH
+static int reach_try_f64(double *a, size_t n, int P, size_t reach);
+#endif
+static __attribute__((noinline)) int wave_try_f64(double *a, size_t n, double *buf, const psamp_t *s, size_t m) {
+    if (getenv("LOGOS_NO_WAVE")) return 0;
+    enum { MAXP = 512 };
+    size_t starts[MAXP + 1]; int dirs[MAXP];
+    size_t np = wave_pieces(s, m, starts, dirs, MAXP);
+    if (np < 3 || np > m / WAVE_MIN_PIECE) { TRACE("wave: %zu pieces -> decline", np); return 0; }
+    /* the pieces must be real at the element's scale too: raw adjacent sample pairs inside a piece mostly go the piece's way */
+    size_t agree = 0, tot = 0;
+    for (size_t p = 0; p < np; p++) for (size_t i = starts[p]; i + 1 < starts[p + 1]; i++) { tot++; agree += dirs[p] > 0 ? s[i + 1].v >= s[i].v : s[i + 1].v <= s[i].v; }
+    if (tot == 0 || (double)agree < 0.85 * (double)tot) { TRACE("wave: %zu pieces but only %zu of %zu pairs agree -> decline", np, agree, tot); return 0; }
+    /* THE CROSSING COST, from the sample: for every point, how many pieces' [min, max] cover it, priced ceil(log2 k) merge levels. A
+       wave whose swing is several periods of drift is covered four and five deep, and the sweep's k-way merges then cost more than
+       the leaf (swing 2: 0.76 in two runs, where swing 0.6 won 1.35). */
+    { double *pl = malloc(np * sizeof(double)), *ph = malloc(np * sizeof(double)); if (!pl || !ph) { free(pl); free(ph); return 0; }
+      for (size_t p = 0; p < np; p++) { pl[p] = INFINITY; ph[p] = -INFINITY; for (size_t i = starts[p]; i < starts[p + 1]; i++) { if (s[i].v < pl[p]) pl[p] = s[i].v; if (s[i].v > ph[p]) ph[p] = s[i].v; } }
+      size_t lv = 0;
+      for (size_t i = 0; i < m; i += 4) { size_t k = 0; for (size_t p = 0; p < np; p++) k += s[i].v >= pl[p] && s[i].v <= ph[p]; size_t l = 0; while (((size_t)1 << l) < k) l++; lv += l; }
+      free(pl); free(ph);
+      double cost = (double)lv / (double)((m + 3) / 4);
+      if (cost > WAVE_COST_MAX) { TRACE("wave: %zu pieces, crossing cost %.2f levels per element -> decline", np, cost); return 0; }
+      TRACE("wave: crossing cost %.2f levels per element", cost); }
+    /* boundaries at the element's scale: the extremum between the last point of one piece and the first of the next */
+    size_t *B = malloc((np + 1) * sizeof(size_t)); if (!B) return 0;
+    B[0] = 0; B[np] = n;
+    for (size_t p = 1; p < np; p++) {
+        size_t lo = s[starts[p] - 1].pos, hi = s[starts[p]].pos, best = lo; double bv = a[lo];
+        if (dirs[p - 1] > 0) { for (size_t q = lo; q <= hi; q++) if (a[q] > bv) { bv = a[q]; best = q; } }
+        else                 { for (size_t q = lo; q <= hi; q++) if (a[q] < bv) { bv = a[q]; best = q; } }
+        B[p] = best + 1;
+        if (B[p] <= B[p - 1]) B[p] = B[p - 1] + 1;
+    }
+    TRACE("wave: %zu pieces, %zu of %zu pairs agree -> sort each where it lies", np, agree, tot);
+    size_t *runs = malloc(2 * np * sizeof(size_t)); if (!runs) { free(B); return 0; }
+    for (size_t p = 0; p < np; p++) {
+        double *x = a + B[p]; size_t len = B[p + 1] - B[p];
+        if (dirs[p] < 0) for (size_t l = 0, r = len - 1; l < r; l++, r--) { double t = x[l]; x[l] = x[r]; x[r] = t; }
+#ifndef LOGOS_NO_REACH
+        g_reach_relax = 1; int ok = reach_try_f64(x, len, 1, 2048); g_reach_relax = 0;
+#else
+        int ok = 0;
+#endif
+        if (!ok) { ns_depth++; psort_f64(x, len, 1, NULL, NULL, NULL, NULL); ns_depth--; }
+        runs[2 * p] = B[p]; runs[2 * p + 1] = B[p + 1] - 1;
+    }
+    /* the sweep: the pieces are strands now; copy what lies alone, merge where they cross */
+    rdesc_t *d; size_t *ch, nc, merged; int placed = 0;
+    if (runs_plan(a, runs, np, &d, &ch, &nc, &merged)) {
+#ifndef LOGOS_NO_KNOT
+        knot_plan_t K;
+        if (knot_plan(a, d, np, n + 1, 1, &K)) {
+            size_t *krl = K.n3 ? knot_rl(&K) : NULL;
+            if (K.total == n && (!K.n3 || krl)) { knot_place_seq(a, buf, &K, krl); memcpy(a, buf, n * sizeof(double)); placed = 1; }
+            free(krl); knot_plan_free(&K);
+        }
+#endif
+        free(d); free(ch);
+    }
+    if (!placed) { merge_all_runs(a, buf, runs, np); }                      /* the k-way merge: slower, still right */
+    TRACE("wave: placed (%s)", placed ? "knot sweep" : "k-way merge");
+    free(runs); free(B); g_wave_count++;
+    return 1;
+}
+#endif
+#endif
+
+/* THE PRESCAN IN BLOCKS (2026-09-22, found by tsbench's edge round: on a sorted array of 8.4M the engine took 2.2x ONE plain scan,
+ * because the whole-array prescan below is the entire sort there and it ran a scalar line with two tests and two live flags per
+ * element). The scalar line decides three things: no fall anywhere (ascending), no rise anywhere (descending), and the first fall.
+ * Here the first two elements that differ say which way the array starts, and from then on only ONE test can still change the answer,
+ * so the rest is read sixteen at a time with the test's results OR-ed (no branch inside a block, and a loop the compiler can
+ * vectorize), and the scalar line takes over inside the block that fires. Comparisons are the same ordered ones, so a NaN answers
+ * both tests false exactly as before. From PRESCAN_FAST_MIN elements up only: a small sort keeps its loop untouched (a loop whose start
+ * became a variable once cost every sorted call of 2-32 elements 10-16%). noinline: nothing of this lands in the dispatcher's frame.
+ * logos_prescan_agree() runs both on one array: the harness asserts they agree. LOGOS_NO_FASTPRESCAN=1 (read from 65,536 up) and
+ * -DLOGOS_NO_FASTPRESCAN: the A/B. */
+/* VECTOR COMPARES (2026-09-22, found by the triple-reversal weld, tsbench mode `weld`: its one plain scan beat the engine on sorted
+ * data). The paragraph above calls the block loop one the compiler can vectorize; at the engine's flags (no -march) it never was:
+ * sixteen scalar comisd / seta / or steps with a serial OR chain, about 0.6 ns per element, and a copy of it measured 1.46-1.69x
+ * behind SSE2 compares and 1.70-2.07x behind AVX2 ones. Now a block compares two doubles at a time with SSE2 (baseline x86-64, no
+ * dispatch) or four with AVX2 (blocks of 32, where the CPU has AVX2 and FMA, as the AVX2 leaf asks), ORs the masks and tests once;
+ * the scalar OR of sixteen remains for every other target. The ordered compares (cmplt / cmpgt, _CMP_LT_OQ / _CMP_GT_OQ) answer
+ * false on a NaN exactly as the scalar line does. LOGOS_PRESCAN_OR16=1 = the old block, LOGOS_PRESCAN_SSE2=1 = SSE2 on an AVX2
+ * CPU (both read per sort from 65,536 up): the A/B, tsbench mode `switch`. logos_prescan_agree() checks every kind this CPU runs. */
+#ifndef PRESCAN_FAST_MIN
+#define PRESCAN_FAST_MIN 256
+#endif
+typedef struct { size_t first_desc; int asc, desc; } pscan_t;
+/* Each returns the start of the first block in which its test fires, or where whole blocks run out; the scalar line takes over there. */
+static inline size_t prescan_rise_or16(const double *a, size_t n, size_t i) {
+    for (; i + 16 <= n; i += 16) { int f = 0; for (int k = 0; k < 16; k++) f |= a[i + k] < a[i + k - 1]; if (f) break; }
+    return i;
+}
+static inline size_t prescan_fall_or16(const double *a, size_t n, size_t i) {
+    for (; i + 16 <= n; i += 16) { int f = 0; for (int k = 0; k < 16; k++) f |= a[i + k] > a[i + k - 1]; if (f) break; }
+    return i;
+}
+#ifdef LOGOS_HAVE_SSE2
+static inline size_t prescan_rise_sse2(const double *a, size_t n, size_t i) {
+    for (; i + 16 <= n; i += 16) { __m128d m = _mm_setzero_pd();
+        for (int k = 0; k < 16; k += 2) m = _mm_or_pd(m, _mm_cmplt_pd(_mm_loadu_pd(a + i + k), _mm_loadu_pd(a + i + k - 1)));
+        if (_mm_movemask_pd(m)) break; }
+    return i;
+}
+static inline size_t prescan_fall_sse2(const double *a, size_t n, size_t i) {
+    for (; i + 16 <= n; i += 16) { __m128d m = _mm_setzero_pd();
+        for (int k = 0; k < 16; k += 2) m = _mm_or_pd(m, _mm_cmpgt_pd(_mm_loadu_pd(a + i + k), _mm_loadu_pd(a + i + k - 1)));
+        if (_mm_movemask_pd(m)) break; }
+    return i;
+}
+#pragma GCC push_options
+#pragma GCC target("avx2,fma,popcnt")
+#include <immintrin.h>              /* a no-op when the AVX2 leaf above included it; -DLOGOS_NO_AVX2_LEAF leaves it to here */
+static __attribute__((noinline)) size_t prescan_rise_avx2(const double *a, size_t n, size_t i) {
+    for (; i + 32 <= n; i += 32) { __m256d m = _mm256_setzero_pd();
+        for (int k = 0; k < 32; k += 4) m = _mm256_or_pd(m, _mm256_cmp_pd(_mm256_loadu_pd(a + i + k), _mm256_loadu_pd(a + i + k - 1), _CMP_LT_OQ));
+        if (_mm256_movemask_pd(m)) break; }
+    return i;
+}
+static __attribute__((noinline)) size_t prescan_fall_avx2(const double *a, size_t n, size_t i) {
+    for (; i + 32 <= n; i += 32) { __m256d m = _mm256_setzero_pd();
+        for (int k = 0; k < 32; k += 4) m = _mm256_or_pd(m, _mm256_cmp_pd(_mm256_loadu_pd(a + i + k), _mm256_loadu_pd(a + i + k - 1), _CMP_GT_OQ));
+        if (_mm256_movemask_pd(m)) break; }
+    return i;
+}
+#pragma GCC pop_options
+#endif
+static int g_pre_or16 = 0, g_pre_sse2 = 0;  /* LOGOS_PRESCAN_OR16 / LOGOS_PRESCAN_SSE2, read per sort from 65,536 up */
+static inline int prescan_cpu(void) { return logos_simd_kind(); }
+static inline pscan_t prescan_kind(const double *a, size_t n, int kind) {
+    pscan_t r = { n, 1, 1 };
+    size_t i = 1;
+    for (; i < n; i++) {                                   /* until one test fires: a couple of elements on random data */
+        if (a[i] < a[i - 1]) { r.asc = 0; r.first_desc = i; i++; break; }
+        if (a[i] > a[i - 1]) { r.desc = 0; i++; break; }
+    }
+    if (r.asc) {                                           /* rising or level so far: only a fall can change the answer */
+#ifdef LOGOS_HAVE_SSE2
+        i = kind == 2 ? prescan_rise_avx2(a, n, i) : kind == 1 ? prescan_rise_sse2(a, n, i) : prescan_rise_or16(a, n, i);
+#else
+        (void)kind; i = prescan_rise_or16(a, n, i);
+#endif
+        for (; i < n; i++) if (a[i] < a[i - 1]) { r.asc = 0; r.first_desc = i; break; }
+    } else {                                               /* fell first: only a rise can change the answer */
+#ifdef LOGOS_HAVE_SSE2
+        i = kind == 2 ? prescan_fall_avx2(a, n, i) : kind == 1 ? prescan_fall_sse2(a, n, i) : prescan_fall_or16(a, n, i);
+#else
+        i = prescan_fall_or16(a, n, i);
+#endif
+        for (; i < n; i++) if (a[i] > a[i - 1]) { r.desc = 0; break; }
+    }
+    return r;
+}
+static __attribute__((noinline, unused)) pscan_t prescan_blocks(const double *a, size_t n) {   /* unused under -DLOGOS_NO_FASTPRESCAN */
+    int kind = prescan_cpu();
+    if (n >= 65536) {     /* the A/B switches are read HERE, not beside the dispatcher's own: two reads there moved the layout of its small-call path */
+        if (ns_depth == 0) { g_pre_or16 = getenv("LOGOS_PRESCAN_OR16") != NULL; g_pre_sse2 = getenv("LOGOS_PRESCAN_SSE2") != NULL; }
+        if (g_pre_or16) kind = 0; else if (g_pre_sse2 && kind > 1) kind = 1;
+    }
+    return prescan_kind(a, n, kind);
+}
+int logos_prescan_agree(const double *a, size_t n) {       /* test hook: the scalar line, exactly as the dispatcher runs it, against every kind of block */
+    int asc = 1, desc = 1; size_t first_desc = n;
+    for (size_t i = 1; i < n && (asc || desc); i++) { if (asc && a[i] < a[i - 1]) { asc = 0; first_desc = i; } if (a[i] > a[i - 1]) desc = 0; }
+    if (n < 2) return 1;
+    for (int kind = 0; kind <= prescan_cpu(); kind++) {
+        pscan_t r = prescan_kind(a, n, kind);
+        if (!(r.asc == asc && r.desc == desc && r.first_desc == first_desc)) return 0;
+    }
+    return 1;
+}
+
 static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, double *vmin, double *vmax) {
     if (vnbk) *vnbk = 0;
     if (P < 1) P = 1;
@@ -3913,14 +6135,68 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     if ((size_t)P > n) P = (int)n;
     P = effective_threads(n, P);
     TRACE_START(); TRACE("psort_f64 n=%zu P=%d", n, P);
+#ifndef LOGOS_NO_REACH
+    /* Reset here, not at the route: a sort that ends in an earlier route must not report the last one's answer. And only where the
+     * route can run: under -fPIC a thread-local access is a call to __tls_get_addr, and reading ns_depth plus writing this put TWO of
+     * them on the path of a three-element sort, where there had been none. A cost per CALL shows only at make scale-full's small
+     * end; no bench that starts at a million can see it. A smaller sort leaves the answer alone, and logos_psort.h says so. */
+    if (n >= REACH_MIN_N && ns_depth == 0) g_reach_last = LOGOS_REACH_NOT_TRIED;
+#endif
+#ifndef LOGOS_NO_RELOCATE
+    if (n >= MIN_PARALLEL) { g_stray_on = !getenv("LOGOS_NO_STRAY") && !getenv("LOGOS_KNOT_LIST"); g_reloc_nocopy = getenv("LOGOS_RELOC_NOCOPY") != NULL; g_onerun_off = getenv("LOGOS_NO_ONERUN") != NULL; g_desc_ties = !getenv("LOGOS_DESC_STRICT"); g_onerun_copy = getenv("LOGOS_ONERUN_COPY") != NULL; g_scan_scalar = getenv("LOGOS_SCANBLOCK_SCALAR") != NULL;
+                                  { const char *cm = getenv("LOGOS_COUNT_MAX"); g_count_max = cm ? atoi(cm) : COUNT_MAX_THREADS; }
+                                  g_lat_par_merge = getenv("LOGOS_LAT_PAR_MERGE") != NULL;
+                                  g_lat_serial_tables = getenv("LOGOS_LAT_SERIAL_TABLES") != NULL;
+                                  g_lat_static_map = getenv("LOGOS_LAT_STATIC_MAP") != NULL; }
+#endif
+#ifndef LOGOS_NO_KNOT
+    /* Two getenv calls are about 40 ns. Read on every call, as the first cut did, that was 7x the whole sort of three
+     * sorted elements (6 ns -> 42 ns; make scale-full's small sizes). Below two strands of KNOT_MIN_AVG_RUN the route
+     * cannot fire, so the switches are not read there. */
+    if (n >= 2 * (size_t)KNOT_MIN_AVG_RUN) knot_env();
+#endif
+    if (n >= 65536 && ns_depth == 0) { g_no_dense_probe = getenv("LOGOS_NO_DENSE_PROBE") != NULL; g_no_fastpre = getenv("LOGOS_NO_FASTPRESCAN") != NULL; }
     PROF(g_prof.n = n; g_prof.nthreads = P; g_prof.route = LOGOS_ROUTE_NONE; double t_start = prof_now(); g_prof_tp = t_start;)
 
     /* whole-array early exits (the JS prescan's O(n) wins; short-circuits fast on random data) */
     { int asc = 1, desc = 1; size_t first_desc = n;
+#ifndef LOGOS_NO_FASTPRESCAN
+      if (n >= PRESCAN_FAST_MIN && !(g_no_fastpre && n >= 65536)) { pscan_t ps = prescan_blocks(a, n); asc = ps.asc; desc = ps.desc; first_desc = ps.first_desc; }
+      else
+#endif
       for (size_t i = 1; i < n && (asc || desc); i++) { if (asc && a[i] < a[i - 1]) { asc = 0; first_desc = i; } if (a[i] > a[i - 1]) desc = 0; }
       if (asc) { PROF(prof_phase(LOGOS_PH_PRESCAN); prof_finish(LOGOS_ROUTE_SORTED, t_start);) return; }
       if (desc) { for (size_t l = 0, r = n - 1; l < r; l++, r--) { double t = a[l]; a[l] = a[r]; a[r] = t; } PROF(prof_phase(LOGOS_PH_PRESCAN); prof_finish(LOGOS_ROUTE_SORTED, t_start);) return; }
       (void)first_desc;
+#ifndef LOGOS_NO_LOOPBACK
+      /* the loop-back: an ascending suffix that continues into the ascending prefix across the wrap is one strand; see loopback_gate */
+      if (n >= LOOPBACK_MIN_N && !g_looped && !vstart) {
+          size_t s = loopback_gate(a, n, first_desc, P > 1 && n >= MIN_PARALLEL);
+          if (s) {
+              size_t known = n - s + first_desc;                    /* after the rotation [0, known) ascends: suffix, then prefix */
+              TRACE("loop-back: prefix %zu, suffix %zu continues into it across the wrap: rotated (%zu known ascending)", first_desc, n - s, known);
+              rotate_left_f64(a, n, s); g_loop_count++;
+              /* One pass saved each way, and it is most of the difference: a ring buffer costs the rotation plus two read passes,
+                 so re-entering the dispatcher, whose prescan re-read all of it, measured 0.89 against the tail route it replaces at
+                 one thread. A hint to the prescan (start past the known stretch) fixed that and cost every SORTED call of 2 to 32
+                 elements 10-16% (make callbench: the loop's start became a variable). So: the whole ring one strand, return; else the
+                 tail route directly, since [0, known) is the sorted prefix it wants and the re-entry chose it anyway; the dispatcher
+                 only if that declines (a NaN in the remainder, no scratch). */
+              if (known >= n) { PROF(prof_phase(LOGOS_PH_PRESCAN); prof_finish(LOGOS_ROUTE_SORTED, t_start);) return; }   /* the whole ring was one strand */
+              g_looped = 1;
+#ifndef LOGOS_NO_TAILROUTE
+              if (tail_merge_try_f64(a, n, known, P)) {
+                  TRACE("loop-back: tail route took the remainder (%zu)", n - known);
+                  PROF(prof_phase(LOGOS_PH_NEARSORTED); prof_finish(LOGOS_ROUTE_NEARSORTED, t_start);)
+                  g_looped = 0; return;
+              }
+#endif
+              psort_f64(a, n, P, NULL, NULL, NULL, NULL);        /* re-enter plainly */
+              g_looped = 0;
+              return;
+          }
+      }
+#endif
 #ifndef LOGOS_NO_TAILROUTE
       /* A sorted prefix with an unsorted tail. The loop above just walked the prefix to its first descent, so
        * the prefix length costs nothing: sort only the tail and merge it in. See tail_merge_try_f64. */
@@ -3947,7 +6223,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     sodo_t SO; int sodo_ok = 0;
     { int nbk0 = P * BUCKETS_PER_THREAD; if (nbk0 > MAX_BUCKETS) nbk0 = P * (MAX_BUCKETS / P > 0 ? MAX_BUCKETS / P : 1);
       if (n >= 4096) sodo_ok = sodo_sample(a, n, (size_t)nbk0 * OVERSAMPLE, &SO); }
-    if (sodo_ok) TRACE("sodo: m=%zu distinct=%zu chao1=%.0f inv=%.3f ks=%.4f nan=%d", SO.m, SO.distinct, SO.chao1, SO.inv_rate, SO.ks, SO.has_nan);
+    if (sodo_ok) TRACE("sodo: m=%zu distinct=%zu chao1=%.0f inv=%.3f inv_all=%.3f reach=%zu ks=%.4f nan=%d", SO.m, SO.distinct, SO.chao1, SO.inv_rate, SO.inv_all, SO.reach, SO.ks, SO.has_nan);
     PROF(prof_phase(LOGOS_PH_SAMPLE);)
 #ifndef LOGOS_NO_DENSEINT
     /* dense consecutive integers with no repeats: presence bits, no comparisons at all */
@@ -3993,6 +6269,27 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
 #endif
 #endif
 
+#ifndef LOGOS_NO_REACH
+    /* short reach: every element near its final place. Sort index blocks where they lie and repair only the seams; tried
+       before any n-sized buffer is asked for, because without strays it needs none. */
+    if (sodo_ok && SO.reach && reach_try_f64(a, n, P, SO.reach)) {
+        free(SO.sorted);
+        PROF(prof_phase(LOGOS_PH_BUCKETS); prof_finish(LOGOS_ROUTE_REACH, t_start);)
+        return;
+    }
+#ifndef LOGOS_NO_SEAM
+    if (g_reach_seam) {                                                /* the reach route found a rotation in its fences: rotate once, enter again */
+        size_t sm = g_reach_seam; g_reach_seam = 0;
+        if (sodo_ok) { free(SO.sorted); SO.sorted = NULL; }
+        TRACE("seam: rotated by %zu", sm);
+        rotate_left_f64(a, n, sm); g_seam_count++; g_seamed = 1;
+        psort_f64(a, n, P, NULL, NULL, NULL, NULL);
+        g_seamed = 0;
+        return;
+    }
+#endif
+#endif
+
     if (P == 1 || n < MIN_PARALLEL) {
 #if defined(LOGOS_SODO) && !defined(LOGOS_NO_STREAMS)
         double st_bnd[STREAMS_MAX_MODES], st_lo = 0, st_hi = 0; int st_nm = 0;   /* read the modes before the sample is freed */
@@ -4006,7 +6303,9 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
 #endif
         void *pb = NULL; uint8_t *pbi = NULL; int pooled = pool_acquire(n * sizeof(double), 0, &pb, &pbi);
         double *buf = pooled ? (double *)pb : (double *)big_alloc(n * sizeof(double)); ctx_t c;
-        if (!buf || !ctx_init(&c, n, 0)) { if (pooled) pool_release(); else free(buf); ctx_free(&c); qsort(a, n, sizeof(double), cmp_d); return; }
+        /* no ctx_free here: when buf failed, ctx_init never ran and c is whatever the stack held (it used to be freed: a crash
+           in-process, luck in a fresh one); when ctx_init failed, c is all zeros and holds nothing */
+        if (!buf || !ctx_init(&c, n, 0)) { if (pooled) pool_release(); else free(buf); qsort(a, n, sizeof(double), cmp_d); return; }
         c.seq = 1;
         TRACE("seq: buffers ready (pooled=%d)", pooled);
         PROF(prof_phase(LOGOS_PH_OTHER);)
@@ -4015,12 +6314,66 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
         PROF(prof_phase(LOGOS_PH_RELOCATE);)
         TRACE("seq: relocation declined");
 #endif
+#if defined(LOGOS_SODO) && !defined(LOGOS_NO_MIRROR)
+        /* the whole array's orientation bit: see mirror_gate. Noise never gets past the first test, which reads a number already in hand. */
+        /* The writhe cannot pre-gate STREAMS: whether a sampled pair falls inside one stream depends on the lag modulo the stream
+           count (four mirrored streams read 0.88 at 1,048,576 elements and under 0.6 at 1,000,003). A multimodal sample is what
+           gets the ascending probe a few lines down, so it gets the mirrored one too; it stops after ~25 reads on data that ascends. */
+#ifndef LOGOS_NO_STREAMS
+        int mirror_ask = sodo_ok && (SO.inv_all >= MIRROR_INV_MIN || st_nm >= 2);
+#else
+        int mirror_ask = sodo_ok && SO.inv_all >= MIRROR_INV_MIN;
+#endif
+        if (sodo_ok && !SO.has_nan && mirror_ask && n >= MIRROR_MIN_N && !g_mirrored && !vstart) {
+#ifndef LOGOS_NO_STREAMS
+            int mg = mirror_gate(a, n, SO.inv_all, st_bnd, st_nm);
+#else
+            int mg = mirror_gate(a, n, SO.inv_all, NULL, 0);
+#endif
+            TRACE("mirror: inv_all=%.3f, gate %d (1 descending suffix, 2 reach, 3 streams)", SO.inv_all, mg);
+            if (mg) {
+                if (pooled) pool_release(); else free(buf);
+                ctx_free(&c);
+                for (size_t l = 0, r = n - 1; l < r; l++, r--) { double x = a[l]; a[l] = a[r]; a[r] = x; }
+                g_mirror_count++; g_mirrored = 1;
+                psort_f64(a, n, P, NULL, NULL, NULL, NULL);          /* re-enter: the prescan, the ladder and the stream probe now read it their way */
+                g_mirrored = 0;
+                return;
+            }
+        }
+#endif
 #if defined(LOGOS_SODO) && !defined(LOGOS_NO_STREAMS)
         if (st_nm >= 2 && streams_try_f64(a, n, buf, &c, st_bnd, st_nm, st_lo, st_hi)) {
             PROF(prof_phase(LOGOS_PH_BUCKETS); prof_finish(LOGOS_ROUTE_SEQUENTIAL, t_start);)
             if (pooled) pool_release(); else free(buf);
             ctx_free(&c);
             return;
+        }
+#endif
+#if defined(LOGOS_SODO) && (!defined(LOGOS_NO_SEAM) || !defined(LOGOS_NO_WAVE))
+        /* the sample in position order: the seam route (a noisy ring buffer) and the wave route (monotone pieces at the sample's
+           scale, noise at the element's). Read the header of sample_by_pos. */
+        if (sodo_ok && !SO.has_nan && n >= WAVE_MIN_N && !vstart && !g_seamed && SO.inv_all <= WAVE_INV_MAX) {
+            psamp_t *ps = sample_by_pos(a, n, SODO_GATE_M);
+            if (ps) {
+#ifndef LOGOS_NO_SEAM
+                size_t seam = seam_gate(a, n, ps, SODO_GATE_M);
+                if (seam) {
+                    TRACE("seam: a noisy ring buffer, seam at %zu: rotated", seam);
+                    free(ps); if (pooled) pool_release(); else free(buf); ctx_free(&c);
+                    rotate_left_f64(a, n, seam); g_seam_count++; g_seamed = 1;
+                    psort_f64(a, n, P, NULL, NULL, NULL, NULL);
+                    g_seamed = 0; return;
+                }
+#endif
+#ifndef LOGOS_NO_WAVE
+                if (wave_try_f64(a, n, buf, ps, SODO_GATE_M)) {
+                    free(ps); PROF(prof_phase(LOGOS_PH_BUCKETS); prof_finish(LOGOS_ROUTE_SEQUENTIAL, t_start);)
+                    if (pooled) pool_release(); else free(buf); ctx_free(&c); return;
+                }
+#endif
+                free(ps);
+            }
         }
 #endif
         PROF(c.path = LOGOS_PATH_NONE; prof_stamp_t sl = prof_stamp();)
@@ -4048,7 +6401,9 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     PROF(prof_phase(LOGOS_PH_OTHER);)
 #ifndef LOGOS_NO_NEARSORTED
 #ifdef LOGOS_SODO
-    if (j.dst && nearsorted_parallel_f64(a, n, P, j.dst, sodo_ok ? SO.inv_rate : -1.0)) {
+    /* inv_all, not inv_rate: the latter is 7 pairs a whole array apart (see sodo_sample). It passed block-permuted, sawtooth
+       and grouped-run data as nearly sorted, and turned away one genuinely near-sorted input in seven. */
+    if (j.dst && nearsorted_parallel_f64(a, n, P, j.dst, sodo_ok ? (getenv("LOGOS_NS_GATE_OLD") ? SO.inv_rate : SO.inv_all) : -1.0)) {
 #else
     if (j.dst && nearsorted_parallel_f64(a, n, P, j.dst, -1.0)) {
 #endif         /* keeps order instead of scattering it */
@@ -4086,6 +6441,10 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     double *samp = NULL;
 #ifdef LOGOS_SODO
     if (sodo_ok && SO.mfull == m && sodo_extend(a, n, &SO) && !SO.has_nan) { samp = SO.sorted; SO.sorted = NULL; }   /* the one sample, extended and sorted */
+    /* Not handed over (a NaN in it, another size, or it could not be extended): it is not needed again, and it used to LEAK
+       here, 11 KB per sort, because only the fallback label freed it. Found the first time the harness ran with leak checking
+       on (make sanitize, 2026-09-20); it had been switched off. */
+    else if (sodo_ok) { free(SO.sorted); SO.sorted = NULL; }
 #endif
     if (!samp) {
         samp = malloc(m * sizeof(double)); if (!samp) goto fallback;
@@ -4100,7 +6459,11 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
        and the straight line through its extremes. Uniform data gives D ~ 1/sqrt(m); anything with a
        tail, a mode or a lattice gives 0.1-0.5. Costs m subtractions on a sample already sorted. */
     j.ks_ok = 0; j.ks_d = 1.0; j.ks_lo = samp[0]; j.ks_hi = samp[m - 1]; j.ks_scale = 0;
-    if (m >= 256 && j.ks_hi > j.ks_lo) {
+    /* The range must be FINITE. With an infinite sample minimum every F below is inf * 0 = NaN, every compare with it is
+     * false, D stays 0 and the data was certified uniform; the grid lookup then cast NaN to a bucket index and the scatter
+     * wrote through it (a[0] = -inf in uniform data at 4 threads: SEGV in hf_scatter; position 0 is always a sample point.
+     * Found 2026-09-19 by the knot harness's infinite-endpoint shape). A finite pair whose difference overflows is the same. */
+    if (m >= 256 && j.ks_hi > j.ks_lo && isfinite(j.ks_hi - j.ks_lo) && isfinite(1.0 / (j.ks_hi - j.ks_lo))) {   /* finite range AND finite scale (subnormal-wide ranges overflow it) */
         double D = 0, inv = 1.0 / (j.ks_hi - j.ks_lo);
         for (size_t i = 0; i < m; i++) { double F = (samp[i] - j.ks_lo) * inv, e1 = F - (double)i / (double)m, e2 = (double)(i + 1) / (double)m - F; if (e1 < 0) e1 = -e1; if (e2 < 0) e2 = -e2; if (e1 > D) D = e1; if (e2 > D) D = e2; }
         j.ks_d = D; j.ks_ok = D <= HF_KS_MAX / sqrt((double)m); j.ks_scale = (double)j.nbk * inv;
@@ -4198,7 +6561,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
         for (int k = 0; k < nm && ok; k++) {
             int fi = j.bt.mfirst[k], la = j.bt.mlast[k];
             double lo = j.bt.mlo[k], hi = j.bt.mhi[k];
-            if (la <= fi || !(hi > lo)) { ok = 0; break; }
+            if (la <= fi || !(hi > lo) || !isfinite(hi - lo) || !isfinite(1.0 / (hi - lo))) { ok = 0; break; }   /* an infinite mode: F below is NaN, D stays 0 and it would certify */
             while (at < m && samp[at] < lo) at++;                       /* skip the gulf below this mode */
             size_t from = at;
             while (at < m && samp[at] < hi) at++;                       /* the mode's own points */
@@ -4261,7 +6624,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
 
     barrier_init(&j.bar, P); atomic_init(&j.hnext, 0); atomic_init(&j.snext, 0); atomic_init(&j.next, 0);
     for (int t = 0; t < P; t++) { wa[t].j = &j; wa[t].t = t; wa[t].ctx = &ctxs[t]; }
-    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, worker, &wa[t]);
+    int hist_made = par_spawn(th, P, worker, wa, sizeof wa[0], &j.bar, NULL);       /* queue-driven throughout */
     PROF(prof_stamp_t sh0 = prof_stamp();)
     do_hist(&j);                                   /* main = worker 0 */
     PROF(prof_busy_since(0, LOGOS_PH_HIST, sh0); double th1 = prof_now();)
@@ -4273,7 +6636,10 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     for (int b = 1; b < j.nbk; b++) j.bstart[b] = j.bstart[b - 1] + j.bsize[b - 1];
     for (int b = 0; b < j.nbk; b++) { size_t acc = j.bstart[b]; for (size_t ch = 0; ch < j.nchunk; ch++) { j.offs[ch * j.nbk + b] = acc; acc += j.counts[ch * j.nbk + b]; } }
     size_t maxb = 1; for (int b = 0; b < j.nbk; b++) if (j.bsize[b] > maxb) maxb = j.bsize[b];
-    int ok = 1; for (int t = 0; t < P; t++) if (!ctx_init(&ctxs[t], maxb, j.wc_on)) ok = 0;
+    /* A typical bucket; a larger one borrows (ctx_fit). A context that cannot be had stays all zeros and ctx_fit refuses it,
+       so that thread sorts its buckets with the routine that needs no context. There used to be a flag here that only the
+       CALLER looked at: it sat the buckets out while every worker ran the leaf on a context with no tables. */
+    for (int t = 0; t < P; t++) (void)ctx_init(&ctxs[t], ctx_typical(maxb, n, j.nbk), j.wc_on);
     PROF(for (int t = 0; t < P; t++) ctxs[t].tid = t; g_prof.busy_ms[0][LOGOS_PH_COMBINE] += prof_now() - g_prof_tp; g_prof.cpu_ms[0][LOGOS_PH_COMBINE] += prof_now() - g_prof_tp; prof_phase(LOGOS_PH_COMBINE);)
     barrier_wait(&j.bar);
     PROF(prof_stamp_t ss0 = prof_stamp();)
@@ -4282,13 +6648,12 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     barrier_wait(&j.bar);
     PROF(prof_wait(0, LOGOS_PH_SCATTER, prof_now() - ts1); prof_phase(LOGOS_PH_SCATTER);)
     TRACE("par: scatter done");
-    if (ok) do_buckets(&j, &ctxs[0]);
-    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+    do_buckets(&j, &ctxs[0]);
+    for (int t = 0; t < hist_made; t++) pthread_join(th[t], NULL);
     PROF(prof_phase(LOGOS_PH_BUCKETS);)
     TRACE("par: buckets done");
     barrier_destroy(&j.bar);
     for (int t = 0; t < P; t++) ctx_free(&ctxs[t]);
-    if (!ok) { if (pooled) pool_release(); else { free(j.bidx); free(j.dst); } free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs); qsort(a, n, sizeof(double), cmp_d); return; }
     if (pooled) pool_release(); else { free(j.bidx); free(j.dst); }
 #ifndef LOGOS_NO_SPLITTER_TABLE
     bt_free(&j.bt);
@@ -4476,7 +6841,9 @@ static void do_buckets_i32(jobi_t *j, ctx_t *ctx) {
             continue;
         }
         if (g_simd_i32 && nb > 1) g_simd_i32(j->dst + s, nb);
-        else if (nb > 1) leaf_i32(j->dst + s, nb, (uint32_t *)(j->src + s), ctx);
+        else if (nb > 1) { ctx_fit_t cf;
+            if (ctx_fit(ctx, nb, &cf)) { leaf_i32(j->dst + s, nb, (uint32_t *)(j->src + s), ctx); ctx_unfit(ctx, &cf); }
+            else qsort(j->dst + s, nb, sizeof(int32_t), cmp_i32); }
         if (nb) memcpy(j->src + s, j->dst + s, nb * sizeof(int32_t));
     }
 }
@@ -4662,9 +7029,7 @@ static int count_try_i32(int32_t *a, size_t n, int P) {
     if (!wa || !th) { free(wa); free(th); return 0; }
     for (int t = 0; t < P; t++) { wa[t].c = &c; wa[t].t = t; }
     TRACE("i32: count route pre-gate passed, max_slots %lld", (long long)max_slots);
-    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, cnti_minmax, &wa[t]);
-    cnti_minmax(&wa[0]);
-    for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+    par_run(th, P, cnti_minmax, wa, sizeof wa[0], 1);
     TRACE("i32: parallel min/max done");
     int32_t mn = INT32_MAX, mx = INT32_MIN;
     for (int t = 0; t < P; t++) { if (wa[t].lo < mn) mn = wa[t].lo; if (wa[t].hi > mx) mx = wa[t].hi; }
@@ -4710,9 +7075,12 @@ static int count_try_i32(int32_t *a, size_t n, int P) {
         c.csize = (n + (size_t)Pc * 4 - 1) / ((size_t)Pc * 4); if (c.csize < 4096) c.csize = 4096;
         c.nchunk = (n + c.csize - 1) / c.csize;
         atomic_init(&c.next, 0); barrier_init(&c.bar, Pc);
-        for (int t = 1; t < Pc; t++) pthread_create(&th[t], NULL, cnti_body, &wa[t]);
+        /* Static slot ranges, and each table is zeroed by the thread that owns it, so an orphan cannot be covered by a
+           queue. Nothing is written to a[] before the first barrier: drop the orphan and let the whole route decline. */
+        int cnt_made = par_spawn(th, Pc, cnti_body, wa, sizeof wa[0], &c.bar, NULL);
+        if (cnt_made != Pc - 1) atomic_store(&c.fail, 1);
         cnti_body(&wa[0]);
-        for (int t = 1; t < Pc; t++) pthread_join(th[t], NULL);
+        for (int t = 0; t < cnt_made; t++) pthread_join(th[t], NULL);
         barrier_destroy(&c.bar);
         if (atomic_load(&c.fail)) ok = 0;                         /* more tail than budgeted; a[] untouched */
         TRACE("i32: counting route, span %lld, %d threads, %s, spill %zu", (long long)span, Pc,
@@ -4728,6 +7096,13 @@ static int count_try_i32(int32_t *a, size_t n, int P) {
     return ok;
 }
 #endif  /* LOGOS_NO_COUNT_I32 */
+/* logos_release_buffers gives the count tables back too. It left them until 2026-09-20 (make memprobe's int32 rows): up to
+   the 64 MB table budget stayed held after the call whose name says otherwise. */
+static void cnti_release_all(void) {
+#if !defined(LOGOS_NO_COUNT_I32) && !defined(LOGOS_NO_CNTI_POOL)
+    for (int t = 0; t < CNTI_POOL_MAX; t++) { free(g_cnti_tab[t]); g_cnti_tab[t] = NULL; g_cnti_cap[t] = 0; }
+#endif
+}
 /* vstart/vnbk non-NULL: partition only (the int32 twin of psort_f64's lazy mode). *vnbk is 0 whenever
  * the array came out FULLY sorted instead: the sequential leaf, the prescan and the counting route all
  * produce sorted output, and so does the qsort fallback, so 0 means "nothing left to do". */
@@ -4742,7 +7117,7 @@ static void psort_i32_ex(int32_t *a, size_t n, int P, size_t *vstart, int *vnbk,
     TRACE_START();
     if (P == 1 || n < MIN_PARALLEL) {
         uint32_t *buf = malloc(n * sizeof(uint32_t)); ctx_t c;
-        if (!buf || !ctx_init(&c, n, 0)) { free(buf); ctx_free(&c); qsort(a, n, sizeof(int32_t), cmp_i32); return; }
+        if (!buf || !ctx_init(&c, n, 0)) { free(buf); qsort(a, n, sizeof(int32_t), cmp_i32); return; }   /* no ctx_free: see psort_f64 */
         leaf_i32(a, n, buf, &c);
         free(buf); ctx_free(&c);
         return;
@@ -4778,22 +7153,21 @@ static void psort_i32_ex(int32_t *a, size_t n, int P, size_t *vstart, int *vnbk,
       free(samp); samp = NULL; j.sp = sp; }
     barrier_init(&j.bar, P); atomic_init(&j.hnext, 0); atomic_init(&j.snext, 0); atomic_init(&j.next, 0);
     for (int t = 0; t < P; t++) { wa[t].j = &j; wa[t].t = t; wa[t].ctx = &ctxs[t]; }
-    for (int t = 1; t < P; t++) pthread_create(&th[t], NULL, worker_i32, &wa[t]);
+    int i32_made = par_spawn(th, P, worker_i32, wa, sizeof wa[0], &j.bar, NULL);    /* queue-driven throughout */
     do_hist_i32(&j);
     barrier_wait(&j.bar);
     for (size_t ch = 0; ch < j.nchunk; ch++) for (int b = 0; b < j.nbk; b++) j.bsize[b] += j.counts[ch * j.nbk + b];
     for (int b = 1; b < j.nbk; b++) j.bstart[b] = j.bstart[b - 1] + j.bsize[b - 1];
     for (int b = 0; b < j.nbk; b++) { size_t acc = j.bstart[b]; for (size_t ch = 0; ch < j.nchunk; ch++) { j.offs[ch * j.nbk + b] = acc; acc += j.counts[ch * j.nbk + b]; } }
     { size_t maxb = 1; for (int b = 0; b < j.nbk; b++) if (j.bsize[b] > maxb) maxb = j.bsize[b];
-      int ok = 1; for (int t = 0; t < P; t++) if (!ctx_init(&ctxs[t], maxb, 0)) ok = 0;
+      for (int t = 0; t < P; t++) (void)ctx_init(&ctxs[t], ctx_typical(maxb, j.n, j.nbk), 0);      /* a failed one stays zeroed and ctx_fit refuses it: see psort_f64 */
       barrier_wait(&j.bar);
       do_scatter_i32(&j);
       barrier_wait(&j.bar);
-      if (ok) do_buckets_i32(&j, &ctxs[0]);
-      for (int t = 1; t < P; t++) pthread_join(th[t], NULL);
+      do_buckets_i32(&j, &ctxs[0]);
+      for (int t = 0; t < i32_made; t++) pthread_join(th[t], NULL);
       barrier_destroy(&j.bar);
-      for (int t = 0; t < P; t++) ctx_free(&ctxs[t]);
-      if (!ok) goto fallback; }
+      for (int t = 0; t < P; t++) ctx_free(&ctxs[t]); }
     if (j.lazy && vstart) {                                        /* hand the boundaries to the view */
         for (int b = 0; b < j.nbk; b++) vstart[b] = j.bstart[b];
         vstart[j.nbk] = n; *vnbk = j.nbk;
@@ -4814,8 +7188,8 @@ fallback:
  * cost in speed: the buffered scatter is sequential, cycle-following is random-
  * access swaps, which the memory-latency wall punishes. Use it only when RAM,
  * not time, is the binding constraint (e.g. sorting toward 1e9 on a machine
- * that cannot hold 2n). Sequential for now; parallel in-place (sort the 256
- * top buckets across threads) is a natural, still-stack-only extension.
+ * that cannot hold 2n). Parallel from 2026-09-20 (inplace_parallel, below): the
+ * first placement pass stays on one thread, everything under it is tasks.
  *
  * Numbers are placed by an order-preserving unsigned key (int32: bias the sign
  * bit; double: the IEEE total-order transform, total_key). A one-pass OR/AND
@@ -4860,6 +7234,7 @@ DEFINE_INPLACE_MSD(inplace_msd_f64, double,  IN_KEY_F64)
  * is always a valid permutation of the input. See logos_view.h for the API built on this. */
 int logos_partition_f64(double *a, size_t n, int nthreads, size_t *starts, double *bmin, double *bmax) {
     if (!a || !starts || n < 2) return 0;
+    if (n > (size_t)UINT32_MAX) { logos_sort_f64_inplace(a, n, nthreads); return 0; }   /* 32-bit counters: see logos_sort_f64. 0 = came out sorted */
     int nbk = 0;
 #ifndef LOGOS_NO_CTX_POOL
     if (ns_depth == 0) g_ctx_next = 0;
@@ -4874,17 +7249,20 @@ int logos_partition_f64(double *a, size_t n, int nthreads, size_t *starts, doubl
  * logos_sort_f64 per bucket, paying the whole dispatcher 168 times, and ran 1.09-1.47x slower than the
  * sort it was deferring. done[b] != 0 skips a bucket; each bucket is written by exactly one thread. */
 typedef struct { double *a; const size_t *starts; int nbk; unsigned char *done; atomic_size_t *next;
-                 size_t maxb; int seq; } sb_arg_t;
+                 size_t maxb; int seq; size_t typ; } sb_arg_t;
 typedef struct { sb_arg_t *w; ctx_t *ctx; } sb_targ_t;
 static void *sb_worker(void *p) {
     sb_targ_t *ta = p; sb_arg_t *w = ta->w; ctx_t *c = ta->ctx; size_t b;
-    double *scratch = malloc((w->maxb ? w->maxb : 1) * sizeof(double));
+    double *scratch = malloc((w->typ ? w->typ : 1) * sizeof(double));      /* a typical bucket; a larger one gets its own for as long as it is sorted */
     if (!scratch) return NULL;
     c->seq = w->seq;
     while ((b = atomic_fetch_add(w->next, 1)) < (size_t)w->nbk) {
         if (w->done[b]) continue;
         size_t s0 = w->starts[b], nb = w->starts[b + 1] - s0;
-        if (nb > 1) { double *r = leaf_f64(w->a + s0, nb, scratch, c); if (r != w->a + s0) memcpy(w->a + s0, r, nb * sizeof(double)); }
+        if (nb > 1) { ctx_fit_t cf; double *big = nb > w->typ ? malloc(nb * sizeof(double)) : NULL, *sc = nb > w->typ ? big : scratch;
+            if (sc && ctx_fit(c, nb, &cf)) { double *r = leaf_f64(w->a + s0, nb, sc, c); if (r != w->a + s0) memcpy(w->a + s0, r, nb * sizeof(double)); ctx_unfit(c, &cf); }
+            else quicksort(w->a + s0, 0, (long)nb - 1, 2 * log2i(nb));
+            free(big); }
         w->done[b] = 1;
     }
     free(scratch);
@@ -4913,28 +7291,91 @@ void logos_sort_buckets_f64(double *a, const size_t *starts, int nbk, unsigned c
     int todo = 0; for (int b = 0; b < nbk; b++) if (!done[b]) todo++;
     int one_each = (todo <= P) && !getenv("LOGOS_VIEW_SEQ0");   /* =1 restores the old policy, for the A/B */
     atomic_size_t next; atomic_init(&next, 0);
-    sb_arg_t w = { a, starts, nbk, done, &next, maxb, (P == 1) || one_each };
+    sb_arg_t w = { a, starts, nbk, done, &next, maxb, (P == 1) || one_each, ctx_typical(maxb, starts[nbk] - starts[0], nbk) };
     pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
     ctx_t *ctxs = calloc((size_t)P, sizeof(ctx_t));
     sb_targ_t *ta = calloc((size_t)P, sizeof(sb_targ_t));
     int made = 0;
-    if (th && ctxs && ta) { for (int t = 0; t < P; t++) { if (!ctx_init(&ctxs[t], maxb, 0)) break; made++; } }
+    if (th && ctxs && ta) { for (int t = 0; t < P; t++) { if (!ctx_init(&ctxs[t], w.typ, 0)) break; made++; } }
     for (int t = 0; t < made; t++) { ta[t].w = &w; ta[t].ctx = &ctxs[t]; }
-    for (int t = 1; t < made; t++) pthread_create(&th[t], NULL, sb_worker, &ta[t]);
-    if (made > 0) sb_worker(&ta[0]);
-    for (int t = 1; t < made; t++) pthread_join(th[t], NULL);
+    if (made > 0) par_run(th, made, sb_worker, ta, sizeof ta[0], 1);
     for (int t = 0; t < made; t++) ctx_free(&ctxs[t]);
     free(th); free(ctxs); free(ta);
     /* a worker that could not get a context leaves its buckets undone; finish them here, serially */
     for (int b = 0; b < nbk; b++) if (!done[b]) { size_t s0 = starts[b], nb = starts[b + 1] - s0; if (nb > 1) logos_sort_f64(a + s0, nb, 1); done[b] = 1; }
 }
+/* logos_twist_last(): twisted strands consumed by placements since the counts were cleared, and by which route. Plain statics: written
+   on the calling thread inside relocate_try_f64 only (never on a small sort's path), one sort at a time like the pool. */
+static size_t g_twist_knot = 0, g_twist_reloc = 0;
+size_t logos_twist_last(int which) {
+    if (which == -2) {                      /* is the twist in this build at all? */
+#if defined(LOGOS_NO_TWIST) || defined(LOGOS_NO_RELOCATE)
+        return 0;
+#else
+        return 1;
+#endif
+    }
+#ifndef LOGOS_NO_KNOT
+    if (which == 3) { size_t r = g_list_count; g_list_count = 0; return r; }
+    if (which == 5) return atomic_exchange(&g_knot_gallops, 0);                 /* gallops made by two-strand merges; reading clears it */      /* placements through the literal linked list; reading clears it */
+#endif
+#ifndef LOGOS_NO_RELOCATE
+    if (which == 4) { size_t r = g_kink_count; g_kink_count = 0; return r; }      /* kinks swapped back by the run detector; reading clears it */
+#endif
+    if (which == -3) {                      /* is the dense-integer bitmap in this build? */
+#if defined(LOGOS_NO_DENSEINT) || !defined(LOGOS_SODO)
+        return 0;
+#else
+        return 1;
+#endif
+    }
+    if (which == 6) { size_t r = g_dense_count; g_dense_count = 0; return r; }   /* arrays placed by the dense-integer bitmap; reading clears it */
+    if (which == -4) {                      /* is the loop-back in this build? */
+#ifdef LOGOS_NO_LOOPBACK
+        return 0;
+#else
+        return 1;
+#endif
+    }
+#ifndef LOGOS_NO_LOOPBACK
+    if (which == 7) { size_t r = g_loop_count; g_loop_count = 0; return r; }     /* sorts the loop-back rotated first; reading clears it */
+#endif
+#if !defined(LOGOS_NO_SEAM) || !defined(LOGOS_NO_WAVE)
+    if (which == 8) { size_t r = g_wave_count; g_wave_count = 0; return r; }     /* arrays the wave route placed */
+    if (which == 9) { size_t r = g_seam_count; g_seam_count = 0; return r; }     /* sorts the seam route rotated first */
+#endif
+#ifndef LOGOS_NO_RELOCATE
+    if (which == 10) { size_t r = g_stray_count; g_stray_count = 0; return r; }  /* strays lifted out of strands by routes that completed */
+    if (which == 12) { size_t r = g_onerun_count; g_onerun_count = 0; return r; } /* sorts finished as a single strand */
+#endif
+    if (which < 0) { g_twist_knot = 0; g_twist_reloc = 0; return 0; }
+    return which ? g_twist_reloc : g_twist_knot;
+}
+int logos_reach_last(void) {
+#ifndef LOGOS_NO_REACH
+    return g_reach_last;
+#else
+    return LOGOS_REACH_NOT_TRIED;
+#endif
+}
 void logos_sort_f64(double *a, size_t n, int nthreads) {
+    /* Nothing to sort: return before the thread-local read below, the call into the dispatcher and the nine pages its prologue
+       probes (its frame is 36 KB, and stack-clash protection touches every page of a frame on every call). A call with 0 or 1
+       elements went from 8.5 to 2.9 ns (make callbench, both copy orientations: 0.34 and 0.25). Every call of 2 to 24 elements
+       still pays those ~5.6 ns; a thin front for them is open direction 0g. */
+    if (n < 2) return;
+    /* The buffered engine counts in 32 bits (the context's aux array, the byte histograms), so above 2^32 - 1 elements a
+       count can wrap. The API takes a size_t and an outside review rightly asked where the bound was. No machine here can
+       hold such an array (34 GB of doubles), so this line is correct by inspection, not by test: the strict in-place
+       radix counts in size_t throughout and takes those arrays. */
+    if (n > (size_t)UINT32_MAX) { logos_sort_f64_inplace(a, n, nthreads); return; }
 #ifndef LOGOS_NO_CTX_POOL
     if (ns_depth == 0) g_ctx_next = 0;              /* one top-level sort at a time: the bundle cursor restarts */
 #endif
     psort_f64(a, n, nthreads, NULL, NULL, NULL, NULL);
 }
 void logos_sort_i32(int32_t *a, size_t n, int nthreads) {   /* native: 4-byte elements throughout */
+    if (n > (size_t)UINT32_MAX) { logos_sort_i32_inplace(a, n, nthreads); return; }     /* 32-bit counters: see logos_sort_f64 */
 #ifndef LOGOS_NO_CTX_POOL
     if (ns_depth == 0) g_ctx_next = 0;
 #endif
@@ -4946,6 +7387,7 @@ void logos_sort_i32(int32_t *a, size_t n, int nthreads) {   /* native: 4-byte el
  * come from the histogram's exact prefix sums. */
 int logos_partition_i32(int32_t *a, size_t n, int nthreads, size_t *starts, int32_t *bmin, int32_t *bmax) {
     if (!a || !starts || n < 2) return 0;
+    if (n > (size_t)UINT32_MAX) { logos_sort_i32_inplace(a, n, nthreads); return 0; }   /* 32-bit counters: see logos_sort_f64. 0 = came out sorted */
     int nbk = 0;
 #ifndef LOGOS_NO_CTX_POOL
     if (ns_depth == 0) g_ctx_next = 0;
@@ -4953,16 +7395,18 @@ int logos_partition_i32(int32_t *a, size_t n, int nthreads, size_t *starts, int3
     psort_i32_ex(a, n, nthreads, starts, &nbk, bmin, bmax);
     return nbk;
 }
-typedef struct { int32_t *a; const size_t *starts; int nbk; unsigned char *done; atomic_size_t *next; size_t maxb; } sbi_arg_t;
+typedef struct { int32_t *a; const size_t *starts; int nbk; unsigned char *done; atomic_size_t *next; size_t maxb, typ; } sbi_arg_t;
 typedef struct { sbi_arg_t *w; ctx_t *ctx; } sbi_targ_t;
 static void *sbi_worker(void *p) {
     sbi_targ_t *ta = p; sbi_arg_t *w = ta->w; ctx_t *c = ta->ctx; size_t b;
-    uint32_t *buf = malloc((w->maxb ? w->maxb : 1) * sizeof(uint32_t));
+    uint32_t *buf = malloc((w->typ ? w->typ : 1) * sizeof(uint32_t));
     if (!buf) return NULL;
     while ((b = atomic_fetch_add(w->next, 1)) < (size_t)w->nbk) {
         if (w->done[b]) continue;
         size_t s0 = w->starts[b], nb = w->starts[b + 1] - s0;
-        if (nb > 1) { if (g_simd_i32) g_simd_i32(w->a + s0, nb); else leaf_i32(w->a + s0, nb, buf, c); }
+        if (nb > 1) { if (g_simd_i32) g_simd_i32(w->a + s0, nb); else { ctx_fit_t cf; uint32_t *big = nb > w->typ ? malloc(nb * sizeof(uint32_t)) : NULL, *sc = nb > w->typ ? big : buf;
+            if (sc && ctx_fit(c, nb, &cf)) { leaf_i32(w->a + s0, nb, sc, c); ctx_unfit(c, &cf); } else qsort(w->a + s0, nb, sizeof(int32_t), cmp_i32);
+            free(big); } }
         w->done[b] = 1;
     }
     free(buf);
@@ -4979,25 +7423,142 @@ void logos_sort_buckets_i32(int32_t *a, const size_t *starts, int nbk, unsigned 
     if (ns_depth == 0) g_ctx_next = 0;
 #endif
     atomic_size_t next; atomic_init(&next, 0);
-    sbi_arg_t w = { a, starts, nbk, done, &next, maxb };
+    sbi_arg_t w = { a, starts, nbk, done, &next, maxb, ctx_typical(maxb, starts[nbk] - starts[0], nbk) };
     pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
     ctx_t *ctxs = calloc((size_t)P, sizeof(ctx_t));
     sbi_targ_t *ta = calloc((size_t)P, sizeof(sbi_targ_t));
     int made = 0;
-    if (th && ctxs && ta) { for (int t = 0; t < P; t++) { if (!ctx_init(&ctxs[t], maxb, 0)) break; made++; } }
+    if (th && ctxs && ta) { for (int t = 0; t < P; t++) { if (!ctx_init(&ctxs[t], w.typ, 0)) break; made++; } }
     for (int t = 0; t < made; t++) { ta[t].w = &w; ta[t].ctx = &ctxs[t]; }
-    for (int t = 1; t < made; t++) pthread_create(&th[t], NULL, sbi_worker, &ta[t]);
-    if (made > 0) sbi_worker(&ta[0]);
-    for (int t = 1; t < made; t++) pthread_join(th[t], NULL);
+    if (made > 0) par_run(th, made, sbi_worker, ta, sizeof ta[0], 1);
     for (int t = 0; t < made; t++) ctx_free(&ctxs[t]);
     free(th); free(ctxs); free(ta);
     for (int b = 0; b < nbk; b++) if (!done[b]) { size_t s0 = starts[b], nb = starts[b + 1] - s0; if (nb > 1) logos_sort_i32(a + s0, nb, 1); done[b] = 1; }
 }
 int logos_num_cpus(void) { long c = sysconf(_SC_NPROCESSORS_ONLN); return c < 1 ? 1 : (int)c; }
 
+/* ---- NaN, with a defined order, for callers who cannot promise NaN-free data ------------------------------------
+ * logos_sort_f64 leaves the ORDER unspecified when the array holds a NaN: a NaN fails every compare, so a prescan can
+ * take [1, NaN, 0.5] for ascending, and measured on an IEEE probe the non-NaN values came back out of order in most
+ * runs. What it does promise, and the harness checks, is the floor: no crash, no out-of-bounds access, and an output
+ * that is a permutation of the input's bit patterns. Making the order defined costs one more pass over the array, which
+ * the default entry does not pay (neither does std::sort, whose contract a NaN also breaks). This entry pays it: NaNs
+ * are swapped to the tail with their bits intact, and the NaN-free prefix is sorted. The pass is sequential. */
+size_t logos_nan_to_end_f64(double *a, size_t n) {
+    size_t m = n;
+    for (size_t i = 0; i < m; ) { if (a[i] != a[i]) { double v = a[i]; a[i] = a[--m]; a[m] = v; } else i++; }
+    return m;
+}
+void logos_sort_f64_nan_last(double *a, size_t n, int nthreads) { logos_sort_f64(a, logos_nan_to_end_f64(a, n), nthreads); }
+
+/* ---- the strict in-place sort, in parallel (2026-09-20) ------------------------------------------------------------
+ * The in-place entries took an `nthreads` and ignored it. `make slopebench` priced that: at 50M the sequential in-place
+ * sort costs 3.6 to 21 times what the buffered sort costs per element at ONE thread (uniform 100.7 against 25.3 ns), and the
+ * buffered sort then goes parallel while this one could not. An outside review's headline comparison was exactly this
+ * pair, in-place against buffered, and the sibling line it reviewed had a parallel in-place sort.
+ *
+ * The placement pass of an American-flag sort is cycle-following and does not split across threads without block
+ * machinery (IPS4o's); what splits for free is everything AFTER a pass, because its 256 buckets are disjoint ranges of the
+ * array. So: ranges are tasks. A worker pops a range; a small one (<= IP_GRAIN) it sorts outright with the sequential
+ * kernel; a large one gets ONE placement pass, after which its large children go back on the stack and its small children
+ * are sorted where they lie. The first pass over the whole array therefore still runs on one thread, which bounds the
+ * speed-up. MEASURED (make ipbench, 14 threads, against its own 1-thread form): 2.5x at 8.4M and 2.85x at 50M on uniform
+ * doubles, a serial share of about 30%; 1.1-1.6x on the structured shapes, whose one expensive pass IS the serial one; no
+ * loss at the 2^20 threshold. It is still 6-10x slower than the buffered sort at the same 14 threads: zero scratch is
+ * bought with time. A value that owns a whole bucket is split again by whoever pops it. NEXT: the placement pass itself,
+ * by speculative permutation with a repair phase (PARADIS); the three read-only passes before it are the cheap third.
+ *
+ * Still strictly in place: the task stack is a fixed IP_TASKS entries (96 KB) whatever n is, and a full stack means the
+ * child is sorted inline instead of queued. If the stack or the thread handles cannot be allocated the caller sorts
+ * sequentially (nothing has been touched yet); a thread that cannot be created is par_run's business, and the workers
+ * finish on "no task queued and none in hand", which does not depend on how many of them exist. */
+#ifndef IP_PAR_MIN
+#define IP_PAR_MIN (1u << 20)        /* below this the sequential kernel is done before a spawn has paid for itself */
+#endif
+#ifndef IP_GRAIN
+#define IP_GRAIN   (1u << 15)        /* a range this small is sorted by whoever holds it, not split into tasks */
+#endif
+#define IP_TASKS   4096
+#define DEFINE_INPLACE_PASS(NAME, ETYPE, KEY) \
+static void NAME(ETYPE *a, size_t lo, size_t hi, int shift, size_t *bstart) {          /* bstart: 257 entries out */ \
+    size_t cnt[256]; memset(cnt, 0, sizeof cnt); \
+    for (size_t i = lo; i < hi; i++) cnt[(KEY(a[i]) >> shift) & 0xffu]++; \
+    bstart[0] = lo; for (int b = 0; b < 256; b++) bstart[b + 1] = bstart[b] + cnt[b]; \
+    size_t next[256]; for (int b = 0; b < 256; b++) next[b] = bstart[b]; \
+    for (int b = 0; b < 256; b++) { \
+        while (next[b] < bstart[b + 1]) {                          /* the same cycle placement as the sequential kernel */ \
+            ETYPE v = a[next[b]]; unsigned tb = (unsigned)((KEY(v) >> shift) & 0xffu); \
+            if (tb == (unsigned)b) { next[b]++; } \
+            else { a[next[b]] = a[next[tb]]; a[next[tb]] = v; next[tb]++; } \
+        } \
+    } \
+}
+DEFINE_INPLACE_PASS(inplace_pass_i32, int32_t, IN_KEY_I32)
+DEFINE_INPLACE_PASS(inplace_pass_f64, double,  IN_KEY_F64)
+
+typedef struct { size_t lo, hi; int si; } ip_task_t;
+typedef struct {
+    void *a; int f64; const int *shifts; int ns;
+    ip_task_t *q; size_t top;
+    size_t inflight;                                  /* tasks queued or in hand; guarded by m, like the stack */
+    pthread_mutex_t m; pthread_cond_t cv;
+} ip_pool_t;
+static int ip_push(ip_pool_t *pl, size_t lo, size_t hi, int si) {
+    pthread_mutex_lock(&pl->m);
+    if (pl->top == IP_TASKS) { pthread_mutex_unlock(&pl->m); return 0; }
+    ip_task_t t = { lo, hi, si }; pl->q[pl->top++] = t; pl->inflight++;
+    pthread_cond_signal(&pl->cv);
+    pthread_mutex_unlock(&pl->m);
+    return 1;
+}
+static void ip_sort_range(ip_pool_t *pl, size_t lo, size_t hi, int si) {
+    if (pl->f64) inplace_msd_f64((double *)pl->a, lo, hi, pl->shifts, si, pl->ns);
+    else inplace_msd_i32((int32_t *)pl->a, lo, hi, pl->shifts, si, pl->ns);
+}
+static void ip_run(ip_pool_t *pl, ip_task_t t) {
+    if (t.hi - t.lo <= IP_GRAIN || t.si + 1 >= pl->ns) { ip_sort_range(pl, t.lo, t.hi, t.si); return; }
+    size_t bs[257];
+    if (pl->f64) inplace_pass_f64((double *)pl->a, t.lo, t.hi, pl->shifts[t.si], bs);
+    else inplace_pass_i32((int32_t *)pl->a, t.lo, t.hi, pl->shifts[t.si], bs);
+    for (int b = 0; b < 256; b++) {
+        size_t clo = bs[b], chi = bs[b + 1];
+        if (chi - clo < 2) continue;
+        if (chi - clo > IP_GRAIN && ip_push(pl, clo, chi, t.si + 1)) continue;
+        ip_sort_range(pl, clo, chi, t.si + 1);                     /* small, or the stack is full: here and now */
+    }
+}
+static void *ip_worker(void *p) {
+    ip_pool_t *pl = p;
+    pthread_mutex_lock(&pl->m);
+    for (;;) {
+        while (pl->top == 0 && pl->inflight > 0) pthread_cond_wait(&pl->cv, &pl->m);
+        if (pl->top == 0) break;                                   /* nothing queued and nothing in hand anywhere: done */
+        ip_task_t t = pl->q[--pl->top];
+        pthread_mutex_unlock(&pl->m);
+        ip_run(pl, t);
+        pthread_mutex_lock(&pl->m);
+        if (--pl->inflight == 0) pthread_cond_broadcast(&pl->cv);
+    }
+    pthread_mutex_unlock(&pl->m);
+    return NULL;
+}
+/* returns 1 when the array has been sorted, 0 when nothing was touched and the caller should sort sequentially */
+static int inplace_parallel(void *a, int f64, size_t n, const int *shifts, int ns, int P) {
+    ip_pool_t pl; memset(&pl, 0, sizeof pl);
+    pl.a = a; pl.f64 = f64; pl.shifts = shifts; pl.ns = ns;
+    pl.q = malloc(IP_TASKS * sizeof(ip_task_t));
+    pthread_t *th = malloc((size_t)P * sizeof *th);
+    if (!pl.q || !th) { free(pl.q); free(th); return 0; }
+    pthread_mutex_init(&pl.m, NULL); pthread_cond_init(&pl.cv, NULL);
+    ip_task_t root = { 0, n, 0 }; pl.q[pl.top++] = root; pl.inflight = 1;
+    par_run(th, P, ip_worker, &pl, 0, 1);                          /* stride 0: every worker shares the one pool */
+    pthread_mutex_destroy(&pl.m); pthread_cond_destroy(&pl.cv);
+    free(pl.q); free(th);
+    return 1;
+}
+
 /* ---- strict in-place entries (~1n memory; slower; for RAM-bound large n) ---- */
 void logos_sort_i32_inplace(int32_t *a, size_t n, int nthreads) {
-    (void)nthreads;                                               /* sequential for now */
     if (n < 2) return;
     int asc = 1, desc = 1;
     for (size_t i = 1; i < n && (asc || desc); i++) { if (a[i] < a[i - 1]) asc = 0; if (a[i] > a[i - 1]) desc = 0; }
@@ -5008,10 +7569,11 @@ void logos_sort_i32_inplace(int32_t *a, size_t n, int nthreads) {
     uint32_t diff = orv ^ andv; int shifts[4], ns = 0;
     for (int b = 3; b >= 0; b--) if ((diff >> (b * 8)) & 0xffu) shifts[ns++] = b * 8;
     if (ns == 0) return;                                          /* all equal */
+    { int P = effective_threads(n, nthreads < 1 ? 1 : nthreads);           /* the prescan and the OR/AND pass above stay on one thread */
+      if (P > 1 && n >= IP_PAR_MIN && inplace_parallel(a, 0, n, shifts, ns, P)) return; }
     inplace_msd_i32(a, 0, n, shifts, 0, ns);
 }
 void logos_sort_f64_inplace(double *a, size_t n, int nthreads) {
-    (void)nthreads;
     if (n < 2) return;
     int asc = 1, desc = 1;
     for (size_t i = 1; i < n && (asc || desc); i++) { if (a[i] < a[i - 1]) asc = 0; if (a[i] > a[i - 1]) desc = 0; }
@@ -5023,5 +7585,7 @@ void logos_sort_f64_inplace(double *a, size_t n, int nthreads) {
     uint64_t diff = orv ^ andv; int shifts[8], ns = 0;
     for (int b = 7; b >= 0; b--) if ((diff >> (b * 8)) & 0xffu) shifts[ns++] = b * 8;
     if (ns == 0) return;
+    { int P = effective_threads(n, nthreads < 1 ? 1 : nthreads);
+      if (P > 1 && n >= IP_PAR_MIN && inplace_parallel(a, 1, n, shifts, ns, P)) return; }
     inplace_msd_f64(a, 0, n, shifts, 0, ns);
 }

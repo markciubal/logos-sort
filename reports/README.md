@@ -33,6 +33,13 @@ with `make noiseprobe` or the memcpy probe before regenerating it.
 `engines/c/scaling-report.html` (from `make scaling`) is the third report; it is
 written next to its benchmark and not copied here.
 
+The scale report's charts zoom and pan (Ctrl + scroll or pinch, drag selections, Shift + drag, keys, per-panel buttons; its
+own "every gesture, key and button" list is under the control bar). A plain scroll moves the page on purpose. After changing
+its template, re-render without measuring (`LOGOS_SCALE_REUSE=<report.html> ./scalebench`) and run BOTH checkers from Windows:
+`node tools/check_report.js <report>` drives every chart under a stub, and `python tools/browser_check.py <report>` drives the
+first panel in real Chrome with synthetic wheel, key, mouse and touch events, in six modes. The second one found two defects in
+uPlot's log axes that the first had passed (engines/c/CHANGELOG.md).
+
 If the profile page ever shows headings but no charts, run
 `node tools/check_report.js reports/profile-report.html`: it executes the page's
 script under a stub DOM and prints what rendered, or the exception. `make

@@ -157,7 +157,22 @@ const logos_profile_t *logos_profile_get(void) { return NULL; }
 #define MOMENTUM_MAX_AVG_RUN     8
 #endif
 #ifndef FLASH_SORT_THRESHOLD
-#define FLASH_SORT_THRESHOLD     4096
+/* 4096 until 2026-09-23. Below this sort_fn has no flash sort and falls through to the scalar quicksort,
+ * which has a cliff there: with the AVX2 leaf off, 2048 and 3000 elements cost 27.5 and 36.3 ns each
+ * against 6.3 and 6.7 through flash. Paired A/B, both orientations, layout cancelled (make bandbench
+ * BB_OLD= BB_NEW=-DFLASH_SORT_THRESHOLD=2048): 2048 reads 1.286 and 3000 reads 1.352 with the AVX2 leaf
+ * on, 4.583 and 5.526 with it off (a non-AVX2 build, and every non-x86 one), and 512 / 1024 / 4096 and up
+ * are 0.986-1.016 in both. 512 is the floor, not a round number: a threshold of 512 measured 0.795 at
+ * n = 512 and 0.939 at 1024 with the AVX2 leaf on, in both orientations -- flash needs the elements. */
+#define FLASH_SORT_THRESHOLD     2048
+#endif
+#ifndef AVX2_FLASH_MAX_N
+/* The top of the window where sort_fn prefers flash_sort to the AVX2 quicksort. Laddered at one thread
+ * (2026-09-23): flash wins 1.27x at 4096 and 1.24x at 8192, 1.05-1.06x at 16384-32768, 1.03 at 65536, and
+ * LOSES 1.09x at 131072 -- which a first cut with no ceiling shipped as a regression, caught by callbench
+ * and the ladder together. Ranges this large reach sort_fn through leaf_f64's skew branch, where flash is
+ * still chosen below COARSE_MIN_N; above this bound the AVX2 kernel is the better of the two. */
+#define AVX2_FLASH_MAX_N         65536
 #endif
 #ifndef FLASH_SAFETY_RATIO
 #define FLASH_SAFETY_RATIO       0.05
@@ -462,6 +477,17 @@ static int g_no_smallnet = 0;   /* LOGOS_NO_SMALLNET=1: short ranges go back to 
 /* Read once at load, never on the sort path: this switch is live at n = 4, where two getenv calls would be
  * several times the whole sort (the knot route's first cut cost a sorted triple 6 -> 42 ns exactly that way). */
 __attribute__((constructor)) static void smallnet_env(void) { g_no_smallnet = getenv("LOGOS_NO_SMALLNET") != NULL; }
+
+/* LOGOS_AVX2_OVER_FLASH=1: put the AVX2 leaf back IN FRONT of the flash/coarse decision in sort_fn, which is
+ * where it sat until 2026-09-23. See the comment on that gate for what the order is worth and why. */
+/* -DLOGOS_AVX2_OVER_FLASH_FORCE bakes it in, which is what lets ONE binary hold both orders: the two engine
+ * copies of a paired A/B have their own statics but read the same environment. */
+#ifdef LOGOS_AVX2_OVER_FLASH_FORCE
+static int g_avx2_over_flash = 1;
+#else
+static int g_avx2_over_flash = 0;
+#endif
+__attribute__((constructor)) static void avx2flash_env(void) { if (getenv("LOGOS_AVX2_OVER_FLASH")) { g_avx2_over_flash = 1; } }
 
 /* ---- leaf primitives (indices are signed so hi < lo is a legal empty range) */
 static void insertion_sort(double *a, long lo, long hi) {
@@ -2100,7 +2126,17 @@ static double *sort_fn(double *a, size_t n, double *buf, ctx_t *c) {
     }
 #endif
 #ifdef LOGOS_AVX2_LEAF
-    if (n >= 32 && mx > mn && AVX2_TAKE(c, n) && avx2_qsort_f64(a, n)) { PATH_TAG(c, LOGOS_PATH_SIMD); return a; }   /* AVX2 leaf: unstructured data; nearly-sorted keeps coarse (its scatter is near-sequential, measured 1.23x better) */
+    /* AVX2 leaf, taken here only where FLASH SORT IS NOT AVAILABLE (n < FLASH_SORT_THRESHOLD). What the
+     * alternative is decides, not the kernel: laddered at one thread with LOGOS_NO_AVX2 (2026-09-23), the
+     * AVX2 quicksort beats the scalar quicksort below 4096 (1.31-1.47x, and 3.5-4.3x at 2048-3000 where
+     * that quicksort has a cliff) and beats coarse_bits above TYPED_MIN_N (1.11-1.38x, which is leaf_f64's
+     * own gate) -- but it LOSES to flash_sort in between, 1.24-1.34x at 4096-8192, because on data that
+     * buckets evenly classification places every element within one class of home while a quicksort pays
+     * its full log n levels. This gate used to run before the flash decision and took that whole window.
+     * The coarse branch below has the other half of this gate. Nearly-sorted keeps coarse either way
+     * (its scatter is near-sequential, measured 1.23x better). LOGOS_AVX2_OVER_FLASH=1 restores the old order. */
+    if (n >= 32 && mx > mn && (n < FLASH_SORT_THRESHOLD || n > AVX2_FLASH_MAX_N || g_avx2_over_flash)
+        && AVX2_TAKE(c, n) && avx2_qsort_f64(a, n)) { PATH_TAG(c, LOGOS_PATH_SIMD); return a; }
 #endif
     if (n >= FLASH_SORT_THRESHOLD && mx > mn && !isfinite(mx - mn)) {
         /* An infinite range (a +-inf in the data, or two finite values whose difference overflows). Every value-linear
@@ -2143,6 +2179,12 @@ static double *sort_fn(double *a, size_t n, double *buf, ctx_t *c) {
             return a;
         }
         if (n < COARSE_MIN_N && (samples[47] - samples[16]) / range >= FLASH_SAFETY_RATIO) { PATH_TAG(c, LOGOS_PATH_FLASH); return flash_sort(a, n, mn, mx, buf, c); }
+#ifdef LOGOS_AVX2_LEAF
+        /* Flash declined this range, so the alternative is coarse -- and against coarse the AVX2 quicksort wins.
+         * This is the other half of the gate above; between them the leaf takes the SIMD kernel everywhere it
+         * is the best of the three and nowhere it is not. */
+        if (!g_avx2_over_flash && AVX2_TAKE(c, n) && avx2_qsort_f64(a, n)) { PATH_TAG(c, LOGOS_PATH_SIMD); return a; }
+#endif
         if (n >= TYPED_MIN_N && skew_probe(a, n) > SKEW_PROBE_MAX) {
             int has_nan = 0; for (size_t i = 0; i < n; i++) if (a[i] != a[i]) { has_nan = 1; break; }
             if (!has_nan) { PATH_TAG(c, LOGOS_PATH_BITS_COARSE); return coarse_bits_f64(a, buf, 0, (long)n - 1, 0, 0, 0, 0, c); }
@@ -6000,6 +6042,24 @@ static __attribute__((noinline)) int wave_try_f64(double *a, size_t n, double *b
 #endif
         if (!ok) { ns_depth++; psort_f64(x, len, 1, NULL, NULL, NULL, NULL); ns_depth--; }
         runs[2 * p] = B[p]; runs[2 * p + 1] = B[p + 1] - 1;
+    }
+    /* LOGOS_WAVE_NOSWEEP=1 prices the sweep: everything up to here (the sample, the pieces, the gates and the 65 piece
+       sorts) and nothing after it. The array comes back as sorted pieces, so the OUTPUT IS WRONG BY DESIGN -- the same
+       device as `./unknotprobe nocopy`, and for the same reason: a trace build's timestamps cannot price a phase, and
+       this is a normal build. Read per sort (the route runs once per call, at n >= 1M) so one binary can alternate. */
+    if (getenv("LOGOS_WAVE_NOSWEEP")) {
+        /* Every other switch in this engine returns a CORRECT answer; this one does not, so it says so on stderr the
+           first time it fires. Without that it is a footgun: set it in a shell and every later sort of a wave-shaped
+           array comes back quietly unsorted, `make test` included. Once per process, not per sort. */
+        /* write(2), not fprintf: <stdio.h> is included only under -DLOGOS_TRACE, on purpose -- a sort library should
+           not drag stdio into every binary that links it, and the first cut of this warning broke the normal build. */
+        static int warned = 0;
+        if (!warned) {
+            static const char msg[] = "logos: LOGOS_WAVE_NOSWEEP is set -- the wave route returns UNSORTED output on purpose (it prices the sweep). Unset it for any real sort.\n";
+            warned = 1; ssize_t wr = write(2, msg, sizeof msg - 1); (void)wr;
+        }
+        TRACE("wave: sweep SKIPPED (wrong output by design)");
+        free(runs); free(B); g_wave_count++; return 1;
     }
     /* the sweep: the pieces are strands now; copy what lies alone, merge where they cross */
     rdesc_t *d; size_t *ch, nc, merged; int placed = 0;

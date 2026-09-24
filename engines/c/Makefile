@@ -328,6 +328,42 @@ datetrace: dateprobe.cpp $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -w -c logos_extra.c -o dt_extra.o
 	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) dateprobe.cpp dt_trace.o dt_extra.o -o $@ $(LDLIBS) -lm
 
+# What share of the wave route is the knot sweep? LOGOS_WAVE_NOSWEEP=1 runs everything up to the sweep and stops
+# (output wrong by design, as ./unknotprobe nocopy does), alternating inside one process so drift cancels.
+# The shape must be unknotprobe's gen_sine or the route declines and the ratio is 1.0 for the wrong reason --
+# the probe's WITNESS line says whether it fired. ./waveprobe [n] [pairs] [cycles]
+waveprobe: waveprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) -I. waveprobe.c $(LIB).a -o $@ $(LDLIBS)
+	./waveprobe 8388608 15 32
+
+# Does kinked data want more cores? The kink repair is already per-worker (detect_runs_parallel gives each thread
+# its own chunk), so this asks whether the SORT wants the threads. Two shapes: 64 shuffled blocks + kinks, and
+# `one` = ONE sorted strand + kinks. `once [P]` sorts once for a -DLOGOS_TRACE build to name the route.
+# ./kinkladder [reps] [n] [one|once] [P]
+kinkladder: kinkladder.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) -I. kinkladder.c $(LIB).a -o $@ $(LDLIBS)
+	./kinkladder 9 8388608
+	./kinkladder 9 8388608 one
+
+# The leaf's choice between the AVX2 quicksort and flash_sort, sized (2026-09-23). Both engine copies are
+# TODAY's source; they differ only in -DLOGOS_AVX2_OVER_FLASH_FORCE, which restores the order that shipped
+# before this round. Built twice with the copies swapped, so the layout bias cancels. See bandbench.c for
+# why callbench cannot answer this (its shape never reaches the window).
+#   make bandbench                                     the shipped comparison (the two orders)
+#   make bandbench BB_OLD=-DX=a BB_NEW=-DX=b           any two leaf settings, e.g. the flash threshold:
+#   make bandbench BB_OLD= BB_NEW=-DFLASH_SORT_THRESHOLD=512 then LOGOS_NO_AVX2=1 ./bandbench_b 0 bandbench_a.txt
+BB_OLD ?= -DLOGOS_AVX2_OVER_FLASH_FORCE
+BB_NEW ?=
+bandbench: bandbench.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BB_OLD) $(call RENAME,bb0) -I. -c $(SRC) -o bb_old0.o
+	$(CC) $(CFLAGS) $(BB_OLD) $(call RENAME,bb1) -I. -c $(SRC) -o bb_old1.o
+	$(CC) $(CFLAGS) $(BB_NEW) $(call RENAME,bb0) -I. -c $(SRC) -o bb_new0.o
+	$(CC) $(CFLAGS) $(BB_NEW) $(call RENAME,bb1) -I. -c $(SRC) -o bb_new1.o
+	$(CC) $(CFLAGS) bandbench.c bb_old0.o bb_new1.o -o bandbench_a $(LDLIBS)
+	$(CC) $(CFLAGS) bandbench.c bb_new0.o bb_old1.o -o bandbench_b $(LDLIBS)
+	./bandbench_a 1 > bandbench_a.txt
+	./bandbench_b 0 bandbench_a.txt
+
 callbench: callbench.c $(SRC) $(HDR)
 	@if [ -n "$(CB_BASE)" ]; then cp "$(CB_BASE)" callbench_base.gen.c; else git show HEAD:engines/c/$(SRC) > callbench_base.gen.c; fi
 	$(CC) $(CFLAGS) -w $(call RENAME,cb0) -I. -c callbench_base.gen.c -o cb_base0.o
@@ -546,7 +582,8 @@ profile-full: profbench.cpp logos_psort_prof.o $(OBJ2) $(HDR)
 # then half-decades from 32 to LOGOS_MAX_N; below 10k a size is timed as a batch of distinct inputs.
 # Per panel two charts: time per sort (linear, log-log toggle) and ns per element, whose value axis is
 # ALWAYS linear. make scalebench = std::sort / gnu_par / logos; make scale-full adds x86-simd-sort and
-# IPS4o. Overrides: LOGOS_MAX_N (default 3e7), LOGOS_MIN_N (10000 = the old ladder), LOGOS_THREADS,
+# IPS4o. Overrides: LOGOS_MAX_N (default 1e7 since 2026-09-23, for turnaround; =5e7 restores the old ceiling,
+# whose 31.6M and 50M rows were most of the run), LOGOS_MIN_N (10000 = the old ladder), LOGOS_THREADS,
 # LOGOS_MAX_SEC (default 20). LOGOS_SCALE_REUSE=<report.html> ./scalebench re-renders that report's
 # measurements through the current template and measures nothing. The node and browser checks below
 # are skipped where neither is installed (WSL here): run them from Windows, tools/check_report.js and

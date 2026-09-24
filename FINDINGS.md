@@ -494,6 +494,84 @@ Prediction and grade: I predicted bimodal's total 22.9 → about 17 ms, roughly
 1.3×. Measured 21.7 → 17.3, 1.25× on the quieter layout and 1.38× on the
 other. Right in both size and mechanism.
 
+## 3ba. The leaf's kernel is decided by its ALTERNATIVE: the AVX2 quicksort steps aside for flash between 2048 and 65536, and flash starts at 2048 (2026-09-23, `make bandbench`)
+
+The question that started it: most sorting happens at n <= 10000, so is there a brute-force method for that range
+that parallelises?
+
+**The parallel half is arithmetic, and it is not close.** Creating and joining 13 workers costs 0.564 ms (§3ay);
+the whole 10,000-element sort costs 0.108 ms. Spawn alone is 5.2x the work, so even a perfect 14-way split loses
+5x. `effective_threads` already caps at one thread per 100,000 elements and a probe confirms it holds exactly:
+a 14-thread request against a 1-thread request reads 0.97, 1.00, 0.90, 1.00, 0.99 at 100 / 1000 / 3162 / 10000 /
+31623 and first differs at **100,000** (1.16). Nothing to build; the policy is right.
+
+**The premise was also wrong, which is worth recording.** In the scale report (uniform, one thread, ns per element)
+logos is 13.6 at n=100 against `std::sort`'s 27.3, and 16.4 at 10,000 against 88.2 -- **2.0x to 5.4x ahead** across
+the whole range in question. The loss is confined to n <= 32. And x86-simd-sort is the FASTEST contender at small n
+(1.3 ns/element at n=32), not a slow one.
+
+**But the ladder the question prompted found two defects.** Laddering `LOGOS_NO_AVX2` at one thread on uniform
+doubles, min of 600 reps, the settings alternated across processes:
+
+| n | AVX2 on | AVX2 off | |
+|---|---|---|---|
+| 512 - 3000 | 5.87 - 7.70 | 8.61 - **32.84** | AVX2 wins 1.31x, and **3.50-4.26x at 2048-3000** |
+| 4096 - 32768 | 9.87 - 10.01 | 7.38 - 9.16 | **AVX2 LOSES 1.09-1.34x** |
+| 65536 | 10.09 | 10.06 | tie |
+| 131072 - 2M | 10.80 - 11.93 | 12.04 - 15.53 | AVX2 wins 1.11-1.38x |
+
+**Read the columns the right way round**: the "on" column is smooth and monotone (5.87 -> 11.93); the "off" column
+is the jagged one. The AVX2 kernel is well-behaved throughout. Both defects are about *what it is being compared to*,
+and the code agrees with the ladder at both boundaries -- 4096 is `FLASH_SORT_THRESHOLD`, 65536 is `TYPED_MIN_N`:
+
+| range | reached by | the alternative | winner |
+|---|---|---|---|
+| n < 4096 | `sort_fn` | the scalar `quicksort` at the bottom of `sort_fn` | AVX2 |
+| 4096 .. ~65536 | `sort_fn` | `flash_sort` | **flash** |
+| above | `leaf_f64` (its own gate) | `coarse_bits_f64` | AVX2 |
+
+`sort_fn`'s gate sat IN FRONT of the flash/coarse decision, so it took the whole middle row. It now fires only where
+flash is not the alternative, with a second copy on the coarse branch after flash has declined, bounded above by a new
+`AVX2_FLASH_MAX_N` = 65536. And below 4096 there is no flash at all, so the fall-through is that scalar quicksort,
+which has a cliff: 2048 and 3000 elements cost 27.5 and 36.3 ns each against 6.3 and 6.7 through flash.
+
+**Measured** (`make bandbench`: one binary, two engine copies, 80 alternating blocks, built twice with the copies
+swapped so layout cancels; one thread). The order, in the shipped configuration (flash available from 2048):
+**2048 1.303, 3000 1.227, 4096 1.185, 6000 1.133**, 8192 1.037; guards 512 0.979, 1024 0.992, 131072 1.008, 2M 0.988.
+(Measured before the threshold change, with flash from 4096, the same rows read 4096 1.237 and 6000 1.169.)
+**16384 to 65536 is NEUTRAL and is not claimed**: two runs straddle one -- 1.005-1.040 in the first and 0.964-0.979 in
+the second, with the orientations agreeing inside each run, which is drift between runs and not an effect. The window
+keeps its top at 65536 because that is where the STRUCTURE changes (above `TYPED_MIN_N` a range reaches `sort_fn` only
+through the skew branch) and because 131072 is a measured loss for flash -- a structural bound that measures neutral,
+not a curve fitted to the wins. The threshold 4096 -> 2048: **2048 1.286** (orientations 1.283 /
+1.289), **3000 1.352** (1.322 / 1.382), everything else 0.909-1.016; with `LOGOS_NO_AVX2=1`, **2048 4.583 and 3000
+5.526** with every other row 0.986-1.016 -- so that cliff is live on any build without AVX2+FMA and on every non-x86
+target, where it is a 4-6x penalty.
+
+**Four predictions graded, three wrong.**
+1. *The 14-thread small-n dip is OpenMP spin-wait* (`__gnu_parallel::sort` runs first in the row and libgomp busy-waits
+   after a parallel region). WRONG: measured directly against `OMP_WAIT_POLICY=passive`, 0.87-1.06. The dip was also
+   misread to begin with -- the report reads 0.69-1.11, not the 0.32 that started the chase.
+2. *Skipping AVX2 wherever flash is chosen.* WRONG at the top: 131072 read **0.914** on the ladder and **1.123** in
+   callbench, independently. Ranges that large reach `sort_fn` through `leaf_f64`'s skew branch, where flash is still
+   selected below `COARSE_MIN_N` (500000). A window needs BOTH ends measured.
+3. *`FLASH_SORT_THRESHOLD = 512`, the obvious floor.* WRONG: **0.795 at n = 512** and 0.939 at 1024 with the AVX2 leaf
+   on, in both orientations. A flash sort needs the elements to amortise its classification pass. 2048 is the crossover.
+4. *The band A/B, at 1.18-1.34x.* Right in size and in mechanism (1.24x at 4096, 1.17x at 6000).
+
+**The methodology point, which cost the most time.** `make callbench` narrowed to the band read **0.989-1.017 on every
+cell** and would have closed the question. Its "random" shape is `(double)(nr() >> 11)` -- integer-valued doubles
+spanning 2^53, costing 25.7 ns per element at n = 4096 where uniform doubles cost 8.3, i.e. it never takes these paths;
+and its default ladder steps 1000 -> 5000 -> 50000, straight over the window. **A bench that does not reach the code
+cannot clear it.** Check a row's absolute cost against the path you believe it took before trusting its flatness.
+`bandbench.c` exists for that reason rather than a wider `SIZES`, and it pairs any two leaf settings at the small end.
+
+**Verified.** `make test` green on all three settings (shipped, `LOGOS_AVX2_OVER_FLASH=1`, `LOGOS_NO_AVX2=1`),
+2,258-2,260 in-process resource checks each with ~1,992 injected allocation failures. `make sanitize` clean, and its
+four `nan is outside the range` reports in `flash_sort` / `coarse_bucket_sort` / `skew_probe` are **exactly the four the
+committed engine produces**, so sending more data to flash did not widen 0h (e). `make callbench` against the committed
+engine: every cancelled cell 0.933-1.040. Eleven flag variants compile; `psort_f64`'s frame is 42,576 bytes, unchanged.
+
 ## 3az. Knowing the data FORMAT: nothing for numeric timestamps, 4.9-8.5x for date TEXT (2026-09-22, `make dateprobe`, `make datestrprobe`)
 
 The proposal: detect that the values are dates and exploit the format, not just the distribution. The engine

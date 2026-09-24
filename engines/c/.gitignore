@@ -34,6 +34,12 @@ mcbench
 dllbench
 callbench_a
 callbench_b
+bandbench_a
+bandbench_b
+bandbench_a.txt
+waveprobe
+kinkladder
+kinktrace
 chaoshunt
 pairprobe
 callbench_a.txt

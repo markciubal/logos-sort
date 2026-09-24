@@ -58,6 +58,8 @@ engines/c/          FLAGSHIP. logos_psort.c (engine), logos_extra.c (argSort,
                     failed in turn), slopebench.cpp (the scaling exponent in pairs), ipbench.c (in-place, parallel),
                     reachhunt.cpp (ceilings for short-reach disorder), reachbench.c / nsgatebench.c (their paired A/Bs),
                     callbench.c (what ONE CALL costs at the small end, a baseline engine against the working tree),
+                    bandbench.c (the leaf's choice of kernel, SIZED: two copies of today's engine differing by one flag,
+                    on the shape that actually reaches those paths -- callbench's does not),
                     twistbench.c (the Moebius twist: its ceiling, its A/B, its two merge loops),
                     dllbench.c (the proposed Moebius DLL sort in C, as written and relinked, paired with the engine: slower on every shape),
                     unknotprobe.c (the unknotting problem: a circular doubly linked list unknotted by Reidemeister moves, a ring buffer
@@ -348,10 +350,30 @@ wastes the session.
 | "Treat uniform data as a complete computation": certify the distribution, sort P chunks with a parallel SIMD quicksort (x86-simd-sort's AVX2 kernel), merge them with a merge-path tree in which no level runs on one thread (`make unibench`) | **3.3-4.2x behind the engine on every shape at 8M and 14 threads, uniform included**, while the chunk sorts ALONE run at 0.76-0.86 of the engine's whole time; with std::sort per chunk 6.3-9.9x | the merge moves 3.86n on every shape and costs 87 ms where every chunk spans the range against 15-18 ms where chunks are disjoint: a merge is COMPARISON, a scatter is bandwidth (the old parallel-merge-sort entry, now with a number). On the same certificate the engine computes each element's bucket with one multiply-add on an equi-width grid and compares nothing. NOTE, found by the first cut's WRONG output: `logos_sort_f64` may not be called CONCURRENTLY (the context pool and bundle table are globals) |
 | The Logos-Moebius hybrid as handed off (scan, twist, Reidemeister I on 2-3 element dips, a fallback under 16, a galloping stitch behind an O(1) boundary check; `./tsbench 16 1048576 moebius`, `moebanat`; implementation REMOVED 2026-09-23, in git history before that commit) | **behind the engine on 14 of 16 shapes as written and 13 of 16 in its strongest form** (block shapes 1.7-2.8x, jitter 5.9-7.0x, late batch 502-543x, uniform 4,759-7,342x, a ring buffer and a newest-first log 6,382-16,213x); the specified micro-kink branch fires **0 times** on 1% adjacent swaps, and the O(1) check skips 0.0-1.6% of boundaries | a dip's first element belongs to the PRECEDING ascending run, so the descending run is one element, never 2 or 3 (the engine's repair asks both neighbours and swaps the pair back inside the run); the bail-out as written sorts a run the scan just proved sorted; and merge ORDER decides: the same runs and kernel cost 100,999 merged elements per element into one growing prefix and 4.6 bottom-up. Its one win was an engine defect, fixed (positives) |
 | The triple-reversal weld (an outside proposal): condense into runs, meta-sort them by min edge, permute them IN PLACE by triple reversals ((A^R B^R)^R = BA), weld the seams left to right behind an O(1) boundary check (`./tsbench 16 1048576 weld`, `weldanat`; implementation REMOVED 2026-09-23, in git history before that commit) | **2-4,600x behind the engine on 14 of 16 shapes at one thread** (latency shapes 11-32x, a late 5% batch 390-465x, uniform 4,079-4,639x) and 2.6-368x at 14; the O(1) check bypassed **0.0% of seams on every shape** | a maximal run swallows the next block wherever it starts higher (K = 32 on 64 staircase blocks), so units span holes and the prefix's maximum reaches the top of the range at once; the test then always fails and the merge behind it is O(prefix): quadratic. The edge round's lesson from the other side. The rotations are correct and cost 1.2-3x against a gather on block shapes. Its two wins were engine defects, both fixed (positives) |
+| Clearing the AVX2/flash window's TOP: skipping the AVX2 leaf wherever flash is chosen, with no ceiling (first cut of the leaf-order change) | **0.914 at 131072** on the ladder and **1.123 in callbench**, independently, before it was caught | ranges that large still reach `sort_fn` through `leaf_f64`'s skew branch, and flash is chosen there for anything under `COARSE_MIN_N` (500000) -- but above ~65536 the AVX2 kernel is the better of the two. A window needs both ends measured; `AVX2_FLASH_MAX_N` is the ceiling |
+| `FLASH_SORT_THRESHOLD = 512` (the obvious floor once the scalar-quicksort cliff below 4096 was found) | **0.795 at n = 512 and 0.939 at 1024** with the AVX2 leaf on, in BOTH orientations | a flash sort needs enough elements to amortise its classification pass; below ~2048 the AVX2 quicksort is better. The crossover is measured (2048), not rounded |
+| Narrowing `make callbench`'s SIZES to look for an effect between 4096 and 65536 | **0.989-1.017 on every cell**, on a change that reads 1.24-1.35x on the shape that reaches it | its "random" shape is `(double)(nr() >> 11)`, integer-valued doubles spanning 2^53, which cost 25.7 ns per element at n = 4096 where uniform doubles cost 8.3: it never takes those paths. And its ladder steps 1000 -> 5000 -> 50000, over the whole window. **A bench that does not reach the code cannot clear it** -- check a row's absolute cost against the path you think it took before believing its flatness (`make bandbench` was written for this) |
+| OpenMP spin-wait as the explanation for the scale report's small-n 14-thread dip (`__gnu_parallel::sort` runs first in the row and libgomp busy-waits after a region) | **0.87-1.06** measured directly, with `OMP_WAIT_POLICY=passive` as the control; not the effect. The dip itself was also misread -- the report reads 0.69-1.11, not the 0.32 that started the chase | at n <= 31,623 the engine runs ONE thread whatever is requested (`MIN_ELEMS_PER_THREAD` 100000), which a probe confirms (0.97-1.00 at every size, first differing at exactly 100,000: 1.16). Read the report's own numbers before explaining them |
+| Building a "one sorted strand with kinks" probe out of `a[i] = i` (`make kinkladder`) | the kink repair reported **0 fixed with 209,142 kinks planted**, on the exact shape it was built for, and the committed engine did the same -- it reads as an engine defect and it is the PROBE | adjacent swaps are a permutation, so `a[i] = i` with kinks is still a PERMUTATION OF 0..n-1 and the dense-integer bitmap claims it before the run detector is ever reached (`once` mode on a `-DLOGOS_TRACE` build named it in one line: `dense-int: 2000000 values, window 5997627`). `a[i] = i + 0.5` declines the dense route and the repair fires (41,745 of 41,746). **A shape built from consecutive integers is a different shape from the one you meant**, and the ledger already had the same trap from the other side (a harness row built from a SORTED array never reached its gate) |
+| A benchmark log that changes UNITS mid-column (`make scalebench`'s console: `u = small ? 1e6 : 1.0`, labelled ns below `SMALL_N` and ms from there up) | read as a 300,000x cliff in the SORT. uniform, one thread, the logos column: `n=1000 ns 7908.0`, `n=3162 ns 27330.0`, `n=10000 ms 0.1` -- "it skyrockets at 3162 then drops below n=1", which printed 0.6. Per element the same rows are **7.91, 8.64, 9.01, 8.91 ns**: no cliff, nothing to isolate | the switch sat at exactly the seam, so it looked like a property of that n. Now ONE unit for the whole table -- nanoseconds, two decimals (`fmt_ns`), `%14s` spanning the 0.01 ns floor to ~2e9 -- and the row ends with ns PER ELEMENT, the only column comparable down the page. An intermediate cut gave each value its own auto-scaled suffix (ns/us/ms/s); it was unambiguous but unscannable and unpasteable, so it went. Only the calibration line stays in ms, deliberately: two labelled reference values, not a column, compared against figures recorded in ms everywhere else. No other bench here has a conditional unit label. **Print the comparable quantity, and never let a column change unit** |
 | Trusting a stub of the chart library with a ZOOMED window (the scale report's zoom and pan, first cut) | 216 charts driven clean under the stub; in real Chrome a log axis **could not be zoomed inside one decade** and a pan **killed the tab** (`Invalid array length`) | uPlot passes EVERY x window through the scale's range function, explicit ones included, and its log default rounds the far end up to the next decade (100..25k came back 100..100k); and its log ticks walk up from the window's lower end and loop forever when that end is below 1 with a mantissa of 9.5+ (9.6e-6 + 1e-6 rounds to 1.1e-5, a step it has no decimals for, so every later tick is 0). Its own zoom never meets the second BECAUSE of the first. A log axis here brings its own range and its own ticks; the stub rounds like uPlot and refuses a log axis without `splits()`; `tools/browser_check.py` DRIVES the charts in real Chrome. Second time a stub hid a log-axis defect: **a fake of a library must reproduce its awkward behaviour, and a chart nobody has dragged is a chart nobody has tested** |
 
 ## POSITIVE results worth building on
 
+- **The leaf picks its kernel by what the ALTERNATIVE is, not by the kernel** (`make bandbench`, off with
+  `LOGOS_AVX2_OVER_FLASH=1`): `sort_fn`'s AVX2 gate sat in front of the flash/coarse decision and took the whole middle of
+  the size range. What it replaces differs by size -- the scalar `quicksort` below `FLASH_SORT_THRESHOLD` (AVX2 wins
+  1.31-1.47x), `flash_sort` from there to about 65536 (**flash** wins), `coarse_bits_f64` above that (AVX2 wins 1.11-1.38x,
+  which is `leaf_f64`'s own gate). The gate now fires only where flash is not the alternative, with a second copy on the
+  coarse branch after flash declines, bounded by a new `AVX2_FLASH_MAX_N` = 65536. Shipped configuration: **2048 1.303,
+  3000 1.227, 4096 1.185, 6000 1.133**, 8192 1.037; guards 512 0.979, 1024 0.992, 131072 1.008, 2097152 0.988.
+  **16384-65536 is NEUTRAL and is not claimed** (two runs straddle one: 1.005-1.040 and 0.964-0.979); the top stays at
+  65536 because that is where the structure changes, not because the curve does. And `FLASH_SORT_THRESHOLD` goes
+  **4096 -> 2048**: below it `sort_fn` falls through to that scalar quicksort, which has a cliff there (2048 and 3000
+  elements cost 27.5 and 36.3 ns each against 6.3 and 6.7 through flash). **2048 1.286, 3000 1.352** with the AVX2 leaf on
+  and **4.583 / 5.526 with it off** -- so the cliff is live on any build without AVX2+FMA and on every non-x86 target.
+  512 is the floor and not a round number: a threshold of 512 measured 0.795 at n = 512. One thread; both are sequential-leaf
+  decisions. Same 4 sanitizer reports as the committed engine (0h (e) not widened), callbench 0.933-1.040, frame unchanged.
 - **A galloping two-strand merge for a sparse strand over dense blocks** (`knot_merge2g_*`, `./knotbench 60 8388608 gallop`, FINDINGS
   §3aj; off with `LOGOS_NO_KNOT_GALLOP=1`): one sparse strand spanning every value made every block a crossing of a few sparse elements
   and the whole block, and the branch-free merge touched every element. Eight branch-free steps while the strands alternate; when one
@@ -416,7 +438,15 @@ wastes the session.
   14 WAITING at a barrier** from static output tiles; the shared sample is 1-4% and strictly serial; and kinked data sorts
   fastest on ONE thread at every P (6.84 ms against 15.6 at two and 7.2 at fourteen). Two cheap remedies were measured and
   rejected (see the ledger), which leaves the two real ones: a parallel merge for the counting routes (0a) and a task queue
-  for relocation's placement.
+  for relocation's placement. **The kinked row's MECHANISM, traced 2026-09-23 (`make kinkladder`): the kink repair fires at
+  one thread and NEVER above it** -- `kinks fixed` reads 41,745 at P = 1 and **0** at P = 2, 3, 4, 6, 8, 10 and 14 -- because
+  at P > 1 the NEAR-SORTED route claims the array before relocation is reached (`ns: split + in-band sorts done, 4998 strays`)
+  and the detector never runs, so ~41,745 runs are sorted instead of one repaired strand: 19.4 ms at one thread against 33.2
+  at two and 24.6 at fourteen. **Kinks inside SHUFFLED BLOCKS are unaffected and scale 2.9-3.1x at 14 threads**, because
+  relocation takes those at every P. So it is a route decision at P > 1, exactly as the ledger row on gating that route
+  concluded, and the gate wants a statistic that tells adjacent swaps from displaced ones: here the shared sample read
+  `inv = 0.000, inv_all = 0.000` and the reach probe said `42 descents in 16384 -> sparse`, both of which say "local",
+  where 1% random swaps would not.
 - **The run detector's block of eight compares with vectors** (`reloc_blocks_up` / `reloc_blocks_down`, `LOGOS_SCANBLOCK_SCALAR=1`,
   `-DLOGOS_NO_SIMD_SCAN`; found by the handoff round, `TS_SWITCH=LOGOS_SCANBLOCK_SCALAR ./tsbench 40 8388608 switch`, two runs): the
   loop the trace puts at 89% of a kinked strand's sort was thirteen scalar `subsd` / `maxsd` / `comisd`, read from the disassembly. Two
@@ -803,7 +833,12 @@ wastes the session.
    copy back) or by a direct 3- and 4-way merge from the source. **Re-measure old parallel wins against the current partition before
    building on them.** Also open on the knot route: an int32 twin (that path has no relocation at all), and ~~a sparse strand over dense~~ (DONE 2026-09-21: the galloping two-strand merge, 2.45-2.70x at one thread)
    blocks, which the cost gate prices as whole-block crossings though a galloping merge would touch a few elements.
-0g. **The small end** (`make scale-full`, FINDINGS §3ad). Below about a hundred elements logos loses to std::sort on every shape: 9x at
+0g. **The small end** (`make scale-full`, FINDINGS §3ad). **Two parts of this are now settled (FINDINGS 3ba, 2026-09-23).
+   (i) There is nothing to parallelise below ~100k**: creating and joining 13 workers costs 0.564 ms where a whole
+   10,000-element sort costs 0.108, so spawn alone is 5.2x the work, and `effective_threads` already holds the line exactly
+   (a 14-thread request reads 0.97-1.00 against a 1-thread request at every size to 31,623 and first differs at 100,000).
+   **(ii) The range from 2048 to 65536 was taking the wrong kernel** and now does not (see the positives). What is left below
+   is the n <= 32 regime, which is where the whole remaining loss lives. Below about a hundred elements logos loses to std::sort on every shape: 9x at
    n = 3-5, 2x at 10-32 (a call is 8 ns at n = 0 and 48 at n = 3, against 0.3 and 5.3), ahead for good from n >= 100 on the random
    shapes, 316 on the block shapes, 1000 on near_sorted. And **between 25 and 76 elements the dispatcher pays for a plan it never
    uses**: insertion sort hands over to run detection at 25, random data there is runs of two or three, a relocation plan is built
@@ -1013,10 +1048,31 @@ make leafbench       # leaf knobs A/B (measured negative; template)
 make theorybench     # bucket count, branch-free leaf, interleave, line repair; six variants
 make profile         # per-phase profile -> profile-report.html (treemaps, stalls, GB/s)
 make profile-full    # same, with x86-simd-sort (AVX-512 or AVX2) and IPS4o beside every cell
-make scale-full      # time vs n (0, 1, 3, 5, 10, then half-decades to 3e7) for every sort and THIRTEEN shapes (nine standard + block_twist,
-                     # block_kinked, sine_slope, reach_mirror; about 12 minutes) -> scale-report.html: per panel a time chart and an
-                     # ns/element chart whose value axis is always linear; below 10k a size is a batch of distinct inputs. LOGOS_MIN_N=10000 = the old ladder;
+make scale-full      # time vs n (0, 1, 3, 5, 10, then half-decades to LOGOS_MAX_N, default 1e7 since 2026-09-23) for every sort and
+                     # THIRTEEN shapes (nine standard + block_twist,
+                     # block_kinked, sine_slope, reach_mirror) -> scale-report.html: per panel a time chart and an
+                     # ns/element chart whose value axis is always linear; below 10k a size is a batch of distinct inputs. LOGOS_MAX_N=5e7 restores the
+                     # old ceiling (its 31.6M and 50M rows were most of the run, and the ns/element curves still
+                     # rise past 10M, so use it when the top of the curve is the question); LOGOS_MIN_N=10000 = the old ladder;
                      # LOGOS_SCALE_REUSE=<report.html> re-renders measured data through the current template without measuring.
+                     # THE SEAM: below 10k a point is a BATCH of distinct instances (~2 MB swept, cache-cold, none repeated),
+                     # at 10k and above it is ONE array sorted repeatedly with the MINIMUM kept (78 KB, L2-resident, same
+                     # input every rep). Working set, branch history and statistic all flip there, all favouring the right.
+                     # A dashed rule marks it on every chart and a seam pass measures the step: n = 10000 timed BOTH ways,
+                     # per contender per panel, printed as `batch / single` and shown as a table row. ~33 s;
+                     # LOGOS_SCALE_SEAM=0 skips it. MEASURED: 1.03-4.64x across the 1-thread contenders (median 2.69), and
+                     # 6-174x for __gnu_parallel::sort at P threads, where a batch opens 26 parallel regions over 10k
+                     # elements. Read it before calling a jump at that x an algorithmic cliff -- and note it does NOT
+                     # explain every one: sine_slope has the report's BIGGEST cliff (2.34x / 2.64x) and among its
+                     # SMALLEST seams (1.34x / 1.54x), so that jump is the DATA (a shape is not the same shape at 3162
+                     # as at 10000, and the routing gates are ratios of n). The two causes are separated by this row.
+                     # MEMORY: each point carries a circle sized by the peak heap of one COLD call at that size, in BYTES PER
+                     # ELEMENT, from a pass that runs after all the timing (releasing the pools is what makes a call cold, so
+                     # doing it between timed rows would leave the next row paying for its buffers). The largest reading in the
+                     # report is 30 px across and the rest scale linearly by it, so a circle means the same number in every
+                     # panel; std::sort and the in-place entry draw none (they allocate nothing), and n < 10k has none (a size
+                     # there is a batch). LOGOS_SCALE_MEM=0 skips the pass. The draw hook counts what it strokes in
+                     # window.__MEMCIRCLES, which is how a test says the circles reached the canvas rather than assuming it.
                      # The charts zoom and pan (Ctrl + scroll, drags, keys, pinch; a plain scroll moves the page). After touching the
                      # template run BOTH checkers from Windows: node tools/check_report.js, python tools/browser_check.py (it drives them)
 make noiseprobe      # min/median/max of one sort per thread count: how noisy is this box right now?
@@ -1074,6 +1130,27 @@ make strandprobe     # `... kinks`: adjacent pairs swapped inside runs, against 
 make mirrorprobe     # `... ab [row]` = the whole-array orientation bit against LOGOS_NO_MIRROR=1 (mirrored rows and as-it-lies guards). Also: where else an orientation bit pays: each cheap route's shape against its MIRROR image (ceiling) and against one timed
                      # reversal pass plus the sort (simple), uniform and block controls, descending teeth for the leaf's detector;
                      # `./mirrorprobe 60 8388608 tail` = the tail route against LOGOS_NO_TAIL=1; make mirrortrace + `once` = the routes taken
+make waveprobe       # what share of the wave route is the KNOT SWEEP: LOGOS_WAVE_NOSWEEP=1 runs everything up to the sweep
+                     # and stops (output wrong by design, as ./unknotprobe nocopy does), the two alternating inside one
+                     # process. MEASURED: the sweep is 51.3% of the route at 8.4M / 32 cycles, and its share is FLAT in
+                     # strand count (54.5% at 16 pieces, 46.2% at 128), so it is O(n) movement -- knot_place_seq writes n
+                     # and the copy-back reads n -- not O(n log strands). Read its WITNESS line first: the shape must be
+                     # unknotprobe's gen_sine or the route declines and the ratio is 1.0 for the wrong reason
+make kinkladder      # does kinked data want more cores? The repair is ALREADY per-worker (detect_runs_parallel gives each
+                     # thread its own chunk). `./kinkladder 9 8388608` = 64 shuffled blocks + kinks, which scale 2.9-3.1x at
+                     # 14 threads; `... one` = ONE sorted strand + kinks, which does NOT: 19.4 ms at 1 thread against 33.2 at
+                     # 2 and 24.6 at 14, because at P > 1 the NEAR-SORTED route claims it before relocation and the kink
+                     # repair never runs (`kinks fixed` reads 41,745 at one thread and 0 at every other). `once [P]` sorts
+                     # once for a -DLOGOS_TRACE build to name the route. Its own shape bug is the lesson: a[i] = i is a
+                     # PERMUTATION OF 0..n-1 even after adjacent swaps, so the dense-integer bitmap claimed it and the
+                     # repair read 0 fixed, which looked like an engine defect for an hour. + 0.5 fixes it
+make bandbench       # the leaf's choice between the AVX2 quicksort and flash_sort, SIZED: one binary, two copies of today's
+                     # engine differing only in -DLOGOS_AVX2_OVER_FLASH_FORCE, built twice with the copies swapped so the
+                     # layout bias cancels. 12 sizes from 512 to 2M on uniform doubles, which is the shape that reaches
+                     # these paths (callbench's does not: see its header and the ledger).
+                     # make bandbench BB_OLD=-DX=a BB_NEW=-DX=b   pairs ANY two leaf settings at the small end, e.g.
+                     # make bandbench BB_OLD= BB_NEW=-DFLASH_SORT_THRESHOLD=2048; add LOGOS_NO_AVX2=1 to ./bandbench_a|_b
+                     # to see what a build without AVX2+FMA does (where the scalar quicksort's 2048-3000 cliff is live)
 make callbench       # what ONE CALL costs at n = 0..50000, random and sorted: a baseline engine (the committed one, or CB_BASE=<source>) against
                      # the working tree, two binaries with the copies swapped. Run it after touching the first page of the dispatcher or the
                      # leaf. A row counts at n <= 5, in both orientations and two runs, with a mechanism visible in the assembly.

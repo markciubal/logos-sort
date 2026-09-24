@@ -1,5 +1,217 @@
 # Changelog
 
+## (unreleased) — the wave route's sweep priced at 51%, and the kink repair traced to one thread only (`make waveprobe`, `make kinkladder`)
+
+Two diagnoses, no engine change. Both started as ideas that looked good and both died on their first measurement,
+which is the cheap outcome.
+
+**The wave route: the sweep is 51.3% and it is O(n), not O(n log strands).** A spectral (Goertzel) projection of the
+position-ordered sample was proposed to find the monotone pieces better. Killed in thirty seconds by a trace, before
+any code: the median filter already finds **65 pieces against a true 64, with 1978 of 1983 sample pairs agreeing**,
+and turning points are *already* refined to element resolution by a scan between sample points. Detection is ~5% of
+the route and it is right. The sweep was then priced properly with a new `LOGOS_WAVE_NOSWEEP=1` (everything up to the
+sweep, then stop -- output wrong by design, the `./unknotprobe nocopy` device), alternating inside one process:
+**51.3% of the route** (166.8 ms full against 78.5 without, median 2.053, p10 2.017 p90 2.352). The obvious follow-up,
+pairing adjacent pieces to halve the strand count, was then killed by the same probe: the sweep's share is **flat in
+strand count** -- 54.5% at 16 pieces, 53.0% at 32, 50.1% at 64, 46.2% at 128 -- so it is `knot_place_seq` writing n
+plus the copy-back reading n, and halving the strands would save nothing while adding a merge pass. What is left is
+the copy-back, which is the already-logged sorted-description lever (1.21-1.35x on block shapes).
+
+**The kink repair fires at one thread and never above it.** Asked: why aren't kinks divided among the cores? They
+are -- `detect_runs_parallel` gives each worker its own chunk and each repairs its own kinks. But `make kinkladder`
+shows `kinks fixed` = **41,745 at P = 1 and 0 at P = 2, 3, 4, 6, 8, 10, 14**, and the trace says why: at P > 1 the
+NEAR-SORTED route claims a single kinked strand before relocation is reached, so the detector never runs and ~41,745
+runs get sorted instead of one repaired strand. 19.4 ms at one thread against 33.2 at two and 24.6 at fourteen.
+**Kinks inside shuffled blocks are unaffected and scale 2.9-3.1x**, because relocation takes those at every P. This
+confirms the amprobe row ("kinked data sorts fastest on ONE thread at every P") and supplies its mechanism; the fix
+is the route decision the ledger already called for, not a thread cap.
+
+**And one probe bug worth the ledger row it got.** The one-strand shape was first built as `a[i] = i`, which after
+adjacent swaps is still a PERMUTATION OF 0..n-1: the dense-integer bitmap claimed it before the detector, `kinks
+fixed` read 0, and it looked like an engine defect -- the committed engine did the same, which is what made it look
+real rather than mine. `a[i] = i + 0.5` declines the dense route and the repair fires. A `-DLOGOS_TRACE` build named
+the route in one line. The same trap as the harness row built from a sorted array that never reached its gate.
+
+## (unreleased) — the scale bench's console switched from ns to ms mid-table, at the seam, and it read as a cliff in the sort (`make scalebench`)
+
+Reported as: the sort takes far too long around n = 3162, then drops to faster than n = 1, on every algorithm.
+
+**It was the units.** `const double u = small ? 1e6 : 1.0` with a label of `"ns"` below `SMALL_N` and `"ms"` from
+`SMALL_N` up, so the per-sort column changed unit in the middle of the table -- at exactly the seam, which is why it
+looked like a property of that x. For uniform at one thread the logos column printed:
+
+```
+n=1000    ns      7908.0
+n=3162    ns     27330.0     <- "skyrockets"
+n=10000   ms         0.1     <- "drops to even faster than n=1", which printed 0.6
+```
+
+A 300,000x collapse in the printed figure, none of it real. The comparable quantity runs straight through it:
+**7.91, 8.64, 9.01, 8.91 ns per element.** There is no cliff at 3162 and there was nothing to isolate.
+
+**Fixed: ONE unit for the whole table, nanoseconds, two decimals** (`fmt_ns`). An intermediate cut gave each value
+its own auto-scaled suffix (ns / us / ms / s); that removed the ambiguity but left a column nobody can scan or paste
+into anything, which is half the point of the log. Fixed ns holds both ends -- the floor is 0.01 ns (what
+`best_small` reports when a sort is inlined away on an empty range) and the widest value is about 2e9 ns -- so `%14s`
+covers 0.01 to 2000000000.00. The row now also ends with **ns per element for logos at both thread counts**, the only
+column that may be read down the page. uniform prints 9126.73, 44724.53, 128415.56, 295656.00, 962727.99 ns across
+316..32000: one unit, monotone, no cliff. The **one deliberate exception** is the calibration line above the table,
+which stays in milliseconds: it is two labelled reference values, not a column, and its job is comparison against
+figures recorded in ms throughout the project (CLAUDE.md's quiet ~2.9 ms / ~65 ms).
+
+**Checked for the same defect elsewhere:** no other bench in `engines/c` has a size-dependent unit, and none has a
+conditional unit label at all. It was unique to this file.
+
+**The lesson, and it is not a small one.** Three separate investigations this session started from this table --
+including one where I measured a real 2.3-2.6x mode artifact and a real 1.24-1.35x engine defect, both genuine, while
+the thing that prompted the question was a printf. **A log that changes units mid-column is a measurement error, not
+a formatting preference.** Print one unit per value or one unit per table, and always print the quantity that is
+comparable across rows.
+
+## (unreleased) — the scale report's batch/single SEAM is marked and measured, and it does not explain every cliff (`make scalebench`)
+
+Asked about: a point between 3162 and 10000 where the curve leaps and then falls, **on every benched algorithm at
+once**. That last clause is the diagnosis. Sizes below `SMALL_N` (10000) are timed as a BATCH of distinct instances
+and sizes from there up as ONE array sorted repeatedly, and three things flip at that x together, all favouring the
+right-hand side:
+
+| | n < 10000 | n >= 10000 |
+|---|---|---|
+| working set | `ni = 262144/n` instances, **~2 MB**, exceeds L2 | one array, **78 KB**, L2-resident |
+| branch history | a different instance every time | the **same** array re-copied every rep |
+| statistic | batch total / ni | **minimum** over reps |
+
+**Built:** a dashed rule on every chart marks the seam, and a **seam pass** measures it -- n = 10000 timed BOTH ways,
+per contender per panel, printed to the console and carried into the report as a `batch / single` row in the
+ns-per-element table. About 15 s; `LOGOS_SCALE_SEAM=0` skips it. A reader can now tell the two apart instead of
+taking the step on trust.
+
+**Measured, full run** (13 shapes, both thread counts, calibration memcpy 3.78 ms / std::sort 1M 80.2 ms). Across the
+one-thread contenders the step is **1.03x to 4.64x, median 2.69x**; for logos alone it runs 0.84x to 4.11x over the
+26 panels. So the seam is real and it is large -- roughly a factor of three, typically.
+
+**But it does not explain every cliff, and that is the useful half.** The first draft of this entry said it did. The
+measurement says otherwise: **sine_slope, which has the biggest cliff in the report (2.34x at one thread, 2.64x at
+fourteen), has among the SMALLEST seams (1.34x and 1.54x)**, while block_perm at one thread has the largest seam
+(4.11x) and no comparable cliff. So the two are not the same thing: a shape is not the same shape at 3162 as at
+10000 -- the number of runs, cycles or distinct values in it moves with n, and the engine's routing gates are ratios
+of n. **Both causes are in this report and the seam row is what separates them.** The caption says so.
+
+**The extreme values are `__gnu_parallel::sort` at P threads: 6x to 174x.** Not a fault in the measurement, the point
+restated. A batch calls the sort 26 times back to back, so 26 parallel regions are opened and joined over 10k
+elements (11.2 ms per sort on quantized, against 0.065 ms measured singly). Everything plotted left of the line for a
+parallel contender is per-call parallel-region cost, not sorting. The caption now says that too.
+
+**A measurement that had to be thrown away.** The first cut measured the step at the LAST BATCHED size (3162)
+instead, since that is the point that looks anomalous. Worthless: one sort there is about 20 us and the big path
+runs 5 reps, which is exactly the clock-resolution problem batching exists to solve. gnu_par came back scattered
+from **0.01x to 2.41x** across the shapes. The step is measurable only where both modes resolve, which is at
+`SMALL_N` itself.
+
+**Verified, including the part a stub cannot see.** `node tools/check_report.js` passes (312 series, 208 charts
+driven in 6 views). The rule is drawn by a uPlot `draw` hook onto a 2d context and **the stub has no canvas at all**,
+so it counts what it strokes in `window.__SEAMRULES` and `tools/browser_check.py` now reads that back -- and asserts
+`__MEMCIRCLES` the same way, which nothing had done since the circles shipped. Proven to be a real test rather than a
+tautology: against a report built from the committed code it fails with `__SEAMRULES=undefined`, against this one it
+passes. Two errors remain in the reduced 3-size report used while developing (a log-axis drag, and the `n <= 10`
+preset having no data when `LOGOS_MIN_N=1000`); a control report built from the COMMITTED scalebench shows both
+identically, so neither belongs to this change.
+
+## (unreleased) — the leaf picks its kernel by what the ALTERNATIVE is: the AVX2 quicksort steps aside for flash sort between 2048 and 65536, and flash starts at 2048 instead of 4096 (`make bandbench`)
+
+Asked for, in substance: most of the sorting happens at n <= 10000, so is there a brute-force method for that range that
+parallelises? **No, and the arithmetic is not close**: creating 13 workers costs 0.564 ms where the whole 10,000-element
+sort costs 0.108, so spawn alone is 5.2x the work. `effective_threads` already knows (one thread per 100k elements), and
+a probe confirms it holds: a 14-thread request reads 0.97-1.00 against a 1-thread request at every size to 31,623 and
+first differs at exactly 100,000 (1.16). **But the question was the right one anyway**, because the ladder it prompted
+found two defects in that range, both now fixed.
+
+**The mechanism, which is the whole entry.** There are two AVX2 leaf call sites, and *what they replace* differs by size:
+
+| range | the alternative | winner |
+|---|---|---|
+| n < FLASH_SORT_THRESHOLD | the scalar `quicksort` at the bottom of `sort_fn` | AVX2, 1.31-1.47x |
+| FLASH_SORT_THRESHOLD .. ~65536 | `flash_sort` | **flash, 1.24-1.35x** |
+| above that | `coarse_bits_f64` (`leaf_f64`'s own gate) | AVX2, 1.11-1.38x |
+
+The gate in `sort_fn` sat *in front of* the flash/coarse decision, so it took the whole middle row. It now fires only
+where flash is not the alternative, and a second copy of it sits on the coarse branch, after flash has declined. The
+bounds are not guesses: 4096 was `FLASH_SORT_THRESHOLD` (where flash becomes available) and the top is a new
+`AVX2_FLASH_MAX_N` = 65536, set from the ladder. `LOGOS_AVX2_OVER_FLASH=1` restores the old order.
+
+**And `FLASH_SORT_THRESHOLD` was too high.** Below it `sort_fn` falls through to the scalar quicksort, which has a cliff
+there: with the AVX2 leaf off, 2048 and 3000 elements cost **27.5 and 36.3 ns each against 6.3 and 6.7** through flash.
+On this box the AVX2 leaf hides it; on a build without AVX2+FMA, and on every non-x86 target, it is live. 4096 -> 2048.
+
+**Measured** (`make bandbench`: one binary, two engine copies, 80 alternating blocks, built twice with the copies swapped
+so the layout bias cancels; one thread, uniform doubles). The two changes, each against the engine without it:
+
+- the order, AVX2 leaf on, in the SHIPPED configuration (so flash is available from 2048): **2048 1.303, 3000 1.227,
+  4096 1.185, 6000 1.133**, 8192 1.037; guards 512 0.979, 1024 0.992, 131072 1.008, 2097152 0.988. Measured before the
+  threshold change, with flash from 4096, it read 4096 1.237 and 6000 1.169 on the same rows.
+- **16384 to 65536 is NEUTRAL and is not claimed**: two runs straddle one (1.005-1.040 in the first, 0.964-0.979 in the
+  second, orientations agreeing inside each). The window keeps its top at 65536 anyway, because that is where the
+  structure changes -- above `TYPED_MIN_N` a range reaches `sort_fn` only through the skew branch, and 131072 is a
+  measured LOSS for flash. The bound is structural and measured-neutral, not fitted to a curve.
+- the threshold, AVX2 leaf on: **2048 1.286** (orientations 1.283 / 1.289), **3000 1.352** (1.322 / 1.382); 512 0.998,
+  1024 0.990, everything from 4096 up 0.909-1.016.
+- the threshold, `LOGOS_NO_AVX2=1`: **2048 4.583, 3000 5.526**; every other row 0.986-1.016.
+
+**Five things measured and NOT shipped, which is most of what the round cost:**
+1. *The premise.* logos already beats `std::sort` from n=100 (2.0x) to n=10000 (5.4x) in the scale report; the loss is
+   confined to n <= 32. And x86-simd-sort is the FASTEST thing at small n (1.3 ns/element at n=32), not the slow one.
+2. *A regression I nearly shipped.* The first cut had no ceiling, so it skipped AVX2 wherever flash was chosen --
+   including n >= 65536, which reaches `sort_fn` through `leaf_f64`'s skew branch with flash still selected below
+   `COARSE_MIN_N`. 131072 read **0.914** on the ladder and **1.123** in callbench, independently. Hence `AVX2_FLASH_MAX_N`.
+3. *A floor of 512 for the flash threshold.* 512 elements read **0.795** and 1024 read 0.939 with the AVX2 leaf on, both
+   orientations agreeing. Flash needs the elements; 2048 is the crossover, not a round number.
+4. *A wrong diagnosis, graded.* The scale report's 14-thread small-n dip was predicted to be OpenMP spin-wait from
+   `__gnu_parallel::sort` running first in the row. Measured directly: **0.87-1.06**, not the effect. (The 0.32 that
+   started the chase was also wrong; the report reads 0.69-1.11.)
+5. *`make callbench` could not see any of this.* Narrowed to the band it read **0.989-1.017 across every cell** and would
+   have closed the question. Its "random" shape is `(double)(nr() >> 11)` -- integer-valued doubles spanning 2^53, which
+   cost 25.7 ns per element at n = 4096 where this shape costs 8.3, i.e. it never reaches these paths at all; and its
+   default ladder steps 1000 -> 5000 -> 50000, straight over the window. **A bench that does not reach the code cannot
+   clear it, and a flat row from one is not a result.** That is why `bandbench.c` exists rather than a wider `SIZES`.
+
+**Verified.** `make test` green on all three settings (shipped, `LOGOS_AVX2_OVER_FLASH=1`, `LOGOS_NO_AVX2=1`), including
+2,258-2,260 in-process resource-exhaustion checks with ~1,992 injected allocation failures each. `make sanitize` clean,
+and its 4 `nan is outside the range` reports in `flash_sort` / `coarse_bucket_sort` / `skew_probe` are **exactly the 4 the
+committed engine produces** -- sending more data to flash did not widen open direction 0h (e). `make callbench` against
+the committed engine: every cancelled cell 0.933-1.040, nothing at the small end more expensive, n=50000 random 0.947.
+Eleven flag variants compile. `psort_f64`'s frame is **42,576 bytes, unchanged**.
+
+## (unreleased) — the scale report carries MEMORY: a circle per point, sized by the peak heap of one cold call in bytes per element (`make scale-full`)
+
+Asked for: memory on the graphs, as circles, the largest 30 px across and the rest scaled by it.
+
+**Measured** by a pass of its own in `scalebench.cpp`, with the allocator interposed exactly as `memprobe.c` does it.
+Three things decided its shape:
+- It runs AFTER all timing. Releasing the engine's pools is what makes a call cold, and doing that between timed rows
+  would have left the next row's first call paying for its buffers. The interposer tests its armed flag first, so the
+  timed sorts pay one relaxed load per allocation and they make very few.
+- The unit is BYTES PER ELEMENT, as `make memprobe` reports. Absolute bytes would only grow with n and say nothing.
+- Only n >= 10k: below that a size is a BATCH of distinct inputs, so a peak would be the batch's, not one sort's.
+`LOGOS_SCALE_MEM=0` skips the pass (it cost 568 s of the full run). Reports made before this change simply carry no
+circles: the toggle is not offered when nothing was measured.
+
+**It reproduces memprobe from a separate code path**, which is the useful part. uniform, one thread, bytes per element:
+std::sort 0.0 at every size, x86-simd-sort 0.0, the strict in-place entry 0.0; logos 49.6 at 10k falling to **15.7 at
+10M against memprobe's documented 15.5**; LSD radix ~16 (a full ping-pong buffer); timsort 3.9; IPS4o 214.8 at 10k
+falling to 0.2 at 10M as its fixed buffers amortize.
+
+**Drawn** by a custom uPlot `draw` hook, because `series.points.size` is a scalar and this needs a radius per point. The
+hook closes over the memory columns, so it wants nothing from the instance but `ctx`, `bbox` and `valToPos`; it clips to
+the plotting rect and scales by the device pixel ratio, so 30 px means 30 CSS px. ONE maximum for the whole report, not
+per panel, so a circle means the same number everywhere. A `memory circles` button toggles it.
+
+**Verified, and not by the green checks alone.** Both required checkers pass from Windows (the stub drives 312 charts;
+real Chrome is clean in all six views) -- but neither proves a circle reached the canvas, and this repo has been burned
+by exactly that (a stub once passed a report whose log panels were blank). So the hook counts what it strokes in
+`window.__MEMCIRCLES` and a browser probe reads it back: **1012 circles on first render, 0 after clicking the toggle
+off**. NOTE on the run that produced the committed report: its calibration line reads 4.69 ms / 90.2 ms against a quiet
+2.9 / 65, so the box was loaded and the TIMES are inflated; the memory readings are peak heap and do not depend on it.
+
 ## (unreleased) — the queued ideas, A/B'd one at a time: a work queue that pays on a COMPUTE phase and measures nothing on a MEMCPY phase, and branchless sorting networks at the small end (1.03x at n = 4 to 1.58x at n = 16)
 
 Asked: run the A/B tests on the queued ideas and merge what succeeds. Four were built and measured, three were closed

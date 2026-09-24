@@ -200,6 +200,31 @@ DRIVER = r"""<script>(async function(){
    await key('0');isHome('the reset after the touches');
   }
 
+  /* WHAT ACTUALLY REACHED THE CANVAS. Both of these are drawn by uPlot `draw` hooks onto a 2d context, so the stub
+     in check_report.js cannot see them at all -- it has no canvas. Each hook counts what it strokes in a global,
+     and this reads the counter back. Without it a hook that returns early on a missing guard passes every test.
+     META, DATA, RANGE, MEMMAX and SHOWMEM are top-level const/let in the report, so they are in lexical scope here
+     but NOT on window; typeof-guarded because a report predating either feature simply will not have them. */
+  try{
+   /* Only where the CURRENT size preset can show the thing: the 'n <= 10' presets hold no memory readings at all
+      (the memory pass skips everything below the seam) and no seam either, so demanding ink there is a false
+      failure -- which is how this check first reported itself. Ask the data that is actually on screen. */
+   var lim=(typeof RANGES!=='undefined'&&typeof RANGE!=='undefined'&&RANGES[RANGE]!=null)?RANGES[RANGE]:Infinity;
+   var sb=(typeof META!=='undefined'&&META)?META.smallBelow:0;
+   if(typeof DATA!=='undefined'){
+    var lo=Infinity,hi=0,anyMem=false;
+    DATA.forEach(function(s){(s.rows||[]).forEach(function(r){
+     if(r.n>lim)return;
+     if(r.n<lo)lo=r.n; if(r.n>hi)hi=r.n;
+     if(r.m)r.m.forEach(function(v){if(v>0)anyMem=true;});
+    });});
+    if(sb>0&&lo<sb&&hi>=sb&&!(window.__SEAMRULES>0))
+     E('the batch/single seam rule never reached a canvas: __SEAMRULES='+window.__SEAMRULES);
+    if(anyMem&&typeof SHOWMEM!=='undefined'&&SHOWMEM&&!(window.__MEMCIRCLES>0))
+     E('the memory circles never reached a canvas: __MEMCIRCLES='+window.__MEMCIRCLES);
+   }
+  }catch(err){E('the canvas-ink check threw: '+(err&&err.stack||err));}
+
   /* the page's own controls */
   var jump=document.querySelector('select.f');
   if(!jump||jump.options.length<2)E('no jump-to-a-shape list');

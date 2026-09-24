@@ -1,6 +1,6 @@
 /* scalebench.cpp — time against n for every contender, every shape, at 1 thread and at P.
  *
- * Sizes 0, 1, 3, 5, 10, then half-decade steps 32, 100, ... up to LOGOS_MAX_N (default 5e7, and the ceiling is itself
+ * Sizes 0, 1, 3, 5, 10, then half-decade steps 32, 100, ... up to LOGOS_MAX_N (default 1e7, and the ceiling is itself
  * a point), thirteen shapes (nine standard, four from the twist-and-knot rounds). Single-threaded section: std::sort, logos, logos in-place (no scratch at all), x86-simd-sort
  * (-DHAVE_XSS, OpenMP threads set to 1), IPS4o sequential (-DHAVE_IPS4O), LSD radix, timsort.
  * Parallel section at P threads: __gnu_parallel::sort, logos, logos in-place (parallel from 2026-09-20),
@@ -36,6 +36,8 @@
 #include <cstdint>
 #include <cmath>
 #include <chrono>
+#include <atomic>
+#include <malloc.h>
 #ifdef HAVE_XSS
 #define XSS_USE_OPENMP 1
 #include "x86simdsort-static-incl.h"
@@ -121,12 +123,76 @@ template <class F> static double best_small(Small &s, F f, bool &ok, double budg
 }
 static std::string jnum(double v) { char b[32]; snprintf(b, sizeof b, "%.4g", v); return b; }
 
-struct Row { size_t n; double t[7]; bool ok; };       /* t: [0]=std::sort or gnu_par, [1]=logos, [2]=xss, [3]=ips4o, [4]=LSD radix, [5]=timsort, [6]=logos in-place (4-6: 1T only); 0 = absent */
-struct Series { std::string shape; int threads; std::vector<Row> rows; };
+/* ONE UNIT FOR THE WHOLE TABLE: NANOSECONDS, every value, every row. This console used to print nanoseconds below
+   SMALL_N and milliseconds from SMALL_N up -- switching mid-column, at exactly the seam -- so the logos column for
+   uniform read 27330.0 at n = 3162 and then 0.1 at n = 10000. That is a 300,000x collapse in the printed figure and
+   none of it is real: per element the same three rows are 7.91, 8.64 and 9.01 ns. It was read, reasonably, as the
+   sort falling off a cliff at 3162 and then beating its own n = 1 row. An auto-scaled suffix per value fixed the
+   ambiguity but left a column that cannot be scanned or pasted into anything; one fixed unit can. Two decimals
+   because best_small's floor is 0.01 ns (what it reports when a sort is inlined away on an empty range), and the
+   widest value is a full sort of the largest n, about 2e9 ns, so %14s holds both ends with room.
+   Rotating buffers because a single printf takes twelve of these. The ONE deliberate exception is the calibration
+   line above the table: it is two labelled reference values rather than a column, and its whole job is comparison
+   against figures recorded elsewhere in milliseconds (CLAUDE.md's quiet ~2.9 ms / ~65 ms), which nanoseconds would
+   break. Everything that is a per-sort measurement is ns. */
+static const char *fmt_ns(double ms) {
+    static char buf[16][32];
+    static int slot = 0;
+    char *b = buf[slot = (slot + 1) & 15];
+    snprintf(b, 32, "%.2f", ms * 1e6);
+    return b;
+}
+
+/* ---- peak-heap tracer (the method of memprobe.c). Armed only inside the memory pass below, so the timed
+   sorts never pay more than one relaxed load per allocation, and they make very few. */
+extern "C" {
+extern void *__libc_malloc(size_t);
+extern void *__libc_calloc(size_t, size_t);
+extern void *__libc_realloc(void *, size_t);
+extern void *__libc_memalign(size_t, size_t);
+extern void __libc_free(void *);
+}
+static std::atomic<int> sm_active{0};
+static std::atomic<size_t> sm_live{0}, sm_peak{0};
+static void sm_add(void *p) {
+    if (!p || !sm_active.load(std::memory_order_relaxed)) return;
+    size_t z = malloc_usable_size(p), v = sm_live.fetch_add(z, std::memory_order_relaxed) + z;
+    size_t old = sm_peak.load(std::memory_order_relaxed);
+    while (v > old && !sm_peak.compare_exchange_weak(old, v, std::memory_order_relaxed)) {}
+}
+static void sm_sub(void *p) { if (p && sm_active.load(std::memory_order_relaxed)) sm_live.fetch_sub(malloc_usable_size(p), std::memory_order_relaxed); }
+extern "C" {
+void *malloc(size_t n) { void *p = __libc_malloc(n); sm_add(p); return p; }
+void *calloc(size_t n, size_t z) { void *p = __libc_calloc(n, z); sm_add(p); return p; }
+void *realloc(void *p, size_t n) { sm_sub(p); void *q = __libc_realloc(p, n); if (q) sm_add(q); else if (n) sm_add(p); return q; }
+int posix_memalign(void **out, size_t al, size_t n) { void *p = __libc_memalign(al, n); if (!p) return 12; sm_add(p); *out = p; return 0; }
+void free(void *p) { sm_sub(p); __libc_free(p); }
+}
+/* one cold call, traced: bytes per element. The work array is filled BEFORE arming so it is not counted, and
+   the engine's pools are released first, since a warm call allocates nothing and would read zero. */
+template <class F>
+static double mem_of(std::vector<double> &work, const std::vector<double> &base, F f, bool is_logos) {
+    std::copy(base.begin(), base.end(), work.begin());
+    if (is_logos) logos_release_buffers();
+    sm_live.store(0); sm_peak.store(0); sm_active.store(1);
+    f(work.data(), work.size());
+    sm_active.store(0);
+    return (double)sm_peak.load() / (double)work.size();
+}
+
+struct Row { size_t n; double t[7]; double m[7]; bool ok; };       /* t: [0]=std::sort or gnu_par, [1]=logos, [2]=xss, [3]=ips4o, [4]=LSD radix, [5]=timsort, [6]=logos in-place (4-6: 1T only); 0 = absent */
+/* seam[k]: n = seam_n (SMALL_N) measured the SMALL way -- a batch of distinct instances -- beside the row that
+   measured the same n the big way. seam[k] / row.t[k] is the measurement-mode step, at the one size where BOTH
+   modes resolve. It is not a universal correction: where it comes out near 1 and the chart still has a cliff, the
+   cliff belongs to the data and not to the harness, which is exactly what it is there to let a reader tell apart. */
+struct Series { std::string shape; int threads; std::vector<Row> rows; double seam[7] = {0,0,0,0,0,0,0}; size_t seam_n = 0; };
 
 int main() {
     int P = bench_threads(logos_num_cpus());   /* bench_common.h: LOGOS_THREADS, else BENCH_THREADS, else physical cores */
-    double max_n = 5e7; if (const char *e = getenv("LOGOS_MAX_N")) { double v = atof(e); if (v >= 1e4) max_n = v; }
+    /* 1e7 since 2026-09-23, for turnaround: it was 5e7, and the two rows above 1e7 (31.6M and 50M) are the
+       most expensive in the run by a wide margin -- every contender, every shape, at both thread counts, plus
+       the cold-call memory pass. LOGOS_MAX_N=5e7 restores the old ceiling when the top of the curve is the point. */
+    double max_n = 1e7; if (const char *e = getenv("LOGOS_MAX_N")) { double v = atof(e); if (v >= 1e4) max_n = v; }
     double max_sec = 20; if (const char *e = getenv("LOGOS_MAX_SEC")) { double v = atof(e); if (v > 0) max_sec = v; }
     const char *shapes[] = { "uniform", "near_sorted", "few_distinct", "heavy_tail", "bimodal", "quantized", "int_wide", "block_perm", "block_overlap", "block_twist", "block_kinked", "sine_slope", "reach_mirror" };
     double min_n = 0; if (const char *e = getenv("LOGOS_MIN_N")) { double v = atof(e); if (v >= 0) min_n = v; }
@@ -136,7 +202,8 @@ int main() {
     std::vector<size_t> sizes;
     for (size_t n : { (size_t)0, (size_t)1, (size_t)3, (size_t)5, (size_t)10, (size_t)32, (size_t)100, (size_t)316, (size_t)1000, (size_t)3162 }) if ((double)n >= min_n) sizes.push_back(n);
     for (double n = 1e4; n <= max_n + 1; n *= 3.1622776601683795) { size_t v = (size_t)std::llround(n / 1e3) * 1000; if ((double)v >= min_n) sizes.push_back(v); }
-    /* the ceiling is itself a point when the half-decade ladder stops well short of it (50M by default: 10M, 31.6M, 50M) */
+    /* the ceiling is itself a point when the half-decade ladder stops well short of it. At the 1e7 default the ladder
+       lands exactly on it (.., 3.16M, 10M) so nothing is appended; at LOGOS_MAX_N=5e7 it adds 50M after 31.6M. */
     if (!sizes.empty() && (double)sizes.back() < max_n * 0.9 && max_n >= min_n) sizes.push_back((size_t)max_n);
     if (sizes.empty()) { fprintf(stderr, "no sizes between LOGOS_MIN_N and LOGOS_MAX_N\n"); return 1; }
     const char *xss_isa =
@@ -188,7 +255,7 @@ int main() {
             };
             /* ---- single-threaded ---- */
             omp_set_num_threads(1);
-            Row r1{n, {0, 0, 0, 0, 0, 0, 0}, true};
+            Row r1{n, {0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0}, true};
             r1.t[0] = T([](double *p, size_t m) { std::sort(p, p + m); }, r1.ok, true);
             r1.t[1] = T([](double *p, size_t m) { logos_sort_f64(p, m, 1); }, r1.ok, false);
 #ifdef HAVE_XSS
@@ -205,7 +272,7 @@ int main() {
             s1.rows.push_back(r1);
             /* ---- P threads ---- */
             omp_set_num_threads(P);
-            Row rp{n, {0, 0, 0, 0, 0, 0, 0}, true};
+            Row rp{n, {0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0}, true};
             rp.t[0] = T([](double *p, size_t m) { __gnu_parallel::sort(p, p + m); }, rp.ok, false);
             rp.t[1] = T([P](double *p, size_t m) { logos_sort_f64(p, m, P); }, rp.ok, false);
             rp.t[6] = T([P](double *p, size_t m) { logos_sort_f64_inplace(p, m, P); }, rp.ok, false);   /* parallel from 2026-09-20: placement passes as tasks */
@@ -217,20 +284,114 @@ int main() {
 #endif
             sp.rows.push_back(rp);
             if (!r1.ok || !rp.ok) bad++;
-            const double u = small ? 1e6 : 1.0;                 /* small rows print nanoseconds per sort, the rest milliseconds */
-            printf("  %-13s n=%-9zu 1T %s: std %9.1f logos %9.1f inplace %9.1f xss %9.1f ips4o %9.1f radix %9.1f tim %9.1f | %dT: gnu_par %9.1f logos %9.1f inplace %9.1f xss %9.1f ips4o %9.1f%s\n", sh, n, small ? "ns" : "ms",
-                   r1.t[0] * u, r1.t[1] * u, r1.t[6] * u, r1.t[2] * u, r1.t[3] * u, r1.t[4] * u, r1.t[5] * u, P, rp.t[0] * u, rp.t[1] * u, rp.t[6] * u, rp.t[2] * u, rp.t[3] * u, (r1.ok && rp.ok) ? "" : "  <-- MISMATCH");
+            /* Nanoseconds per sort throughout; then nanoseconds PER ELEMENT for logos, the only column that may be
+               compared down the page -- and the one that shows there is no cliff where the units used to imply one. */
+            printf("  %-13s n=%-9zu 1T ns: std %14s logos %14s inplace %14s xss %14s ips4o %14s radix %14s tim %14s | %dT ns: gnu_par %14s logos %14s inplace %14s xss %14s ips4o %14s | logos ns/elem 1T %8.2f %dT %8.2f%s\n",
+                   sh, n,
+                   fmt_ns(r1.t[0]), fmt_ns(r1.t[1]), fmt_ns(r1.t[6]), fmt_ns(r1.t[2]), fmt_ns(r1.t[3]), fmt_ns(r1.t[4]), fmt_ns(r1.t[5]),
+                   P, fmt_ns(rp.t[0]), fmt_ns(rp.t[1]), fmt_ns(rp.t[6]), fmt_ns(rp.t[2]), fmt_ns(rp.t[3]),
+                   n ? r1.t[1] * 1e6 / (double)n : 0.0, P, n ? rp.t[1] * 1e6 / (double)n : 0.0,
+                   (r1.ok && rp.ok) ? "" : "  <-- MISMATCH");
             fflush(stdout);
             if (r1.t[0] > budget * 0.5) over = true;        /* the slowest contender is at half the budget: stop this shape here */
         }
         all.push_back(s1); all.push_back(sp);
     }
 
+    /* ---- the seam pass: how big is the measurement-mode step at SMALL_N? -------------------------------------
+       Below SMALL_N a size is a BATCH of distinct instances (ni = 262144/n of them, ~2 MB swept, every instance
+       cache-cold and none repeated); at SMALL_N and above it is ONE array copied from a pristine base and sorted
+       again and again, keeping the MINIMUM (78 KB at n = 10000, L2-resident, the same input every rep). Three
+       advantages flip at that x at once -- working set, branch history, and mean-of-batch against min-of-reps --
+       and all three favour the right-hand side. Eighteen series in the 2026-09-22 report peak at 3162 and fall at
+       10000 BECAUSE OF THIS, across every contender, which is the tell that it is the harness and not a sort.
+       So measure SMALL_N BOTH ways and publish the ratio: the curve is then splice-able instead of merely wrong,
+       and a reader can see the step rather than read it as an algorithmic cliff. Costs one extra batch per
+       contender per panel. LOGOS_SCALE_SEAM=0 skips it. */
+    if (!getenv("LOGOS_SCALE_SEAM") || atoi(getenv("LOGOS_SCALE_SEAM")) != 0) {
+        double t_seam = nowms();
+        for (size_t si = 0; si < all.size(); si++) {
+            Series &s = all[si];
+            /* AT SMALL_N, where both modes resolve. Measuring instead at the last BATCHED size (3162) was tried and
+               is worthless: one sort there is ~20 us and the big path runs 5 reps, which is precisely the resolution
+               problem batching exists to solve -- gnu_par scattered from 0.01x to 2.41x across the shapes. */
+            const Row *at = nullptr;
+            for (const Row &r : s.rows) if (r.n == (size_t)SMALL_N) { at = &r; break; }
+            if (!at) continue;
+            s.seam_n = at->n;
+            omp_set_num_threads(s.threads);
+            Small sm = make_small(s.shape, (size_t)SMALL_N);
+            bool ok = true; const double budget = max_sec * 1e3;
+            const int P2 = s.threads;
+            if (at->t[0] > 0) s.seam[0] = P2 == 1
+                ? best_small(sm, [](double *p, size_t m) { std::sort(p, p + m); }, ok, budget)
+                : best_small(sm, [](double *p, size_t m) { __gnu_parallel::sort(p, p + m); }, ok, budget);
+            if (at->t[1] > 0) s.seam[1] = best_small(sm, [P2](double *p, size_t m) { logos_sort_f64(p, m, P2); }, ok, budget);
+#ifdef HAVE_XSS
+            if (at->t[2] > 0) s.seam[2] = best_small(sm, [](double *p, size_t m) { x86simdsortStatic::qsort(p, m, false, false); }, ok, budget);
+#endif
+#ifdef HAVE_IPS4O
+            if (at->t[3] > 0) s.seam[3] = best_small(sm, [P2](double *p, size_t m) { if (P2 == 1) ips4o::sort(p, p + m); else ips4o::parallel::sort(p, p + m); }, ok, budget);
+#endif
+            if (at->t[4] > 0) s.seam[4] = best_small(sm, [](double *p, size_t m) { radix_sort_f64(p, m); }, ok, budget);
+            if (at->t[5] > 0) s.seam[5] = best_small(sm, [](double *p, size_t m) { timsort_f64(p, m); }, ok, budget);
+            if (at->t[6] > 0) s.seam[6] = best_small(sm, [P2](double *p, size_t m) { logos_sort_f64_inplace(p, m, P2); }, ok, budget);
+            if (!ok) { printf("  seam %s %dT: MISMATCH\n", s.shape.c_str(), s.threads); bad++; }
+            printf("  seam %-13s %2dT n=%-6zu batch/single  std %.2fx logos %.2fx xss %.2fx ips4o %.2fx radix %.2fx tim %.2fx inplace %.2fx\n",
+                   s.shape.c_str(), s.threads, at->n,
+                   at->t[0] > 0 ? s.seam[0] / at->t[0] : 0.0, at->t[1] > 0 ? s.seam[1] / at->t[1] : 0.0,
+                   at->t[2] > 0 ? s.seam[2] / at->t[2] : 0.0, at->t[3] > 0 ? s.seam[3] / at->t[3] : 0.0,
+                   at->t[4] > 0 ? s.seam[4] / at->t[4] : 0.0, at->t[5] > 0 ? s.seam[5] / at->t[5] : 0.0,
+                   at->t[6] > 0 ? s.seam[6] / at->t[6] : 0.0);
+            fflush(stdout);
+        }
+        printf("seam pass: %.1f s\n\n", (nowms() - t_seam) / 1e3);
+    }
+
+    /* ---- the memory pass: peak heap of one COLD call, bytes per element, for the circles on the charts.
+       It runs after ALL timing on purpose. Releasing the engine's pools is what makes a call cold, and doing
+       that between timed rows would have left the next row's first call paying for its buffers. Skipped below
+       SMALL_N, where a size is a batch of distinct inputs and a peak would be the batch's, not one sort's.
+       LOGOS_SCALE_MEM=0 skips the pass; the charts then simply draw no circles. */
+    if (!getenv("LOGOS_SCALE_MEM") || atoi(getenv("LOGOS_SCALE_MEM")) != 0) {
+        double t_mem = nowms();
+        for (size_t si = 0; si < all.size(); si++) {
+            Series &s = all[si];
+            omp_set_num_threads(s.threads);
+            for (size_t ri = 0; ri < s.rows.size(); ri++) {
+                Row &r = s.rows[ri];
+                if (r.n < (size_t)SMALL_N) continue;
+                std::vector<double> base = gen(s.shape, r.n), work(r.n);
+                const int P2 = s.threads;
+                if (r.t[0] > 0) r.m[0] = s.threads == 1
+                    ? mem_of(work, base, [](double *q, size_t m) { std::sort(q, q + m); }, false)
+                    : mem_of(work, base, [](double *q, size_t m) { __gnu_parallel::sort(q, q + m); }, false);
+                if (r.t[1] > 0) r.m[1] = mem_of(work, base, [P2](double *q, size_t m) { logos_sort_f64(q, m, P2); }, true);
+#ifdef HAVE_XSS
+                if (r.t[2] > 0) r.m[2] = mem_of(work, base, [](double *q, size_t m) { x86simdsortStatic::qsort(q, m, false, false); }, false);
+#endif
+#ifdef HAVE_IPS4O
+                if (r.t[3] > 0) r.m[3] = mem_of(work, base, [](double *q, size_t m) { ips4o::sort(q, q + m); }, false);
+#endif
+                if (r.t[4] > 0) r.m[4] = mem_of(work, base, [](double *q, size_t m) { radix_sort_f64(q, m); }, false);
+                if (r.t[5] > 0) r.m[5] = mem_of(work, base, [](double *q, size_t m) { timsort_f64(q, m); }, false);
+                if (r.t[6] > 0) r.m[6] = mem_of(work, base, [P2](double *q, size_t m) { logos_sort_f64_inplace(q, m, P2); }, true);
+            }
+        }
+        omp_set_num_threads(P);
+        printf("memory pass: peak heap of one cold call per point, bytes/element, %.1f s\n", (nowms() - t_mem) / 1e3);
+    }
+
     /* ---- JSON ---- */
     j = "[";
     for (size_t si = 0; si < all.size(); si++) {
-        const Series &s = all[si]; j += (si ? ",{" : "{"); j += "\"shape\":\"" + s.shape + "\",\"threads\":" + std::to_string(s.threads) + ",\"rows\":[";
-        for (size_t ri = 0; ri < s.rows.size(); ri++) { const Row &r = s.rows[ri]; j += (ri ? ",{" : "{"); j += "\"n\":" + std::to_string(r.n) + ",\"t\":[" + jnum(r.t[0]) + "," + jnum(r.t[1]) + "," + jnum(r.t[2]) + "," + jnum(r.t[3]) + "," + jnum(r.t[4]) + "," + jnum(r.t[5]) + "," + jnum(r.t[6]) + "],\"ok\":" + (r.ok ? "true" : "false") + "}"; }
+        const Series &s = all[si]; j += (si ? ",{" : "{"); j += "\"shape\":\"" + s.shape + "\",\"threads\":" + std::to_string(s.threads);
+        j += ",\"seamN\":" + std::to_string(s.seam_n);
+        j += ",\"seam\":[" + jnum(s.seam[0]) + "," + jnum(s.seam[1]) + "," + jnum(s.seam[2]) + "," + jnum(s.seam[3]) + "," + jnum(s.seam[4]) + "," + jnum(s.seam[5]) + "," + jnum(s.seam[6]) + "]";
+        j += ",\"rows\":[";
+        for (size_t ri = 0; ri < s.rows.size(); ri++) { const Row &r = s.rows[ri]; j += (ri ? ",{" : "{"); j += "\"n\":" + std::to_string(r.n) + ",\"t\":[" + jnum(r.t[0]) + "," + jnum(r.t[1]) + "," + jnum(r.t[2]) + "," + jnum(r.t[3]) + "," + jnum(r.t[4]) + "," + jnum(r.t[5]) + "," + jnum(r.t[6]) + "]";
+            j += ",\"m\":[" + jnum(r.m[0]) + "," + jnum(r.m[1]) + "," + jnum(r.m[2]) + "," + jnum(r.m[3]) + "," + jnum(r.m[4]) + "," + jnum(r.m[5]) + "," + jnum(r.m[6]) + "]";
+            j += std::string(",\"ok\":") + (r.ok ? "true" : "false") + "}"; }
         j += "]}";
     }
     j += "]";
@@ -314,7 +475,7 @@ button.t:hover{color:var(--ink);border-color:var(--ink2)}button.t[aria-pressed="
 <li><b>Panels.</b> The two charts of a panel share their n window and their pointer. &ldquo;expand&rdquo; gives a panel the full width. The bar above stays in view and jumps to any shape.</li>
 </ul></details>
 <p class="sub">The dashed grey curves are O(n) and O(n log n) references anchored at logos's largest measured point, so a series that bends above the O(n log n) curve is growing faster than a comparison sort should. The label after each series name is its empirical exponent, the least-squares slope of log t against log n over n &ge; 100k (below that fixed costs dominate). The single-threaded panel compares sorts that each use one thread; the parallel panel compares sorts that each use all threads. Every output was checked equal to std::sort's on the same data; the minimum of the repetitions is plotted. A line that stops early hit the per-sort time budget.</p>
-<p class="sub">Each panel holds two charts of the same measurements: time per sort, and below it nanoseconds per element, whose value axis is always linear (only its n axis follows the axis toggle). n = 0 is the cost of one call: it has no per-element value, and it cannot sit on a log axis, so the log view leaves it to the tables. The size buttons cut every chart down to the small end, because a linear n axis puts everything below a million into its first pixels. The last row of the ns-per-element table is the scaling slope read off two points: with c the cost per element, p = 1 + ln(c_hi / c_lo) / ln(n_hi / n_lo), so p = 1 is linear scaling and the percentage beside it is how much dearer one element became from 1M to the largest size. Those two rows are measured minutes apart on a machine whose speed drifts, so read that row as a sketch: make slopebench measures the same number in adjacent pairs, where the drift cancels. Sizes below 10k are timed as batches of distinct inputs sorted back to back, since one such sort is shorter than the clock can resolve and repeating one input would train the branch predictor; the parallel sorts are called with all threads there too, so what they show at small n is what such a call costs.</p>
+<p class="sub">Each panel holds two charts of the same measurements: time per sort, and below it nanoseconds per element, whose value axis is always linear (only its n axis follows the axis toggle). n = 0 is the cost of one call: it has no per-element value, and it cannot sit on a log axis, so the log view leaves it to the tables. The size buttons cut every chart down to the small end, because a linear n axis puts everything below a million into its first pixels. The last row of the ns-per-element table is the scaling slope read off two points: with c the cost per element, p = 1 + ln(c_hi / c_lo) / ln(n_hi / n_lo), so p = 1 is linear scaling and the percentage beside it is how much dearer one element became from 1M to the largest size. Those two rows are measured minutes apart on a machine whose speed drifts, so read that row as a sketch: make slopebench measures the same number in adjacent pairs, where the drift cancels. Sizes below 10k are timed as batches of distinct inputs sorted back to back, since one such sort is shorter than the clock can resolve and repeating one input would train the branch predictor; the parallel sorts are called with all threads there too, so what they show at small n is what such a call costs. <b>That change of method is a SEAM, and the dashed line marks it.</b> Three things flip there at once, all favouring the right-hand side: the working set (a batch is about 2 MB and exceeds L2, one array at n = 10k is 78 KB and does not), the branch history (every batch instance is a different input; the single array is the same input every rep), and the statistic (a batch's total divided by its count, against the minimum of several reps). So a curve may be read along either side of the line, but a step ACROSS it is partly the method. The <b>batch &divide; single</b> row in the ns-per-element table measures that step for this panel: the same n timed both ways, at the one size where both modes resolve. Use it to tell the two apart. Where it is well above 1 a jump at the line is the harness; the sequential contenders sit around 2-4x. Where it is near 1 and the chart still jumps, the jump is real and belongs to the data - a shape is not the same shape at 3162 as at 10000, since the number of runs, cycles or distinct values in it moves with n, and the engine's routing gates are ratios of n. Both happen in this report. The extreme values, tens to hundreds, are all __gnu_parallel::sort at P threads, and they are not a measurement fault but the point restated: a batch calls the sort 26 times back to back, so 26 parallel regions are opened and joined on 10k elements, where the single measurement opens one and keeps the best of five. Everything that panel plots LEFT of the line for a parallel contender is dominated by that per-call cost rather than by sorting, which is what "the parallel sorts are called with all threads there too" means in practice. <b>The circle around a point is memory</b>: the peak heap of one COLD call at that size, in bytes per element, measured in a pass of its own after all the timing (releasing the pools is what makes a call cold, and doing that between timed rows would have left the next row paying for its buffers). The largest reading anywhere in the report is 30 px across and every other scales linearly by it, so a circle means the same number in every panel; with a linear diameter, twice the memory draws four times the ink, so read them as ranks rather than areas. No circle means nothing was allocated - std::sort and the strict in-place entry draw none at any size - and sizes below 10k have none because a size there is a BATCH of distinct inputs, where a peak would be the batch's and not one sort's. Per element, not absolute: absolute bytes would simply grow with n and say nothing, and this way the small-n rows show the fixed pool costs before they amortize.</p>
 <div id="charts"></div>
 </div>
 <script>__UPLOT_JS__</script>
@@ -330,11 +491,19 @@ const fmtMs=v=>v==null?'':v===0?'0':v>=1000?(+(v/1000).toFixed(1))+' s':v>=1?(+v
 const fmtNs=v=>v==null?'':v===0?'0':v>=1e6?(+(v/1e6).toFixed(1))+' ms':v>=1e3?(+(v/1e3).toFixed(1))+' µs':(+v.toFixed(v>=100?0:v>=10?1:2))+' ns';
 let MODE='lin';
 let RANGE='all';
+let SHOWMEM=true;
 const RANGES={all:Infinity,k10:1e4,t10:10};
+/* MEMORY. r.m[k] is the peak heap of one COLD call in bytes per element, from scalebench's memory pass (its
+   header says why it runs after all timing and why the unit is per element). The maximum is taken across EVERY
+   shape, size and sort in the report, not per panel, so the same circle means the same number everywhere.
+   MEMPX is the diameter of that largest reading; the rest scale linearly by it, as asked. Note the perceptual
+   caveat: with a linear diameter, twice the memory draws four times the ink. */
+const MEMPX=30;
+const MEMMAX=(function(){let m=0;DATA.forEach(function(s){s.rows.forEach(function(r){if(r.m)r.m.forEach(function(v){if(v>0&&v>m)m=v;});});});return m;})();
 const NS=DATA.length?DATA[0].rows.map(r=>r.n):[];
 document.getElementById('sub').textContent=`${META.threads} threads (${META.ncpus} online) · ${NS.length} sizes, ${NS.length?fmtN(NS[0]):'?'} .. ${NS.length?fmtN(NS[NS.length-1]):'?'} · ${DATA.length/2} shapes`;
 document.getElementById('cal').innerHTML=`<div class="warn">Calibration (1T): memcpy 64 MB ${META.memcpyMs.toFixed(2)} ms, std::sort 1M ${META.std1mMs.toFixed(1)} ms. Quiet 20-core reference \u2248 2.5 ms / \u2248 50 ms; beyond 15% the machine was loaded and ratios within one chart are more trustworthy than absolute times.</div>`;
-document.getElementById('legend').innerHTML=[1,6,0,2,3,4,5].filter(k=>k<2||(k==2&&META.xss)||(k==3&&META.ips4o)||k>=4).map(k=>`<span><i class="sw" style="background:${cssv(CVAR[k])}"></i>${k==0?'std::sort (1T) / __gnu_parallel::sort (P)':NAMES1[k]+((k==4||k==5)?' (1 thread only)':'')}</span>`).join('')+`<span><i class="sw ref"></i>O(n) and O(n log n), anchored at logos's largest n</span>`;
+document.getElementById('legend').innerHTML=[1,6,0,2,3,4,5].filter(k=>k<2||(k==2&&META.xss)||(k==3&&META.ips4o)||k>=4).map(k=>`<span><i class="sw" style="background:${cssv(CVAR[k])}"></i>${k==0?'std::sort (1T) / __gnu_parallel::sort (P)':NAMES1[k]+((k==4||k==5)?' (1 thread only)':'')}</span>`).join('')+`<span><i class="sw ref"></i>O(n) and O(n log n), anchored at logos's largest n</span>`+(MEMMAX>0?`<span><i class="sw" style="background:transparent;border:1.5px solid var(--muted);border-radius:50%"></i>circle = peak heap of one cold call, bytes per element (largest in this report ${+MEMMAX.toFixed(1)} B/elem = ${MEMPX} px across)</span>`:'');
 
 /* empirical exponent: least-squares slope of log10 t vs log10 n over n >= 1e5 (fixed costs dominate below) */
 function exponent(rows,k){const pts=rows.filter(r=>r.t[k]>0&&r.n>=1e5).map(r=>[Math.log10(r.n),Math.log10(r.t[k])]);if(pts.length<3)return null;
@@ -350,7 +519,14 @@ function table(s){const names=s.threads==1?NAMES1:NAMESP;const cols=[1,6,0,2,3,4
  const slope=k=>{const rs=s.rows.filter(r=>r.t[k]>0&&r.n>=1e6);if(rs.length<2)return '-';const a=rs[0],b=rs[rs.length-1],g=(b.t[k]/b.n)/(a.t[k]/a.n);
   return (g>=1?'+':'')+((g-1)*100).toFixed(1)+'% (p = '+(1+Math.log(g)/Math.log(b.n/a.n)).toFixed(3)+')';};
  const pRows=s.rows.map(r=>`<tr><td>${fmtN(r.n)}</td>${cols.map(k=>`<td>${r.t[k]>0&&r.n>0?fmtNs(r.t[k]*1e6/r.n):'–'}</td>`).join('')}</tr>`).join('');
- return `<details><summary>tables: time per sort, ns per element, empirical exponents</summary><h3>time per sort</h3><div class="tw"><table>${head('logos vs best other')}<tbody>${tRows}<tr><td>t ∝ (n ≥ 100k)</td>${exps.map(e=>`<td>${e}</td>`).join('')}<td></td></tr></tbody></table></div><h3 class="cap2">nanoseconds per element (n = 0 has no elements: its row above is the cost of one call)</h3><div class="tw"><table>${head('')}<tbody>${pRows}<tr><td>per element, 1M to the largest n</td>${cols.map(k=>`<td>${slope(k)}</td>`).join('')}</tr></tbody></table></div></details>`;}
+ /* THE SEAM, measured: n = smallBelow timed the SMALL way (a batch of distinct instances) over the same n timed the
+    BIG way (one array, min of reps). Everything left of that n is on the batch side, so DIVIDE those points by this
+    to bring them onto the right-hand scale -- or multiply the right-hand points by it to go the other way. Without
+    it the curve steps by 2.3-2.6x at that x for reasons that have nothing to do with any sort. */
+ const seamRow=(()=>{const sm=s.seam;if(!sm||!s.seamN)return '';const at=s.rows.find(r=>r.n==s.seamN);if(!at)return '';
+  if(!cols.some(k=>sm[k]>0&&at.t[k]>0))return '';
+  return `<tr><td>batch ÷ single at n = ${fmtN(s.seamN)}</td>${cols.map(k=>`<td>${sm[k]>0&&at.t[k]>0?(sm[k]/at.t[k]).toFixed(2)+'×':'–'}</td>`).join('')}</tr>`;})();
+ return `<details><summary>tables: time per sort, ns per element, empirical exponents</summary><h3>time per sort</h3><div class="tw"><table>${head('logos vs best other')}<tbody>${tRows}<tr><td>t ∝ (n ≥ 100k)</td>${exps.map(e=>`<td>${e}</td>`).join('')}<td></td></tr></tbody></table></div><h3 class="cap2">nanoseconds per element (n = 0 has no elements: its row above is the cost of one call)</h3><div class="tw"><table>${head('')}<tbody>${pRows}${seamRow}<tr><td>per element, 1M to the largest n</td>${cols.map(k=>`<td>${slope(k)}</td>`).join('')}</tr></tbody></table></div></details>`;}
 
 /* Two uPlots per panel: time per sort against n, and the same measurements as nanoseconds per element. Series are
    built in draw order with logos LAST so it sits on top, and the two big-O references are appended as dashed series
@@ -415,7 +591,7 @@ function build(s,holder,kind,capEl,syncKey,height){
  const rows=visible(s);if(!rows.length)return null;
  const xs=rows.map(r=>r.n),fv=per?fmtNs:fmtMs;
  const yv=(r,k)=>{const t=r.t[k];if(!(t>0))return null;if(!per)return t;return r.n>0?t*1e6/r.n:null;};
- const data=[xs],series=[{label:'n',value:(u,v)=>v==null?'–':fmtN(v)}],meta=[null];
+ const data=[xs],series=[{label:'n',value:(u,v)=>v==null?'–':fmtN(v)}],meta=[null],mems=[null];
  [0,2,3,4,5,6,1].forEach(k=>{
   if(!rows.some(r=>yv(r,k)!==null))return;
   data.push(rows.map(r=>yv(r,k)));
@@ -424,6 +600,7 @@ function build(s,holder,kind,capEl,syncKey,height){
   series.push({label:nm+(ex!==null?' ~n^'+ex.toFixed(2):'')+(bad?' ✗':''),
    stroke:cssv(CVAR[k]),width:k===1?2.5:1.75,points:{show:true,size:6},
    value:(u,v)=>v==null?'–':fv(v)});
+  mems.push(rows.map(r=>(r.m&&r.m[k]>0)?r.m[k]:null));
  });
  if(data.length<2)return null;
  const capBase=capEl?capEl.textContent:'';
@@ -436,7 +613,8 @@ function build(s,holder,kind,capEl,syncKey,height){
    const a=L.t[1]/f(L.n);
    data.push(xs.map(n=>{if(n<2)return null;const t=a*f(n),y=per?t*1e6/n:t;return y>0&&isFinite(y)?y:null;}));
    meta.push({name:nm,ref:true,logos:false,color:cssv('--muted')});
-   series.push({label:nm,stroke:cssv('--muted'),width:1.25,dash:[5,4],points:{show:false},value:(u,v)=>v==null?'–':fv(v)});});}
+   series.push({label:nm,stroke:cssv('--muted'),width:1.25,dash:[5,4],points:{show:false},value:(u,v)=>v==null?'–':fv(v)});
+   mems.push(null);});}
  const ax={stroke:cssv('--muted'),grid:{stroke:cssv('--grid'),width:1},ticks:{stroke:cssv('--axis'),width:1},font:'11px system-ui',labelFont:'12px system-ui'};
  const yscale=ylog?{distr:3}:{distr:1,range:(u,mn,mx)=>[0,Math.min((mx||1)*1.05,cap)]};
  const opts={
@@ -460,7 +638,56 @@ function build(s,holder,kind,capEl,syncKey,height){
          dblclick:(u,targ)=>e=>{if(e.target===targ)IX.reset(u);}}},
   legend:{live:true},
   hooks:{ready:[u=>{IX.lim(u);}],setSelect:[u=>{IX.selected(u);}],setCursor:[u=>{IX.tip(u);}],
-         setSeries:[(u,si,o)=>{if(o&&o.show!=null)IX.refit(u);}]},
+         setSeries:[(u,si,o)=>{if(o&&o.show!=null)IX.refit(u);}],
+         /* MEMORY CIRCLES. Drawn after the series, clipped to the plotting rect, closing over `mems` so the
+            hook needs nothing from the uPlot instance but ctx, bbox and valToPos. Every access is guarded:
+            the stub in tools/check_report.js implements only the parts of uPlot the report is known to use. */
+         draw:[u=>{
+          /* THE SEAM. Left of META.smallBelow a point is a BATCH of distinct instances (~2 MB swept, every one
+             cache-cold, none repeated); at and above it a point is ONE array sorted again and again with the
+             MINIMUM kept (78 KB, L2-resident, same input every rep). Measured both ways, the step is 2.3-2.6x,
+             so the curve may be read on either side of this line but NOT across it. Drawn before the circles and
+             independently of them. Counted, because a stub DOM proves only that the code ran. */
+          (()=>{
+           const c=u&&u.ctx,sb=META&&META.smallBelow;
+           if(!c||!(sb>0)||!u.valToPos||!u.bbox||!c.moveTo)return;
+           const xs=data&&data[0];if(!xs||!xs.length)return;
+           if(!(xs[0]<sb&&xs[xs.length-1]>=sb))return;              /* the seam is off-screen: nothing to mark */
+           const px=u.valToPos(sb,'x',true);if(!isFinite(px))return;
+           const dpr=u.pxRatio||(window.devicePixelRatio||1);
+           c.save();
+           if(c.beginPath&&c.rect&&c.clip){c.beginPath();c.rect(u.bbox.left,u.bbox.top,u.bbox.width,u.bbox.height);c.clip();}
+           c.strokeStyle=cssv('--muted');c.globalAlpha=0.85;c.lineWidth=1*dpr;
+           if(c.setLineDash)c.setLineDash([4*dpr,4*dpr]);
+           c.beginPath();c.moveTo(px,u.bbox.top);c.lineTo(px,u.bbox.top+u.bbox.height);c.stroke();
+           if(c.setLineDash)c.setLineDash([]);
+           if(c.fillText){c.globalAlpha=1;c.fillStyle=cssv('--muted');
+            c.font=(10*dpr)+'px system-ui,sans-serif';
+            if(c.textAlign!==undefined)c.textAlign='left';
+            c.fillText('batch | single',px+4*dpr,u.bbox.top+12*dpr);}
+           c.restore();
+           window.__SEAMRULES=(window.__SEAMRULES||0)+1;
+          })();
+          if(!SHOWMEM||!(MEMMAX>0))return;
+          const c=u&&u.ctx;if(!c||!c.arc||!u.valToPos||!u.bbox)return;
+          const dpr=u.pxRatio||(window.devicePixelRatio||1);
+          c.save();
+          if(c.beginPath&&c.rect&&c.clip){c.beginPath();c.rect(u.bbox.left,u.bbox.top,u.bbox.width,u.bbox.height);c.clip();}
+          for(let i=1;i<mems.length&&i<data.length;i++){
+           const col=mems[i];if(!col)continue;
+           const se=u.series&&u.series[i];if(se&&se.show===false)continue;
+           c.strokeStyle=(se&&se.stroke)||cssv('--muted');c.globalAlpha=0.5;c.lineWidth=1.5*dpr;
+           for(let jx=0;jx<col.length;jx++){
+            const v=col[jx];if(!(v>0))continue;
+            const y=data[i][jx];if(y==null)continue;
+            const xv=data[0][jx];
+            const px=u.valToPos(xv,'x',true),py=u.valToPos(y,'y',true);
+            if(!isFinite(px)||!isFinite(py))continue;
+            const rr=(MEMPX*(v/MEMMAX)/2)*dpr;if(!(rr>=0.5))continue;
+            c.beginPath();c.arc(px,py,rr,0,6.283185307179586);c.stroke();window.__MEMCIRCLES=(window.__MEMCIRCLES||0)+1;
+           }}
+          c.restore();
+         }]},
  };
  const u=new uPlot(opts,data,holder);
  u._ix={per,ylog,fv,meta,capEl,capBase,capHome:capEl?capEl.textContent:''};
@@ -716,6 +943,11 @@ sep();
 /* which sizes are drawn: a linear n axis puts everything below a million into its first pixels, so the small end gets its own views */
 [['all','all sizes'],['k10','n ≤ 10k'],['t10','n ≤ 10']].forEach(([v,l])=>{const b=document.createElement('button');b.className='f';b.textContent=l;b.setAttribute('aria-pressed',v===RANGE);
  b.onclick=()=>{RANGE=v;fl.querySelectorAll('button[data-rg]').forEach(x=>x.setAttribute('aria-pressed',x===b));render();};b.dataset.rg=v;fl.appendChild(b);});
+/* the memory toggle: only offered when the report actually carries a memory pass (older ones do not) */
+if(MEMMAX>0){const b=document.createElement('button');b.className='f';b.textContent='memory circles';
+ b.title='circle diameter = peak heap of one cold call, bytes per element; the largest reading in this report ('+(+MEMMAX.toFixed(1))+' B/elem) is '+MEMPX+' px across';
+ b.setAttribute('aria-pressed',SHOWMEM);b.dataset.mem='1';
+ b.onclick=()=>{SHOWMEM=!SHOWMEM;b.setAttribute('aria-pressed',SHOWMEM);render();};fl.appendChild(b);}
 sep();
 /* what a plain drag does. Shift + drag and the middle button always pan; this switch is for a mouse hand that wants to pan all the time */
 [['zoom','drag zooms'],['pan','drag pans']].forEach(([v,l])=>{const b=document.createElement('button');b.className='f';b.textContent=l;b.setAttribute('aria-pressed',v===DRAG);

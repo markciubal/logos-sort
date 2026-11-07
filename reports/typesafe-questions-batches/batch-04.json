@@ -1,0 +1,213 @@
+{
+  "Q_S09": {
+    "type": "noul",
+    "instructions": "In logos-sort: Knowing the date format pays when the dates are TEXT. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S10": {
+    "type": "noul",
+    "instructions": "In logos-sort: Projecting each element onto a sphere of radius n (x=value, y=a prime, z=the index) and sorting the projection. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S11": {
+    "type": "noul",
+    "instructions": "In logos-sort: The scale report's memory column reproduces make memprobe from an independent code path. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S12": {
+    "type": "noul",
+    "instructions": "In logos-sort: The dispatcher's frame grew across one session and that is the untraced small-call drift. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S13": {
+    "type": "noul",
+    "instructions": "In logos-sort: A trace build can be used to price a phase. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S14": {
+    "type": "noul",
+    "instructions": "In logos-sort: The triple-reversal weld (condense into runs, meta-sort by min edge, in-place triple reversals, seam weld behind an O(1) check). Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S15": {
+    "type": "noul",
+    "instructions": "In logos-sort: The handed-off Moebius hybrid's micro-kink branch (Reidemeister I on 2-3 element dips). Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_SZ_networks": {
+    "type": "score",
+    "instructions": "Branchless Batcher sorting networks for 4-16 elements replacing insertion sort in the leaf. Rate the speedup on RANDOM calls at n=16, one thread.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_net4": {
+    "type": "score",
+    "instructions": "The same networks, rated on RANDOM calls at n=4.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_latqueue": {
+    "type": "score",
+    "instructions": "The lattice map phase claiming chunks from a counter instead of equal slices, at 14 threads on quantized. Rate the speedup.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_tiles": {
+    "type": "score",
+    "instructions": "The same work queue applied to relocation's memcpy output tiles, 14 threads. Rate it.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_prescan": {
+    "type": "score",
+    "instructions": "Making the dispatcher's prescan compare with vectors (AVX2 blocks of 32) where its block loop had compiled to sixteen scalar compares and a serial OR chain. Rate it on SORTED input.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_kink": {
+    "type": "score",
+    "instructions": "Swapping a kinked adjacent pair back where it stands inside a run (Reidemeister I), on sorted blocks with 0.1% kinks at one thread. Rate it.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_datestr": {
+    "type": "score",
+    "instructions": "Parsing fixed-width ISO-8601 timestamps to a numeric key and using argsort + one gather, against std::sort on std::string. Rate it.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_datenum": {
+    "type": "score",
+    "instructions": "Telling the sort the origin and step of NUMERIC epoch-millisecond timestamps, so it can convert to integer keys and radix only the varying bytes. Rate it against the engine.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_hugepage": {
+    "type": "score",
+    "instructions": "Huge pages for the engine's large buffers, at 14 threads and 8M, with the mechanism verified firing (98MB AnonHugePages vs 0). Rate it.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_gallop": {
+    "type": "score",
+    "instructions": "A galloping two-strand merge for one sparse strand spanning every value over dense blocks, one thread, 8.4M. Rate it.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_MECH_lattice_idle": {
+    "type": "choice",
+    "instructions": "logos-sort's lattice counting route at 14 threads shows only 8.4 of 14 threads busy on average, with NONE waiting at a barrier and no preemption (cpu/busy = 1.00). Every thread is handed exactly n/P work in both of its parallel phases. Which is the binding constraint?",
+    "criteria": {
+      "serial_merge": "the serial merge between the two parallel phases",
+      "table_teardown": "freeing the per-thread count tables at the end",
+      "thread_creation": "creating and joining the worker threads, paid once per parallel phase",
+      "memory_bandwidth": "the emit phase saturating memory bandwidth, so extra threads cannot help",
+      "thread_imbalance": "unequal work per thread inside the phases",
+      "cache_pressure": "the per-thread tables being too large for L2"
+    }
+  },
+  "Q_MECH_proposal_failure": {
+    "type": "choice",
+    "instructions": "An outside sorting proposal arrives for logos-sort. Given that the engine sorts at 0.8-2.1 ns/element at 14 threads and already certifies cardinality, sortedness, skew and quantization from one shared sample, which failure mode will the proposal hit FIRST?",
+    "criteria": {
+      "per_element_cost": "its per-element transform costs more than the whole sort",
+      "destroys_order": "its transform is not monotone in the value, so the output is not sorted",
+      "already_subsumed": "the engine's existing routes already exploit the same structure",
+      "isolated_win_only": "the kernel wins in isolation and loses end to end",
+      "gate_never_fires": "the branch it relies on fires zero times on its target shape",
+      "fixed_cost_per_call": "it is free at scale but adds cost to every small call"
+    }
+  },
+  "Q_MECH_small_end": {
+    "type": "choice",
+    "instructions": "logos-sort loses 2-9x to std::sort below ~100 elements. Entering the dispatcher costs ~5.6ns before any work, and psort_f64's stack frame is 42,576 bytes, which stack-clash protection probes a page at a time on EVERY call (11 probes). Which lever recovers the most at n = 2-10?",
+    "criteria": {
+      "thin_front": "a small-frame front function, with the large body behind a call",
+      "alignment": "an alignment policy (-falign-functions/-falign-loops)",
+      "fewer_gates": "skipping more dispatcher gates at tiny n",
+      "networks": "branchless sorting networks (already shipped for 4-16)",
+      "nothing": "nothing structural; the remaining cost is irreducible"
+    }
+  }
+}

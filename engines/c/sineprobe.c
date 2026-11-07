@@ -95,7 +95,8 @@
  * thread, because at <= MERGE_MAX_RUNS (8) runs the knot route's cost gate is 1.0n instead of 3.0n and it declined, where at 9 it
  * went). The gate was set from 4 interleaved runs (0.955 with the gate lifted); the knot route's own record has 8 strands at 1.8x
  * where the fallback was the run merge. Here: a pure cosine of h half-cycles (h runs, each spanning the whole range), h = 2..10,
- * with and without noise, the shipped engine against LOGOS_KNOT_MAX=3 (every gate at 3.0n), same binary, ONE thread: the column is
+ * with and without noise, the shipped engine against LOGOS_KNOT_FEW=3 (the few-runs gate alone at 3.0n; it was LOGOS_KNOT_MAX=3,
+ * every gate, until 2026-09-26), same binary, ONE thread: the column is
  * t(shipped) / t(gate 3.0), above 1 = lifting the few-runs gate is faster. Two runs of 40 pairs.
  * PREDICTIONS, written before the first run: h = 2 and 3 1.00 (cost 1.0n and ~1.6n: two strands go anyway; three read 2.44x in
  * the gate's own record against the shipped engine, so 1.0-1.3); h = 4 0.93-1.00 (the 0.955 the gate was set from); h = 5-8 1.3-1.9
@@ -442,12 +443,12 @@ int main(int argc, char **argv) {
     }
     if (argc > 3 && !strcmp(argv[3], "fewgate")) {
         printf("THE KNOT ROUTE'S FEW-RUNS GATE, n = %zu, %d pairs, ONE thread: a pure cosine of h half-cycles (h runs, each spanning the range).\n"
-               "Column: t(shipped) / t(LOGOS_KNOT_MAX=3, every gate 3.0n), same array; above 1 = lifting the few-runs gate is faster.\n\n", n, reps);
+               "Column: t(shipped) / t(LOGOS_KNOT_FEW=3: the few-runs gate ALONE at 3.0n; h > 8 rows are guards), same array; above 1 = lifting it is faster.\n\n", n, reps);
         printf("  %-4s %-8s %-18s %-18s | %s\n", "h", "noise", "route, shipped", "route, gate 3.0", "t(shipped)/t(gate 3.0) [p10 p90]");
         for (int h = 2; h <= 10; h++) for (int nz = 0; nz < 2; nz++) {
             wave_t W = { "few", (double)h / 2.0, 1.0, nz ? 50.0 : 0.0, 0 };
             gen_wave(b, n, &W, 1, 777 + (uint64_t)h * 3 + (uint64_t)nz);
-            char r0[64], r1[64]; route_of(b, w, n, r0); setenv("LOGOS_KNOT_MAX", "3", 1); route_of(b, w, n, r1); unsetenv("LOGOS_KNOT_MAX");
+            char r0[64], r1[64]; route_of(b, w, n, r0); setenv("LOGOS_KNOT_FEW", "3", 1); route_of(b, w, n, r1); unsetenv("LOGOS_KNOT_FEW");
             /* the same array both sides, the switch set around one side, the order alternated */
             double p10, p90, med; int ok = 0;
             {   double *r = (double *)malloc((size_t)reps * sizeof(double)); if (!r) return 2;
@@ -456,9 +457,9 @@ int main(int argc, char **argv) {
                     for (int side = 0; side < 2; side++) {
                         int lifted = ((i & 1) ? 1 - side : side);            /* alternate which goes first */
                         memcpy(w, b, n * sizeof(double));
-                        if (lifted) setenv("LOGOS_KNOT_MAX", "3", 1);
+                        if (lifted) setenv("LOGOS_KNOT_FEW", "3", 1);
                         s0 = now_ms(); logos_sort_f64(w, n, 1); double dt = now_ms() - s0;
-                        if (lifted) { unsetenv("LOGOS_KNOT_MAX"); tb = dt; } else ta = dt;
+                        if (lifted) { unsetenv("LOGOS_KNOT_FEW"); tb = dt; } else ta = dt;
                         if (!sorted_ok(w, n)) ok = -1;
                     }
                     r[i] = tb > 0 ? ta / tb : 1.0;

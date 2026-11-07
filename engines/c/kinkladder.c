@@ -16,6 +16,8 @@
  * ONE STRAND + kinks does not: 19.4 ms at one thread against 33.2 at two and 24.6 at fourteen, because `kinks fixed`
  * reads 41,745 at P = 1 and 0 at every P above it -- at P > 1 the NEAR-SORTED route claims the array before
  * relocation is reached, so the detector never runs. A route decision, not a thread cap.
+ * FIXED (2026-09-26, the kink gate + the stray list on every worker): 0.5% kinks 5.52 ms at one thread -> 2.22 at 14 (2.49x),
+ * 2.5% 9.20 -> 2.79 (3.30x); 0.05% still 0.27-0.58 with 0 repaired (REACH_KINK_MIN = 8 against ~7.9 expected descents).
  *
  * usage: ./kinkladder [reps] [n] [one | once] [P for once]
  *   (no mode) 64 shuffled sorted blocks + kinks     one  ONE sorted strand + kinks
@@ -76,6 +78,13 @@ int main(int argc, char **argv) {
         if (!b || !v) { printf("no memory\n"); return 2; }
         size_t nk = gen_kinked_one(b, n, 0.005, 4242);
         memcpy(v, b, n * 8);
+        /* the kinks that lie within four of a detection-chunk edge (chunk = ceil(n / P), as detect_runs_parallel sizes
+           it): the worker cannot repair a pair whose test reads across its edge, and the join repairs only a pair that
+           straddles one. A strand that comes back as R > 1 broke at one of these; print them so the trace can be read. */
+        { size_t chunk = (n + (size_t)tp - 1) / (size_t)tp;
+          for (int t = 1; t < tp; t++) { size_t bd = (size_t)t * chunk;
+            for (size_t x = bd >= 6 ? bd - 6 : 0; x + 1 < n && x <= bd + 6; x++)
+              if (b[x] > b[x + 1]) fprintf(stderr, "#### kink pair (%zu, %zu) lies at chunk edge %zu (edge - %ld)\n", x, x + 1, bd, (long)bd - (long)x); } }
         fprintf(stderr, "#### ONE sorted strand, %zu kinks (%.2f%%), n = %zu, 1 thread\n", nk, 100.0 * (double)nk / (double)n, n);
         logos_twist_last(4);
         logos_sort_f64(v, n, tp);

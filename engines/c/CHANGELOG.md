@@ -1,5 +1,886 @@
 # Changelog
 
+## (unreleased) -- the near-sorted route's strand gate: strands are not strays (FINDINGS 3bw)
+
+**Asked:** "integrate the speedup if it makes sense to", after the prime-factor knot solver (3bv) found that at P > 1 the near-sorted
+route claims sorted runs lying in order and overlapping their neighbours, and sorts a tenth of the array as strays.
+- **The strand gate** (`nearsorted_parallel_f64`; `LOGOS_NO_NSSTRAND=1` off; `NS_STRAND_WIN_DESC` and `NS_STRAND_MIN_DESC`, 4 and 4;
+  `logos_twist_last(38)`): after the four-window pre-gate, when the windows hold at most 4 adjacent descents in all (disorder at the
+  element's scale) and a 2048-point sample in position order holds 4 or more (disorder at the array's scale), decline: the run routes
+  take the array. t(gate off) / t(gate on), 14 threads, 8.4M, two runs: in-order staircases **1.67-1.70 / 3.46-3.87 / 3.10-3.32 /
+  3.47-3.56** (overlap 0.05; 0.2 of 64, 16 and 256 runs), 8 neighbour pairs swapped **3.01-3.10**, 4 batches late **3.41-3.70**; 1M:
+  1.62-1.63 / 3.10-3.29 / 3.06-3.17 (256 runs 1.59-1.68), at 4 threads 2.1-4.2, at 2 threads 2.75-5.26; 21 guard rows 0.95-1.07 at
+  8.4M, roundbench's 23 shapes 0.98-1.05, tsbench's 16 shapes 0.97-1.05 at 1 and 14 threads. The one cell at or under 1: 16 runs of
+  65k at 1M, 0.86 / 0.98 at 14 threads and 0.88 at four, p90 past 1 each time (the knot route's parallel form is level with or a little
+  slower than near-sorted there).
+- `make strandgate`: the 27 shapes, the statistics a gate could read (inv_all, the pre-gate's rejects, the sample's descents and
+  strays) beside a paired timing of any switch (`SG_SWITCH`, default `LOGOS_NO_NSSTRAND`) against the shipped engine.
+- Harness: section "strand gate" (24 checks, 12 name the path). faultprobe: case `stairs_order`.
+- GCC 13.3 died with an internal compiler error twice this round, in harness.c (cprop; the row generation moved to a noinline helper)
+  and compiling logos_psort.c at -O1 under the sanitizers (cfgcleanup), which succeeded unchanged on a retry.
+
+## (unreleased) -- the comparison bound, shape by shape: a lattice entry the sample's repeats no longer gate, spills, a divided step (FINDINGS 3br)
+
+**Asked:** "Try to break the ETH boundary." ETH is an unproven SAT conjecture; the boundary a sort can break is the comparison bound,
+and only by placing instead of comparing. The new `make boundprobe` prints, per shape, the bits a comparison sort needs on that input
+(H_m, H_r, H_rem, their minimum), ns per element and per bit, and the growth from 1M to 16M in adjacent pairs (+20% = comparison-bound).
+It found the vector quicksort already ON the multiset bound for random doubles with repeats (0.37-0.57 ns per bit, flat in n), and one
+shape priced like a comparison sort where a direct index places every element: a lattice of 30,000 values, 7.99 ns per element at 16M.
+- **A lattice entry for lattices whose sample shows no repeats** (`lat1_gate`; `LOGOS_NO_LAT1=1` off, `LOGOS_LAT1_FILL`,
+  `LOGOS_LAT1_PMAX`; `logos_twist_last(36)`): the counting block needs repeats in a sample of 384 points per thread, which a lattice
+  of 10k-250k values does not show below eight threads. Every sample point on one lattice, and LAT1_MIN_FILL (P + 1) / 2 elements per
+  slot (16 at one thread, 24 at two, 40 at four; fill 8 lost 0.79 at one thread, fill 16 lost 0.69-0.75 at four). t(off) / t(on),
+  16 pairs: one thread **1.18-4.01** wherever it fires (30,000 values 2.27 / 3.24 / 3.61 at 1M / 4M / 16M, 250,000 values 1.18 /
+  1.69 at 4M / 16M, prices in cents 2.89-2.90), two threads **1.60-4.19**, four threads **1.23-2.93**; guards 0.945-1.039 (the one-thread
+  1M cells 0.989-1.018 at 40 pairs, a null run 0.970-1.015). roundbench's 30,000-value quantized row 3.62 at one thread, 3.70 at two.
+- **The step is the coarsest divisor of the sample's smallest gap that holds every point** (`lattice_sample_step`, up to 16;
+  `LOGOS_LAT_DIV1=1` the gap alone): a sample with no two adjacent lattice points saw a multiple of the step and the route fired by
+  chance above ~65k values. 16M, one thread: lat131072 2.20, lat250000 1.73. A divided step must pass the fill test in
+  `lattice_try_f64` too: one off-lattice sample value otherwise made a lattice five times finer than the data (5.3 ns per element
+  at 8 threads, 1M).
+- **A value off the lattice is spilled, not a decline** (`lat_spill`, `lattice_spill_finish`; `LOGOS_LAT_NO_SPILL=1`;
+  `logos_twist_last(37)`): up to n/32 elements, a shared atomic budget, sorted after the emit and merged in from the top. The last
+  0.05% off the lattice: 2.93-3.66 at one thread (was a decline after a full map, 0.80-0.85); 16 far sentinels at 8 and 14 threads,
+  in the counting block's lattice, 1.55-1.90.
+- Memory at one thread on the 30,000-value lattice (rssprobe, 4M): peak 4.14 -> 0.39 bytes per element, held 4.14 -> 0.09.
+- Fixed: `-DLOGOS_INT_NARROW` (broken since 3bq) and `-DLOGOS_NO_MODE_TABLE` (since 3bj) did not compile.
+- Harness: section "lattice entry" (79 checks, 53 name what must have happened). faultprobe: case `lattice_spill`. `boundprobe ab`
+  pairs any two engine settings with a `fired` column; `boundprobe once [n] [filter] [P]` for the trace build.
+
+**Measured and not built:** counting arbitrary doubles by hashing (a told ceiling, scratch `hcount.c`) beats the vector quicksort only
+while the table stays in L2, k up to ~2,000 at 16M (1.20-1.70), and loses past it (0.35-0.81) and at 1M nearly everywhere.
+
+**Wrong prediction, traced:** spills were predicted to pay 1.5-3x on the off-lattice rows at 8 and 14 threads and read 0.97-1.05: the
+2,048-point sample holds one off-lattice value, the step that keeps it is 0.05, a 150,000-slot lattice the fill check (1M) or
+LATTICE_MT_MAX_SLOTS (16M) declines, so neither side maps a lattice. A step estimate that tolerates a few such points is owed.
+
+**Verification:** `make test` all green (55,114 checks); `make faultprobe` on three counting shapes, 374 allocation and 18
+thread-creation failures, 0 bad; `make sanitize` (the 4 known reports) and `make tsan` (0 races) green; 78 flag builds, warnings
+identical to the old source; psort_f64's frame 24,320 -> 24,048 bytes; `make callbench` against the engine before the round,
+n <= 5 0.987-1.017 with the layout cancelled.
+
+## (unreleased) -- the second memory round: half a scratch for one-thread placements, float32 keys in place, one block for the regions and the pool (FINDINGS 3bq)
+
+**Asked:** "try to reduce memory usage more." Resident bytes per element above the array, 4M elements (`make rssprobe`, and the new
+`make mixprobe`, which holds ten different sorts in ONE process and so sees buffers that coexist):
+- **Half a scratch for a sequential placement** (`half_place`, `LOGOS_PLACE_FULL=1` restores the full one, `logos_twist_last(34)`):
+  the lower half of the output goes to the scratch; the upper half's pieces that reach the midpoint are copied into the gaps the
+  lower half left (else every piece slides left); the upper half is placed in the array; the lower half is copied back (or merged
+  backwards with the strays). A straddling copy, two-way merge (merge path) or k-way merge (a selection on values) is split at the
+  midpoint; every copy that does not overlap itself streams. The knot route at one thread, the tail and head routes' vector merge,
+  the wave route: block_perm, stairs_x20, two_halves, strands4 8.1 -> 4.1; near_sorted 8.4 -> 4.4. Speed, t(full) / t(half): 64
+  blocks 1.09 at 8.4M and 1.15 at 1M, roundbench block_perm64 1.12, every other row 0.97-1.07. (First cut, memcpy and a full slide:
+  0.86-0.91 on block shapes.)
+- **The float32 radix keeps its keys in the input** (`LOGOS_F32_TWOBUF=1` restores aux): quantized at one thread 8.1 -> 4.1; a
+  decline widens the keys back, bit for bit. Neutral where it runs; the worst decline (every value a float but the last) 0.91.
+- **The partition's regions borrow the pool's block** (`LOGOS_HF_OWN=1` restores their own buffer, `logos_twist_last(35)`): in one
+  process the regions and the pool used to be held side by side. Neutral at 14 threads.
+- **A nested sort's context bundles are free again when it returns** (`NESTED_SORT`): the wave route's ~65 piece sorts each kept a
+  bundle; sine_wave at one thread 10.4 -> 4.4 with the half placement.
+- **Ten mixed sorts in one process held 23.8 bytes per element between calls; 14.0 now.**
+- **`LOGOS_LOWMEM=1`**: the in-place partition and the hard pool trim together, for callers who trade speed for memory (14 threads:
+  partition peak 8.8 -> 1.5-2.6, held 8.7 -> about 1).
+- Harness: section "half the scratch" (68 checks, 34 name the path). `make mixprobe` is new; `rssprobe` gained sine_wave.
+- Settled from 3bp: the dominant-value route's guard rows on a quiet box, 0.955-1.068 at 1 and 14 threads.
+
+**Not built:** the parallel forms of the placing routes, the 14-thread partition (structural; the in-place form is opt-in), the
+leaf's own run relocation (its scratch is often the output region already).
+
+**Verification:** `make test` all green (55,035 checks); a build with HALF_MIN_N=2 through the whole harness (the only failures the
+two rows that assert the threshold); 47 flag builds, no new warnings; `make faultprobe` on nine placing shapes, 8,204 injected
+allocation failures and 60 thread-creation failures, 0 bad; `make sanitize` (the 4 known reports) and `make tsan` green.
+
+## (unreleased) -- the memory round: one scratch array for the radixes, a dominant-value route, release returns the heap (FINDINGS 3bp)
+
+**Asked:** "try to be more memory efficient." `rssprobe` (resident bytes per element) now covers 21 shapes: this session's routes, the
+int32 API, and one value holding 25 / 50 / 90 / 99%.
+- **One scratch array for the LSD radixes** (`lsd_radix_i32`, `lsd_radix_int32`; `LOGOS_RADIX_TWOBUF=1` restores two): the keys are
+  biased or narrowed in place in the input's storage and the passes ping-pong with one buffer. int32 at one thread: peak 8.1 -> 4.1
+  bytes per element of scratch, kept 4.1 -> 0.15; int-valued doubles 8.1 -> 4.1. Speed 0.98-1.04 (neutral).
+- **The dominant-value route** (`dominant_try_f64`, `LOGOS_NO_DOMINANT=1`, `logos_twist_last(33)`): one value holding 20% or more at
+  P > 1 (85% at one thread) is filled in around the rest, which is sorted on its own. 14 threads 2.7x / 3.0x / 5.6x / 9.9x at shares
+  0.25 / 0.5 / 0.75 / 0.9 (the partition had sent every copy of the value to one bucket and one thread: from a half up, slower than one
+  thread); one thread 2.1x at 0.9. Memory at 14 threads: 0.9 peak 11.6 -> 0.9, kept 11.6 -> 0.16; 0.5 10.8 -> 4.2; 0.25 10.4 -> 6.2.
+- **`logos_release_buffers()` returns the heap too** (`malloc_trim(0)` on glibc), and the route's buffer is its own mmap: glibc raises
+  its mmap threshold to the size of any mmap-backed block it frees, which had left 6.25 bytes per element resident after release.
+- Harness: section "dominant-value route" (23 checks, 11 name the branch). `fieldprobe i32ab`: any switch on the int32 API and on
+  int-valued doubles, paired.
+
+**Not built:** an in-place float32 path (a decline must leave the input untouched), half-size merge buffers (the one-chain vector merge
+is ~1.7x slower than the two-chain one), and the partition / pool alternatives already opt-in (`LOGOS_PART_INPLACE=1`, `LOGOS_TRIM=1`).
+
+**Verification:** `make test` all green (54,957 checks), `make sanitize` all green (the 4 known reports), 42 flag builds, faultprobe on
+the dominance shapes and int_wide 0 bad of 1,306 injected failures, psort_f64's frame 24,304 unchanged. The route's guard rows were
+measured under another session's CPU load (owed); the radix A/B and the route's gains were measured on a quiet box.
+
+## (unreleased) -- ideas from other fields: three new tests (moire, founder, Landauer) and seven changes they led to; the hardware question (FINDINGS 3bo)
+
+**Asked:** "hallucinate more. pull from other branches other than computer science and math", and mid-round "Are there hardware
+optimizations that you can also perform?" Eight analogies from biology, logistics, telecommunications, card magic, optics, population
+genetics, thermodynamics and immunology, each with a prediction before the first run (experiments/OTHER_FIELDS.md); `make fieldprobe`
+holds their ceilings, three new tests and an A/B mode over the round's shapes. Ratios: old / new, above 1 = the change is faster,
+all taken on a quiet box (another session's headless Chrome loaded it from 12:42 to before 19:50; those runs are discarded).
+
+**Shipped:**
+- **Founder windows** in `sort_fn` (`LOGOS_SF_FRONT_ONLY=1`, `logos_twist_last(31)`): a 64-element prefix that settles nothing
+  (sorted, integral or constant: a header block) no longer sends the whole range through the scalar profile loop; three more windows
+  are asked. Founders 1.13-1.16, ramps and runs 1.06-1.14, guards 0.97-1.08.
+- **The k-way merge in vectors** (`merge_runs_vec`, `LOGOS_RUNMERGE_SCALAR=1`, `logos_twist_last(32)`): k >= 3 crossings of the knot
+  route and the leaf's run merge, pairwise through the two-chain vector kernel. 3-8 laid-out strands 2.08-2.60, 1.32-1.36 at 14
+  threads, eight concatenated logs 2.13.
+- **The stray cap 1/16 at one thread** (`LOGOS_STRAY_DIV`; 1/64 at P > 1, where 1/16 lost 0.33): 1% random swaps 3.07, 2% 2.09;
+  3% swaps 0.885 (recorded: 1/8 and 1/12 measure the same, so it is the stray path's cost at 6% displaced, not the cap).
+- **The short-reach probe's density threshold 0.20** (`LOGOS_REACH_DENSE`): two randomly interleaved sources no longer depend on the
+  seed, 2.0-2.6x on the seeds that lost.
+- **The cuts route declines before its block pass** when over half the sample is a candidate (`LOGOS_CUTS_DENSE=1`).
+- **The low-discrepancy probe asks for coverage, as a measured band** (`LOWDISC_MIN_COVER` 0.5, `LOWDISC_LONG_COVER` 0.05,
+  `LOGOS_LOWDISC_LOCAL=1`, `logos_twist_last(30)`): a triangle wave had sorted 7.8x slower than its own values shuffled. Windows covering
+  5-50% of the range take the kernel: short legs 1.09-1.22, clustered legs 1.97-2.23; long clean legs keep coarse, which beats the
+  kernel there; guards 0.95-1.03. When the profile is deferred the test takes the real range first (the founder windows had made it
+  read four windows' extremes: 2x on triangles, caught by the A/B).
+- **The run detector's checkpoints stop nothing before 4,096 elements** (`RELOC_CHECK_MIN_SEEN`, `LOGOS_RELOC_CHECK_EARLY=1`): a
+  near-sorted array with strays in its first 64 places 5x; guards 0.97-1.05 at one thread, 0.89-1.05 at 14.
+
+**Measured and not built:** hub and spoke at one thread (0.58-0.91); the AVX2 kernel for int32 on distinct inputs (1.02-1.24 slower:
+the ledger's row stands; `make twinbatch`, new: any compile-time switch paired on distinct inputs); TDM demultiplexing, told ceiling
+1.27-1.90 at 2-4 channels and 0.50 at 16 (OUTSIDE_THE_BOX C1 predicted 3-10x); patience piles 1.14-1.46. **The hardware question:**
+4K aliasing between the array and its scratch (a switch skewing the scratch by 64 or 2112 bytes) 0.93-1.03, nil, taken out again; code
+alignment (`-falign-functions=64 -falign-loops=32 -falign-jumps=32`) 0.95-1.07, nil; a staged streaming write-back for the run-length
+route queued. Harness: new section "other fields" (33 checks, 15 name the branch); "blocks + 3% strays (past the cap)" became 9% (the
+cap moved); `logos_psort.h` documents `logos_twist_last` 28-32 and -11..-13.
+
+**Verification:** `make test` all green (54,924 checks), `make sanitize` all green (the 4 known reports), 40 flag builds, faultprobe on three new cases
+0 bad of 3,924 injected failures, psort_f64's frame 24,304 unchanged, callbench rows of 5 or fewer within the floor (0.97-1.07; n = 0 1.07).
+
+## (unreleased) -- three new tests (order must never cost; isomorphs cost the same; one element must not cost 10% more) and the eight fixes they found (FINDINGS 3bn)
+
+**Asked:** "hallucinate some more tests and a/b them". Three invariant tests the project had never run, each a bench:
+`orderprobe` (24 ordered shapes against their own values shuffled), `symprobe` (order-isomorphisms: negate-and-reverse, exact
+power-of-two scalings) and `edgeprobe` (every size gate crossed by one element). Each defect they found was traced, fixed behind a
+switch, and paired against the engine as it ships. Ratios: above 1, the change is faster.
+
+**Shipped:**
+- **The run-length route** (`rle_try_f64`, `LOGOS_NO_RLE=1`, `logos_twist_last(28)`): runs of bit-equal values in no order (a
+  table re-sorted by a column constant inside its previous groups) collapse to (key, length) pairs, an MSD byte radix sorts the
+  pairs, the runs are written back. Branch-free compress, blocked write-back (the first cut's branches cost geometric runs all of
+  the gain). One thread, 4M: runs of 8 2.04x, 16 3.47x, 64 7.0x, geometric mean 6 1.56x, 12 2.32x; declines below a mean run of
+  four; 23 guards 0.96-1.05. `make rleprobe` (`kv` = the ceiling, `ab` = the route against itself off).
+- **The cuts route** (`cuts_try_f64`, `LOGOS_NO_CUTS=1`, `logos_twist_last(29)`): windows in order, unordered inside, larger than
+  the short-reach route's reach. Candidate cuts from the position-ordered sample, exact cuts from block extremes, segments sorted
+  where they lie. coarse64k 1.53x at one thread (predicted 1.8-2.2x), 23 guards 0.96-1.04. After the wave route.
+- **The tail merge's forms** (`LOGOS_TAIL_BRANCHY=1`, `LOGOS_TAIL_VEC`, `LOGOS_TAIL_GALLOP`, `logos_twist_last(-11)`): the two-chain
+  vector merge at gaps up to 3 (1.41x at a half, 1.26x at a quarter), a gallop from 256 (1.10-1.25), the old loop between. A
+  branch-free loop measured 0.34-0.66 and was removed. `make tailladder`.
+- **The head route** (`head_merge_try_f64`, `LOGOS_NO_HEAD=1`, `logos_twist_last(-12)`): a random head before a sorted suffix, the
+  tail's mirror, found by symprobe 5.02x slower than its isomorph. 1.39-7.61x across head fractions (`make headladder`).
+  The head and tail routes' vector merges now count in `logos_twist_last(13)` (the kernel's counter): the head route took the
+  vector-merge harness rows' 40/60 two-strand shape, and three rows read "the kernel was never taken".
+- **The quantization probe on Weyl positions** (`LOGOS_QUANT_STRIDED=1`): its stride aliased with a period of 4 (streams4 2.17x).
+- **The quantized float radix off by default** (`LOGOS_QUANT_RADIX=1` restores it): quantized 1.40-1.41x, near-sorted 1.93x at
+  262k, nothing it won.
+- **The thin front to 2047** (`THIN_MAX_N`, `logos_twist_last(-13)` reports it; `make thinbench` moves it at run time in a
+  `-DLOGOS_THIN_HOOK` copy): with the dispatcher's vector prescan and kink windows ending in a budgeted insertion sort, it beats the
+  dispatcher at every size from 129 to 2047 on fourteen shapes (uniform 2.32x at 129, 1.11x at 2047; kinks 1.6-2.3x; near-sorted
+  to 3.0x; a 95% prefix to 3.7x).
+- **The 2048-65536 window by local order** (`band_local_order`, `-DLOGOS_BAND_FLASH` / `LOGOS_BAND_FLASH=1` restore flash for the
+  window): measured on distinct inputs (`make bandbatch`; bandbench repeated one input), the AVX2 kernel takes ranges without local
+  order: uniform 1.13-1.25x, normal 1.35-1.57x, bimodal 1.67-1.94x, clustered 2.6-15x; ordered ranges keep flash (0.94-1.09); one
+  loss, a 30,000-value lattice at 32768 elements (0.74).
+
+**Diagnosed, not fixable here:** the vector quicksort's order cost (`make ordkern`): x86-simd-sort pays it too, at the same partition
+depth, so it is a per-level cost of in-place vector quicksort on locally ordered input. **Reverted:** dropping `nearly` on dense
+ranges (coarse64k 1.10x, superseded by the cuts route). **Leads logged** (IDEAS_LOG 11): the shared sample at 4096 (+25-66%), the
+probes at 65536 (+11%), the one-to-two-thread edge at 14 threads (four mechanisms), coarse at 500000, momentum at 50000.
+
+**Verification:** `make test` all green (54,815 checks; new sections "runs of equal values" 28, "cuts: windows in order" 19,
+"thin front" 3,960), `make sanitize` all green (the 4 known reports), 34 flag builds, faultprobe on the four new paths 0 bad of
+724 injected failures, frame 24,304 unchanged, callbench: 1,000 elements 0.46x random and 0.59x sorted, rows of 5 or fewer
+within the floor (one compare added on that path, read in the assembly).
+
+
+## (unreleased) -- the scale report says what each shape is, with demo data
+
+**Asked:** "Provide a brief description of each shape and provide some demo data in an accordion in the scale-report file."
+Above the charts, one collapsed accordion: an entry per shape the report measured (13 numeric, 4 string), each with a one-line
+summary, a short description of the DATA (what it models, what is special about it; routes are left to the trace builds, since
+they move between rounds), a profile counted over all n elements (distinct values, range, share of adjacent pairs in order,
+ascending runs, integrality; for strings, lengths), two inline SVG plots (the whole array at 512 evenly spaced positions, and 48
+consecutive elements around the feature that defines the shape, marked in orange: a block boundary, a kink, a swapped element,
+the wave's steepest fall, a late log line) and the values or strings themselves in the order the sort receives them. Strings are
+plotted by rank. Every panel's heading now carries the shape's one-line summary and a link that opens its entry.
+The demo is NOT a picture: `shape_demos_json()` in scalebench.cpp calls the bench's own `gen()` / `gen_strings()` (seed 7, n =
+1,048,576) when the page is written, so `LOGOS_SCALE_REUSE` re-renders carry it (2.8 s) and it can never drift from the data that
+was timed. `tools/browser_check.py` asserts an entry per described shape with both plots inked, and that a panel link opens its
+entry (checked to FAIL on a page with one entry removed). The report grows ~100 KB. Nothing was measured; the timings are those of
+the report it was rendered from.
+
+## (unreleased) -- eight invented ideas, A/B'd: two halves, the AVX2 leaf in the partition, small string groups on keys, the log-line route, streamed placements, a kink gate that sees sparse kinks (FINDINGS 3bm)
+
+**Asked:** "Hallucinate some more ways of improving the algorithm and a/b test them." Each idea was predicted in writing, built
+behind a switch in one binary, and paired against the shipped engine with its guards. New benches: `roundbench` (any per-sort
+switch against shipped, f64, 23 shapes including twelve structured guards: `RB_SWITCH=<NAME> [RB_VALUE=v] ./roundbench [pairs] [P]
+[n list] [filter]`) and `strsmallbench` (small string calls, batches of distinct inputs: `SS_SWITCH=...`). `bench_strings.h` gains
+`logs8` (eight log files concatenated) and stringbench runs it.
+
+**Shipped (ratios t(switch) / t(shipped), above 1 = the change is faster):**
+- **Two halves at two threads** (`halves_try_f64`, `LOGOS_NO_HALVES=1`, `logos_twist_last(26)`): after every structured route has
+  declined, the sample's median splits each half in place (the kernel's own partition), the misplaced blocks trade places, and each
+  part takes the sequential leaf on its own thread. 8.4M: uniform 1.32, heavy_tail 1.60, bimodal 1.55, clustered 2.25, normal 1.47,
+  int_wide 1.14; 250k: 1.22-3.04; twelve guards 0.99-1.02. Gated by `sample_unstructured` (the sample's inv_all, its repeats, and 64
+  windows of adjacent pairs), which three failed cuts made necessary (noisy ring 0.71, shuffled blocks 0.44, quantized 0.80, a
+  sawtooth aliasing the sample's lag 0.655).
+- **The sequential leaf's policy inside the partition where buckets are past L2** (`job_t.seq_leaf`, `SEQLEAF_MIN_BUCKET` 96,000,
+  `LOGOS_NO_SEQLEAF=1`): 8.4M at 3 threads 1.32-1.37 (clustered 2.09), 4 threads 1.12-1.76, 6 threads 1.05-1.12; 30M at 14 threads
+  1.05-1.24; 50k buckets (8.4M at 14) neutral; guards within noise. This SUPERSEDES the ledger's "AVX2 quicksort inside the parallel
+  leaf" row, measured before the kernel bridge and on L2-resident buckets.
+- **Small string groups on 8-byte keys** (`str_small_keys`; `LOGOS_STR_SMALLMKQS=1` keeps the multikey quicksort for groups inside a
+  large sort; a call of 32 strings or fewer reads no environment): small calls of 8-32 strings 1.36-2.77x, logs at 48-128 strings
+  1.5-1.9x, 2M urls 1.10 at 1 and 14 threads.
+- **The log-line route** (`str_ns_try`, one thread, from 65,536 strings; `LOGOS_STR_NO_NS=1`; `logos_twist_last(27)`, verdict `(-9)`,
+  pre-gate strays `(-10)`; `LOGOS_STR_NS_CAP=<f>` forces the give-up, for the harness): one keep pass with demotion, the strays
+  sorted alone, a backward merge in place. 2M log lines 2.11-2.32x (4.72x std::sort), 200k 2.00x; concatenated logs and random
+  shapes 0.97-1.04.
+- **Placements stream** (`place_copy`, `LOGOS_PLACE_PLAIN=1`, from 4M elements): relocation's and the knot route's piece copies and
+  copy-backs use AVX2 streaming stores, fenced before every barrier. block_perm64 1.05-1.09 at one thread, staircases 1.03-1.05,
+  14 threads 1.06-1.22 on a noisy box.
+- **`REACH_KINK_MIN` 8 -> 3** (`LOGOS_REACH_KINK_MIN=<k>`): one strand with 0.02-0.05% kinks 1.9-3.4x in 7 of 10 cells at 4 and 14
+  threads, random-swap guards 0.98-1.04.
+
+**Not shipped (reverted; ledger):** radix in the cache for int32-valued doubles (one MSD pass, LSD inside L2 buckets: 1.034 / 1.023
+over 60 pairs, null 1.004; with 12-bit digits 0.87-0.90), and the string sort's top level fanned out (16384 / 4096 per thread: 100k-
+200k 1.10-1.88x SLOWER; a cap of six top-level threads won 1.05-1.35x at 300-450k and lost from 1M, a P-core artefact pointing at a
+work queue for the static-sliced phases).
+
+**Found in review, fixed before shipping:** `psort_f64` also serves the sorted view's lazy partition (`logos_partition_f64`), and the
+halves route would have sorted the whole array there instead of handing back unsorted buckets; it now runs for plain sorts only, and
+a harness row asserts the view gets buckets at two threads.
+
+**Verification:** `make test` all green (53,462 checks; new sections "two halves" 548, "log-line route" 132), `make sanitize` all green
+with the same 4 reports as before the round (the flash / coarse NaN-to-index casts of 0h (e); the halves section's NaN rows reach three
+of them), 21 flag builds compile
+(warnings unchanged), the dispatcher's frame unchanged at 24,304 bytes, faultprobe 0 bad (two threads uniform: 1,082 allocation and
+10 thread-creation failures; three threads uniform and heavy_tail: 1,956 and 32; the new `loglines` string case: 36 and 6).
+`roundbench`'s first sequential-leaf run linked a STALE library after a failed build and read as a null; every bench command since
+stops on a failed build.
+
+## (unreleased) -- strings in the scale report (`make scale-full`)
+
+**Asked:** "strings should also be part of the scale-full benchmark." Four string shapes join the thirteen numeric ones -- uuids
+(high-entropy keys), words (short, Zipf duplicates), urls (long shared prefixes), logs (timestamps nearly in order) -- over the same
+ladder (0, 1, 3 ... 10M), at one thread and at 14, with the same batching below 10k, the seam pass and the cold-call memory pass.
+The contenders keep their columns and colours and the panels name them (`names` and `note` in each series; the script falls back
+to the numeric names): std::sort / __gnu_parallel::sort and IPS4o with strcmp, logos (`logos_sort_strings_mt`), x86-simd-sort's
+key-value sort under the same 8-byte-prefix scheme (it cannot sort strings), and the multikey quicksort logos used before, in the
+radix column. Outputs are compared AS STRINGS (identical strings may come back in any pointer order). The string shapes and the
+prefix scheme moved into `bench_strings.h`, shared with `stringbench`; the harness's timing, batch, check and memory helpers are
+templates on the element type now. `LOGOS_SCALE_STRINGS=0` skips the strings. Both report checkers pass (the stub drives 408
+charts, real Chrome six views).
+
+**What the ladder shows that a 2M bench could not** (the second run; the first was discarded, its calibration read memcpy 27 ms):
+
+| contender / logos | 1 thread | 14 threads |
+|---|---|---|
+| std::sort, gnu_parallel (strcmp) | **1.5-14x** at every size (uuids 14x at 10M) | **0.37-0.92 from 10k to 100k**, 1.3-9.7x from 1M (logs at 10M 0.94) |
+| x86-simd-sort key-value, same prefix scheme | 0.97-1.36 to 1M, **0.76-0.81 at 10M** on words and logs | 0.45-0.88 on words from 32k to 1M, 1.1-4.3 elsewhere |
+| IPS4o (strcmp) | 1.7-7.8x | 0.6-0.9 at 32k-100k on words, urls, logs; 1.2-6x elsewhere |
+
+So the string sort's weakness is the MIDDLE with threads: below 65,536 strings it runs on one thread, and at 100k only three. Two
+attempts to close it, both measured mixed and neither shipped on (ledger): lower thresholds (urls at 32k 0.69, but logs at 262k
+2.86x slower: a parallel level's sample and phases do not shrink with the range), and handing the groups below the first level to
+the workers (`LOGOS_STR_GROUPPAR=1`, opt-in: urls 1.0-1.9x, logs and words 0.66-0.95, the wake-up dearer than groups of identical
+strings). Also open from the small end: 32 log lines sharing a 20-byte prefix take 3.4 us against IPS4o's 1.1 (the base case's
+multikey quicksort steps through the shared prefix a byte at a time, strcmp compares it in vectors), and at 10M on one thread the
+library's key-value kernel beats the MSD radix on words and logs.
+
+**Smaller fixes on the way:** `logos_sort_strings_mt` read its A/B switches with getenv on every call (a batch of tiny sorts paid
+it thousands of times); it reads them only with threads now. The harness's strings section runs the opt-in hand-off too (993 checks).
+
+## (unreleased) -- strings on 8-byte prefix keys: the numeric machinery under a string sort (`make stringbench`)
+
+**Asked:** "are strings sorted? if not, why?", then "do that and also compare to simd". The C engine had a one-thread multikey
+quicksort (`logos_sort_strings`, one harness check, never benchmarked); the string engine with the tricks lived in JavaScript.
+
+**Built: `logos_sort_strings_mt(a, n, nthreads)`** (logos_psort.c; `logos_sort_strings` now calls it with one thread,
+`LOGOS_STR_MKQS=1` keeps the quicksort; `logos_twist_last(25)` counts it). Each string's next 8 bytes become one 64-bit key,
+big-endian and zero past the NUL, so comparing keys is comparing those bytes the way strcmp does; one load when the 8 bytes cannot
+leave the string's page, masked after the first NUL. (key, pointer) pairs are sorted without chasing a pointer: an MSD radix that
+skips constant bytes on one thread, a sample sort into P x 16 buckets on sample-quantile splitters in parallel. Equal keys whose
+last byte is not 0 are strings sharing 8 more bytes: sorted again 8 bytes deeper; equal keys ending in 0 are identical strings,
+done. A range whose keys are ALL equal skips to the next 8 bytes (a shared "https://" costs one key pass). Groups of equal keys
+are handed to the workers concurrently, largest first; a group gets threads of its own only past a fair share. A prescan returns
+sorted input after one pass and turns strictly descending input round. Ranges of 32 or fewer take the multikey quicksort. Scratch
+about 24 bytes per string; a failed allocation falls back to the quicksort.
+
+**The SIMD comparison.** x86-simd-sort cannot sort strings; its AVX2 key-value sort can sort (prefix, pointer) pairs. So the bench
+drives the SAME prefix scheme (keys, skip, groups 8 bytes deeper) with `x86simdsortStatic::keyvalue_qsort` (OpenMP at 14 threads)
+and with std::sort, beside std::sort / __gnu_parallel::sort with strcmp and the old quicksort. 2M strings, 7 reps, contenders
+rotated inside each rep, every output checked against std::sort's; ratio = contender / logos in the same rep, median.
+
+| shape (mean length) | 1T std::sort | 1T old quicksort | 1T prefix + x86-simd-sort | 14T gnu_parallel | 14T prefix + x86-simd-sort |
+|---|---|---|---|---|---|
+| uuids (36) | **12.4x** | 6.0x | 1.15 | **6.0x** | 1.05 |
+| random bytes (22.5) | **14.5x** | 7.4x | 1.43 | **6.0x** | 1.08 |
+| words, Zipf (6.7) | **7.1x** | 2.4x | 0.96 | **3.4x** | 0.90 (1.07 and 0.99 in two earlier runs: level) |
+| ids "user_" + 10 digits (15) | **8.3x** | 4.4x | 1.44 | **4.8x** | 1.44 |
+| urls (46) | **4.2x** | 3.3x | 1.25 | **2.4x** | 1.82 |
+| paths (51) | **5.0x** | 4.3x | 1.54 | **3.8x** | 6.6 |
+| logs, timestamps nearly in order (54) | **2.4x** | 1.9x | 1.02 | **1.7x** | 5.1 |
+| words, already sorted | **24x** | 4.0x | 6.8 | **3.3x** | 2.3 |
+
+(The final source; the second of three runs read within 0.1-0.4 of every cell.)
+
+**Predictions graded** (written in stringbench.cpp first): high-entropy prefixes 3-6x over std::sort -- measured 12.4-14.5, low by
+2-3x (std::sort pays two cache misses per compare and about 21 compares per string; the prefix sort reads each string once);
+words and ids 2-4x -- 7.1 and 8.3; long shared prefixes 1.5-3x -- 2.4-5.0; sorted words 0.5-1.0 -- 2.35 before the prescan and 24
+after. Against prefix + x86-simd-sort at one thread 0.8-1.25 -- 0.96-1.54: the library's kernel is level on short keys with heavy
+duplicates (words) and behind on high-entropy keys, where the MSD radix on 16-byte pairs wins. 14 threads, 3-6x over
+__gnu_parallel::sort -- 1.7-6.0 (8.7 in one run).
+
+**Two defects of the first cut, found by the bench and fixed:** (1) no prescan -- sorted words ran 0.38 of the old quicksort
+(whose middle pivot is perfect on sorted input) and 0.65 of the SIMD scheme; the prescan made it 4.1x and 6.9x AHEAD. (2) Each large
+group of equal keys was sorted in turn with every thread: twenty user directories of 100k strings each ran one after another on
+three threads apiece, and paths scaled 1.23x from 1 to 14 threads. Paired in one binary (`STRING_AB=1`, `LOGOS_STR_SEQBIG=1` keeps
+the first policy), 21 reps at 14 threads: **paths 2.58x**, urls 1.05, ids 0.99, logs 0.97, sorted 1.00.
+
+**A third defect, found by printing the frames, fixed:** the recursion went into EVERY group of equal keys, so input where each string
+shares one 8-byte block more than the last recursed once per string, at 15.7 KB a frame. 3,000 such strings SEGFAULT the previous
+version (exit 139, one buffer of 24 KB). Now every group but the largest recurses (each at most half its range) and the largest
+continues in the loop -- the multikey quicksort's rule for its equal partition -- so the depth is at most log2 n; the parallel half
+lives in a function that is not inlined, and the recursive frame is 208 bytes. Harness row "nested blocks".
+
+**Verified:** harness section "strings on prefix keys" (597 checks: empty strings, every byte value, prefixes of one another, 8, 9
+and 200 shared bytes, duplicates, sorted, reversed, sizes 2 to 300,007 across both thresholds, 1 / 2 / 8 threads, and strings ending
+on the last byte before a PROT_NONE page so the 8-byte load must not cross into it); `faultprobe` entry `strings` (68 injected
+allocation failures, 12 thread-creation failures, 0 bad); the section under ASan and TSan.
+
+## (unreleased) -- every speed and memory trick on the list, each A/B'd (`make rssprobe`, `make batchbench`, `make pgobench`)
+
+**Asked:** "what other tricks to increase speed or decrease memory usage aren't being used?", then "implement all suggested features
+with A/B testing to check." Eleven items. Each got a prediction in writing first (the bench headers, and the list below), a
+switch or a build flag, a paired A/B (`bench_paired`, one binary, or two copies in both orientations with the layout cancelled), a
+harness section that names the path it took, and a verdict. **Five ship on by default, two ship opt-in (they win memory and lose
+speed), four do not ship.**
+
+**Shipped, on by default:**
+- **A persistent worker pool** (`wp_*` under `par_run` / `par_spawn` / `par_join`; `LOGOS_NO_POOL=1`; `logos_twist_last(19)`). Every
+  parallel phase used to create and join its threads, ~60 us a thread here, paid once per phase. The workers now stay, spin briefly,
+  then wait on a condition; `logos_release_buffers()` stops them, a fork child gets a fresh pool (`pthread_atfork`). 1M, 14 threads:
+  sorted **2.29**, sorted with late strays **2.44**, few distinct **1.47-1.73**, near-sorted **1.62**, shuffled blocks **1.34**, the
+  partition shapes 1.07-1.13; 8.4M 0.99-1.37; 1M at 4 threads 1.02-1.79. Predicted 1.10-1.30 / 1.2-1.5 / 1.5-2.0 at 1M: the partition
+  came in at the bottom of its range, everything structured above. Harness "worker pool" (97 checks: pool growth 2 -> 8 -> 16,
+  release, a fork with the pool alive under a watchdog); the fault section's thread-creation runs are now cold and run both with and
+  without the pool (360 injected creation failures, 0 bad).
+- **The thin front** (`thin_sort_f64` / `thin_core_f64`, `-DLOGOS_NO_THINFRONT`, `logos_twist_last(20)`): calls of up to 128 elements
+  are answered before the dispatcher (prescan exits, the networks for 4-16, the AVX2 quicksort from 17, insertion / introsort without
+  AVX2). **What it found:** an UNSORTED call took the buffer pool's lock, initialised a context and built a relocation plan before the
+  tiny case ran -- 160-219 ns for three random doubles (the committed engine the same), where the record said 48. `make callbench`
+  against the engine before it, both orientations, two runs: random n = 3 **0.18**, 5 **0.11**, 10 **0.16**, 32 **0.07**, 72 **0.11**,
+  100 0.27-0.30; sorted 2-5 0.31-0.40, 10 0.52, 24-100 0.60-0.86; 0, 1 and 1000 up 0.98-1.01. A second cut (17-24 elements to the
+  AVX2 kernel's vector networks instead of insertion sort) read 0.28-0.54 against the first. Predicted 1.3-1.6 sorted / 1.5-2.5
+  random 32-100: low by 2-6x, because the baseline was dearer than recorded. Harness "thin front" (2,688 checks, 1,344 name the path).
+- **The lattice map in vectors** (`lattice_map_vec`, `LOGOS_NO_LATVEC=1`, `logos_twist_last(23)`): four elements per step -- FMA,
+  round, the residue and NaN test as one unordered compare, the slot range, the slot keys by one gather against the elements'
+  total-order keys; a vector that does not verify takes the shipped scalar step, so verdicts and tables are identical. 8.4M, one
+  thread: 256 distinct values **2.57**, quantized **2.38**; 14 threads **1.77 / 1.60**; guards 0.98-1.03. Predicted 1.2-1.4 / 1.05-1.20:
+  low by 2x -- the scalar map's round-through-`long` and branches were most of the route. This is IDEAS_LOG 8 (a), and the scoreboard's
+  256-value cell at one thread (0.845 of x86-simd-sort) with it.
+- **Float32 narrowing** (`f32_radix_try`, `LOGOS_NO_F32=1`, `-DLOGOS_NO_F32`, `logos_twist_last(22)`): a one-thread leaf of 65,536 or
+  more whose doubles are all exactly floats (one pass proves it while writing 32-bit total-order keys; the first double that is not
+  a float, or a NaN, declines with the array untouched) is radix-sorted on 4-byte keys, 1-3 passes of at most 11 bits relative to the
+  minimum, the last pass writing doubles back. Float-origin data, one thread: **1.20-1.34** from 262k to 8M, **1.50-1.68** at 65,536;
+  plain doubles and int_wide 0.97-1.00 (they decline on the first element). Predicted 1.25-1.45 at 8M: right. The "sensor" floats read
+  1.0 because the leaf's quantized-radix probe takes them first.
+- **A batch entry** (`logos_sort_f64_batch(a, off, nseg, nthreads)`, in `RENAME`): many arrays end to end, sorted in parallel ACROSS
+  segments, each worker with a private context and buffer (nothing pooled or global shared), segments claimed in groups; the
+  low-cardinality route first from 4,096 elements; with several threads every segment under 200,000 (which the engine would sort on
+  one thread anyway), with one only up to 4,096 (beyond that the whole engine has routes the leaf lacks). Against a loop of
+  `logos_sort_f64`, 8.4M elements in all, `make batchbench`: **14 threads 4.2-9.6x on every row** (8- to 150,000-element segments,
+  uniform, five values, near-sorted, quantized, mixed lengths); one thread 0.97-1.06. **The first cut lost**, as its written risk
+  said, worse than said: five-valued segments of 10,000 at one thread 0.284 (the dispatcher's vector count against the leaf's
+  scalar counting), fixed by asking the low-cardinality route first (1.02); mixed lengths 1.46 at 14 threads (fixed by the 200,000
+  limit: 7.1); and 8-element segments 0.94 at one thread from three passes over the offsets (one pass: 1.00).
+
+**Opt-in -- they win memory and lose speed, so they are not defaults:**
+- **Pool trim** (`trim_note`, `trim_idle`; `LOGOS_TRIM=1` hands pages back with MADV_FREE, `LOGOS_TRIM=hard` with MADV_DONTNEED;
+  `logos_twist_last(21)`). The pools kept what one large call used FOREVER: `make rssprobe` (new) shows 8-10 bytes per element
+  resident after one 8.4M sort and 32 small ones. Each pooled region now keeps a decaying high-water mark (an eighth off per call)
+  and hands back what lies past twice it. Hard form: that residue **8-10 -> 0.35-0.83**; soft form: 7.6-9.6 of it LazyFree
+  (reclaimable under pressure, still counted in RSS). **The price:** the next LARGE call after six or more small ones faults its
+  pages back -- hard form 1.3-2.5x on that one call (block_perm at one thread 2.48, uniform at 14 threads 2.14), soft form 1.03-1.97
+  at one thread and 0.92-1.09 at 14 on a noisy box. Predicted 1.03-1.20 for the hard form: the refault costs far more than the
+  ~13% page-fault floor of record. Harness "pool trim" (324 checks: a large sort reusing trimmed pages, both forms, both thread
+  counts).
+- **The in-place partition** (`ipp_partition`, `LOGOS_PART_INPLACE=1`, `logos_twist_last(24)`): IPS4o's block permutation over the
+  histogram-free partition's own bucket map -- stripes classified into per-stripe block buffers, full blocks written back behind the
+  read position, each bucket's area compacted, blocks permuted under per-bucket locks with a reading count, the spills set aside and
+  the holes filled, the buckets sorted where they lie; every phase claims its work, a failed allocation declines before the array is
+  touched. 14 threads, peak resident above the array **8.6 -> 1.4-2.2 bytes per element** (uniform 1.64, heavy_tail 2.15, int_wide
+  1.37), 0.6-0.8 held after; speed **1.25-1.38x the time** of the region-buffer partition on every shape that reaches it, at 2M and
+  8.4M (predicted 1.05-1.25x). The extra cost is the permutation pass. Harness "in-place partition" (448 checks, 160 assert it ran)
+  and the WHOLE harness passes with `LOGOS_PART_INPLACE=1` set.
+
+**Not shipped:**
+- **The AVX2 quicksort for int32-valued doubles at one thread** (the existing `-DLOGOS_AVX2_INT32`, tried as the default with a
+  switch): int_wide **0.83** at 8.4M and 0.93-0.94 from 65k to 1M -- the narrowed LSD radix is the faster of the two. Predicted
+  1.05-1.12, wrong in sign. Reverted to the opt-in flag, code as it was.
+- **Lazy one-thread scratch**: not built, because `make rssprobe` settled it first. The one-thread path ASKS for 15.5 bytes per
+  element (memprobe's figure), but a large malloc is an mmap and the AVX2 leaf touches none of it: uniform, heavy_tail, few
+  distinct and sorted read **0.04-0.06 bytes per element resident**. There is nothing resident to save.
+- **`-march=x86-64-v3` as the ceiling for `target_clones`**: the whole engine built for AVX2+FMA+BMI2 against the shipped build,
+  `tools/ledger_rerun.py --only march`, layout cancelled: **0.95-1.00 on every row**. The hot kernels are already AVX2 intrinsics;
+  the scalar rest gains nothing. The rule written beforehand (build target_clones only if a row clears 1.04) says no.
+- **Profile-guided optimisation** (`make pgobench`: each orientation trains its own copy with `pgotrain`, fourteen shapes, 3 to 8M
+  elements, 1 and 14 threads, then `-fprofile-use`): **0.98-1.03 on every row**, layout cancelled. Predicted 0.98-1.06: neutral.
+
+**Also measured:** sorted calls of 1,000 elements cost 1.09-1.12 against the COMMITTED engine, bisected (`make callbench`, both
+orientations) to changes that predate this session (HEAD -> the working tree as this session found it: 1.094; this session's
+changes 0.98-1.03 from 1,000 up). Logged in IDEAS_LOG, not chased. The dispatcher's frame is 24,304 bytes at the end of the round
+(six probed pages; it was 28,256, seven), printed at the engine's flags.
+
+**Verified on the final source:** the whole harness green, and green again with `LOGOS_PART_INPLACE=1` set for every row; `make
+sanitize` (ASan + UBSan + float-cast-overflow, leak checking on) the same 4 reports as before the round, all the known NaN-to-index
+casts of open direction 0h (e); `make tsan` 0 data races -- its one failure was the worker pool's fork row, because ThreadSanitizer
+refuses threads in a child forked from a multi-threaded parent, so that row is skipped under TSan and runs everywhere else; every
+changed section re-run under TSan by name, all green; `make faultprobe` **14,046 injected allocation failures and 282 thread-creation
+failures, 0 bad**, the new `batch f64` and `ipart f64` entries included; every compile-time switch builds (30 configurations).
+And the check a switch cannot make (`make frontledger FL_BASE=<the source before the pool>`, two copies, both orientations, 60
+pairs, layout cancelled): the whole round against the engine before it on ledgerbench's five shapes at 8.4M, **one thread
+0.99-1.02, 14 threads 1.07-1.10** (predicted 1.00 and 1.00-1.08): nothing rewritten on a switched-off path cost anything.
+
+**Tools added:** `rssprobe` (resident bytes per element: peak, held, after small calls, LazyFree, released; `rssprobe time` = the
+trim's refault cost, paired), `batchbench`, `pgotrain` + `make pgobench`, `tools/pair_orient.py` (two ledgerbench orientations ->
+sqrt(A/B)), `-march` in `tools/ledger_rerun.py`'s list, four float-origin and integer shapes in `frontprobe`, two entries in
+`faultprobe` (`batch f64`, `ipart f64`).
+
+## (unreleased) -- the scoreboard, and the four cells it said logos was losing (`make scoreboard`)
+
+**Asked:** "make the fastest sorting algorithm". Fastest needs a definition before it needs code, so the first deliverable is
+one: `scoreboard.cpp` sorts fifteen to seventeen shapes with logos as shipped, logos with the library leaf, x86-simd-sort,
+IPS4o and std::sort / __gnu_parallel::sort, all interleaved on identical data, every output verified, minimum of 11, at 1 and
+14 threads. **Its first reading was wrong in a way worth recording:** OpenMP threads spin after a parallel region, and the
+rotation always put logos right after __gnu_parallel::sort, so at 14 threads logos read 1.4x slower than an engine identical
+to it there; the board now re-executes itself with `OMP_WAIT_POLICY=PASSIVE` (see the ledger). Corrected, logos lost six
+cells: 1T two values 2.9x, five values 1.45x, 256 values 1.25x, int_wide 1.10x; 14T sorted input 1.9x, clustered 1.3x.
+
+**Built, each behind its own switch, each paired in one binary (`./frontprobe ... ab`, FP_SWITCH):**
+- **A handful of values counted in registers** (`lc_vec_count`, `LOGOS_NO_LCVEC=1`): the low-cardinality route's map compares
+  each 4-lane vector with up to 8 sample values' BIT PATTERNS and counts per lane; the first vector holding anything else hands
+  back to the scalar hash loop. The cost had been `hc[sl]++` chaining through store forwarding. 1T 2 / 5 / 8 values
+  **1.97 / 1.64 / 1.36**, 14T **1.73 / 2.35 / 1.84**, guards 0.97-1.01. The sample's dedup now keeps -0.0 and +0.0 apart (they
+  compare equal), or the one left out stopped the vector count at once (zeros_3: 1.98 / 2.32).
+- **The emit streams** (`LOGOS_LC_EMIT_PLAIN=1`): the counting routes' write-only pass uses non-temporal stores for runs of 512
+  and more in arrays of 2M and more. 1T **1.21-1.36** on 2-8 values, 1.05 on the lattice rows; 14T 1.04-1.13; guards 1.00. This
+  is not the scatter of the ledger's two zero-measuring memory levers: a pure write pass moved every line twice (RFO + write).
+- **The prescan in parallel** (`prescan_par`, `LOGOS_NO_PARPRESCAN=1`): a 64K head as before, then, if the head is still in
+  order and the sort has threads, up to 8 chunks look for their first wrong-way step; first_desc is the earliest, identical to
+  the single scan's (the harness checks it at 2, 4, 8 and 16 threads, NaNs and boundary swaps included). 14T sorted **1.74**,
+  reversed 1.22, sorted with late strays 1.13, guards 0.99-1.02.
+- **The mode grid** (`mdx_t`, `md_certify`, `LOGOS_NO_MDGRID=1`): the per-mode certificate finds up to 64 modes from the
+  splitters (the splitter table keeps 8), and above 8 modes the scatter names a value's mode with one cell of a 4096-cell grid
+  and at most one compare. 14T 16 clusters **1.31**, 32 clusters **1.24**, every other row 0.98-1.03. The crossover was
+  measured, not predicted: through the grid 4 clusters read 0.933 and 8 read 1.035, so up to 8 modes keep the compares.
+
+**A crash in the committed engine, found by the mode grid's harness rows and fixed:** bimodal data holding ONE NaN the sample
+missed segfaults every 14-thread sort of the committed engine and of the pre-session one (8.4M, five tries of five). The
+per-mode map fell through to `(int)(NaN * scale)`, INT_MIN on x86, a negative bucket. `!(x >= lo)` now sends a NaN to a real
+bucket, in the old compares and in the grid; the grid's sentinel is a NaN, not +inf (+inf >= +inf is true, which the infinity
+row caught). Harness row "bimodal + one NaN".
+
+**Predictions graded.** LCVEC: 1T 2.4 / 2.0 / 1.8 predicted, 1.97 / 1.64 / 1.36 measured (low by 15-25%); 14T 1.1-1.3 predicted,
+1.73-2.35 measured (the map was compute-bound per thread there too). Streaming emit: 1.3 / 1.2 / 1.07 / 14T 1.0-1.3 predicted,
+1.36 / 1.21-1.25 / 1.05 / 1.04-1.13 measured: right. Parallel prescan: 1.9 / 1.25 / 1.1 predicted, 1.74 / 1.22 / 1.13: right.
+Mode grid: 1.45 / 1.4 / 1.15 / 1.0-1.05 predicted, 1.31 / 1.24 / 1.035 / **0.933**: the grid is not cheaper than a few compares.
+
+**The board after** (one thread, quiet): uniform, heavy_tail, bimodal, clustered **0.986-1.047 against x86-simd-sort with the
+in-house kernel**; few distinct **1.64x ahead** (was 0.685); 2 values 0.933 (was 0.348); 256 values 0.845, int_wide 0.916 still
+behind; every structured row ahead. Fourteen threads: the board is not paired, and its 14-thread half moved 1.4-2x with the
+box's load across three runs (gnu_parallel on uniform 10.8 / 15.5 / 22.8 ns). On the quiet run logos led every unstructured
+row 1.19-1.30x except clustered (0.77 before the mode grid, whose paired 1.31 puts it level); on the two loaded runs
+x86-simd-sort led uniform and the clustered rows. The paired A/Bs, not the board, carry the 14-thread claims.
+
+**Checks:** `make test` green with three new sections (low-cardinality vector count 112, parallel prescan 1,840, mode grid 118
+checks; 102 of them name the path taken). Flag builds clean (`-DLOGOS_NO_SPLITTER_TABLE` implies `LOGOS_NO_MODEKS`, which now
+also removes `md_certify`; the vector count's target string must be the one the intrinsics header was read under). Against the engine before this session (`make frontledger`, layout cancelled, 80
+pairs, the source before the frame fix): one thread uniform 1.157, heavy_tail 1.098, bimodal 1.087, clustered 1.089, int_wide
+0.998; 14 threads 1.040 / 1.039 / 1.017 / **1.295** / 0.994.
+`make callbench` against the pre-session source caught a FRAME regression: `bt_init` (16.6 KB of arrays) newly
+inlined into the dispatcher, 28,320 -> 42,656 bytes, sorted calls of 2 and 3 elements 1.11-1.13 in both orientations. `noinline`
+on it and one array dropped from the low-cardinality route: 28,288, and n <= 5 reads 0.90-1.03 after. Random calls of 32-100
+elements read 1.07-1.11 in both orientations, in the band the ledger records as moving with layout alone; unclaimed. `make sanitize` on the final source: the same 4 reports as before the session, all the known
+NaN-to-index casts (open item 0h (e)), none from the new code. Frames at the engine's flags: `psort_f64` 28,288 (28,320 before), `sort_fn` 1,376,
+`bt_init` 16,592 (out of line now).
+
+**Still behind, and why:** 256 values at one thread (the lattice route's map is a scalar round / tolerance / key compare per
+element, 40 of 46 ms in a trace: vectorise the index, verify the key, keep the increments); int_wide at one thread (the int32
+radix 11.07 ns against the library's 10.14: `-DLOGOS_AVX2_INT32` exists and wants its A/B against today's kernel); 2 values (both
+sorts now move the same bytes: parity is the ceiling for count + emit).
+
+## (unreleased) -- the profile phase rides on the SIMD sort: logos with the library leaf is level with the bare library (`make frontprobe`, `make frontledger`)
+
+**Asked:** review the algorithm and see how logos would piggyback off the SIMD sort with the profile phase. The router already
+hands unstructured data to a vectorized quicksort (the in-house one, or x86-simd-sort with `-DLOGOS_XSS_LEAF`). What logos
+does BEFORE that call -- the profile phase -- had never been priced. x86-simd-sort itself already piggybacks a profile on its
+own first pass: `partition_unrolled(..., &smallest, &biggest)` reads min and max off the vectors it partitions.
+
+**Priced first** (`frontprobe.cpp`, one engine copy, the library reached through the same `logos_xss.o`, 40 pairs): one thread,
+8.4M, logos against the library with ONE NaN/-0.0 scan in front (the floor for data nobody vouched for) read **1.117** on
+uniform and **1.045-1.057** on heavy_tail, bimodal, clustered; the scan itself, against the bare library, 1.04-1.05. 1M the
+same. Two threads: logos's own profile 0.98-1.00, but the scan, serial in front of a parallel sort, **1.072-1.079**. The two
+passes the code showed: `sort_fn`'s scalar min / max / all-integer / ascending / descending loop (uniform), `leaf_f64`'s
+scalar NaN loop (skewed shapes), and in both cases the kernel's own scan after it.
+
+**Built, three levers, two switches** (`LOGOS_NO_FRONTFUSE=1` restores all three, `LOGOS_NO_PARTFUSE=1` only the third):
+- (A) `leaf_f64`'s skewed branch asks the kernel's scan whether there is a NaN instead of running a scalar loop first.
+- (B) `sort_fn` settles all-integer / ascending / descending on a 64-element scalar prefix (`sf_prefix`), then takes min, max
+  and the NaN-or-zero flag in one AVX2 pass (`sf_profile_avx2`); a clean verdict lets the kernel skip its scan. Anything the
+  prefix does not settle (integers, sorted stretches) takes the original loop, byte for byte.
+- (C) **the kernel's first partition is the profile pass** (`av_qsort_fused`, `av_partition_fl`): the in-house partition's
+  loop with one compare and one OR per vector added, at the top level of a sequential sort from 65,536 elements, the parts then
+  going to the kernel proper (the library where the build has it). `sort_fn` leaves its pass to it: an ascent and a descent in
+  the prefix already prove max > min, which is all the code before the AVX2 gate needs. The price: a NaN is found AFTER one
+  partition has moved data, so that decline returns a permutation of the input; only callers that continue on the same
+  multiset ask for it (`sc_in = -2`).
+
+| 8.4M, one binary, switched / shipped | A + B, 1T default | A + B, 1T library | A + B, 14T default | C, 1T default | C, 1T library | C, 1T default 1M |
+|---|---|---|---|---|---|---|
+| uniform | 1.117 | 1.132 | 1.066 | 1.037 | 1.037 | 1.035 |
+| heavy_tail | 1.059 | 1.064 | 1.052 | 1.041 | 1.035 | 1.033 |
+| bimodal | 1.056 | 1.062 | 1.053 | 1.038 | 1.047 | 1.029 |
+| clustered | 1.062 | 1.066 | 1.033 | 1.031 | 1.050 | 1.030 |
+| int_wide (guard) | 0.995 | 1.009 | 0.990 | 1.003 | 1.002 | 0.998 |
+| zeros of both signs | 1.078 | 1.069 | 1.042 | 1.067 | 1.057 | 1.045 |
+| heavy tail + zeros | -- | 1.055 | 1.032 | 1.023 | 1.034 | 1.021 |
+
+120 pairs at one thread, 80 at 14 (C at 14 threads, 40 pairs: 0.995-1.049, the fused path is sequential only).
+
+**Against the engine as it was before** (`make frontledger FL_BASE=<the pre-session source>`, two copies built twice with the
+assignment swapped, 80 pairs, geometric mean of both orientations): **one thread uniform 1.140, heavy_tail 1.086, bimodal
+1.088, clustered 1.089**, int_wide 1.010; **14 threads 1.033 / 1.032 / 1.055 / 1.021**, int_wide 0.994 (the 14-thread gain is
+(B): every bucket of the partition ran the scalar loop). Re-priced, the library build now reads **0.991-1.010 against the bare
+library call**, which checks nothing, and 0.93-0.98 against the library with one scan.
+
+**A defect caught by the cross-engine ledger, invisible to the switch:** the first version passed `&mn, &mx` to
+`sf_profile_avx2` and split `sort_fn`'s loop around the prefix; int_wide, which keeps that loop, read **0.966** at one thread
+against the old engine while every switch A/B read 0.995-1.009 -- both sides of a switch run the NEW code, and the switched-off
+path was no longer the old loop. Fixed by returning both helpers' results by value and leaving the original loop untouched
+(1.010 after). See the ledger row.
+
+**Predictions graded.** Price: uniform 1.08-1.14, right (1.117); the skewed shapes in that range, low (1.045-1.057, their
+loop is the cheaper NaN loop); two threads 1.04-1.10 on the profile, WRONG (0.98-1.00: the P > 1 path never reaches `sort_fn`)
+-- and the serial scan's 7.5% there was not predicted at all. A + B: uniform 1.08-1.12 right, skewed 1.04-1.06 right, zeros
+~1.03 low (1.07-1.08), 14 threads 1.00-1.04 low (1.03-1.07). C: 1.03-1.05 right; re-price 0.99-1.02 right.
+
+**Checks:** `make test` green on every version, with a new section (`first-partition scan`, 306 checks, 108 of which name the
+path: the fused partition ran where the row says, a NaN declined exactly on the NaN rows, never under either switch) covering
+a NaN met inside the partition, -0.0 through the fused path, pivot-is-the-minimum and right-part-all-equal exits, all-zero
+arrays and infinities. Every touched flag builds warning-free (`-DLOGOS_ZERO_SIGN_UNSAFE` needed two guards). Frames at the
+engine's flags: `psort_f64` 28,320 (unchanged), `sort_fn` 1,344 -> 1,376, `leaf_f64` 80. `make callbench` against the
+pre-session source: 0.91-1.04 layout-cancelled in a first run; a second run on a box 3x slower read 1.066 at n = 0 (a call
+that returns before any changed code), so its small rows are that box's floor; the small path's only new instruction is one
+`cmpq $1023` and a branch, read from the assembly. `make sanitize`: the same 4 reports as before this change, all
+the known NaN-to-index casts in `flash_sort`, the coarse leaf and `skew_probe` (open item 0h (e)); none from the new code.
+
+**Open:** (D) the hybrid's two-thread half (`-DLOGOS_XSS_LEAF`, P <= `XSS_PAR_MAX`) still scans serially in front of the
+library's parallel quicksort: 1.072-1.079 of its time. Folding it the same way means a top partition here and the two parts on
+two threads, which trades the library's task balancing for a static split (a 1023-sample pivot would keep the imbalance near
+1.6%); or a parallel scan, about half the prize. Unbuilt.
+
+## (unreleased) -- the bridge: the in-house AVX2 quicksort closes two thirds of its gap to x86-simd-sort, no dependency (`make avkernbench`)
+
+**Asked:** bridge the best of the SIMD sort and logos. The hybrid (previous entries) bridges them by LINKING the library, which
+makes a C engine depend on C++. The other bridge is to find what the library's kernel does better and do it in house; the
+one-thread gap the hybrid recovered was exactly that kernel's (1.18x). `make avkernbench` times the two quicksorts ALONE,
+no dispatcher, at sizes from one base-case network (64) to 8M, paired, every output verified, with the partition count per
+element against the ideal log2(n/64); the library is built twice so compiler tuning is separated from algorithm.
+
+| step | kernel alone vs x86-simd-sort, 512 / 4096 / 1M / 8M | end to end, one thread, layout cancelled |
+|---|---|---|
+| before | 1.36 / 1.41 / 1.31 / 1.31 | -- |
+| compiler flags (-march=native vs -mavx2 -mfma) | no difference | -- |
+| the library's one-block-ahead prefetch (`-DAV_PREFETCH`) | no difference | not shipped |
+| **networks read the range directly** (no staging buffer, no memcpy) | 1.22 / 1.27 / 1.20 / 1.19 | **1.053-1.068** on four unstructured shapes |
+| 15-sample insertion-sorted pivot from 128 / from 65 | 1.46 / 1.79 at 512: fewer levels, dearer | not shipped |
+| scalar networks for base cases <= 8 / <= 16 | 1.21 / 1.31 at 512; n = 16 alone 8.9x | not shipped |
+| **vector-sampled pivot, every range** (`AV_VPIVOT` = 2) | **1.07 / 1.12 / 1.10 / 1.11** | **1.062-1.087** on four unstructured shapes |
+
+**What the library does better, found by measurement and not by reading:** (1) its base case loads and stores the range
+directly with masked loads, where ours staged every call through a buffer with a variable-length memcpy in and out (two libc
+calls per base case); (2) it samples its pivot as whole VECTORS and finds the median with a vector network, where ours used a
+median of 3 below 512 elements (1.2-1.7 partition levels over ideal) and 15 or 63 scalar samples insertion-sorted above. More
+samples sorted OUR way bought the levels back and lost 1.2-1.5x in cost: the lever was the sampler, not the sample count.
+
+**Shipped:** both, as the defaults. `-DAV_NET_STAGED` and `-DAV_VPIVOT=0` restore the old kernel for the A/B. Together, end to
+end at one thread, about **1.12-1.16x on unstructured data** (the two paired A/Bs compound: networks 1.053-1.068, pivot
+1.062-1.087 on uniform, heavy_tail, bimodal, clustered); int_wide 0.99-1.00 (its leaf is the int32 radix) and every shape at 14
+threads 0.98-1.01 (this kernel is sequential-only). `make test` green on both changes. `make sanitize`: the same 4 reports as the committed engine (the leaves' NaN-to-index casts, open item 0h (e)), none from the new masked loads. The sine wave (open item 0i (f)) is NOT helped: against a uniform sort in the same engine it read 1.27 with the old pivots and 1.33 with the new, because uniform got faster and the wave did not; its own values shuffled read 1.00 and 0.99. The wave's order cost in this quicksort is still untraced, and now it is not the pivot's sample count either.
+
+**Predictions graded.** "The gap grows with n, so the partition": WRONG, it was flat, half of it in the 64-element network.
+"Compiler flags under 5%": right (0%). "Prefetch 1.05-1.10": WRONG, 1.00. "Scalar networks help n <= 16": WRONG, 2-9x worse.
+"A vector pivot 1.05-1.10 on the kernel": right (1.07-1.13 against the library, and the gap to it dropped from 1.18-1.27 to
+1.07-1.12).
+
+**What remains to the library:** 1.07-1.12 on the kernel. The base case at 33-64 elements is still 1.34-1.42x the library's
+and 2-3.5x at 8-16, where the library halves its network to fit and ours pads an 8-vector network with +inf; a 4-vector
+network for ranges of 16 or fewer is the next measurement. With that gap this small, the optional library leaf
+(`-DLOGOS_XSS_LEAF`) buys correspondingly less at one thread; its two-thread half is unaffected.
+
+## (unreleased) — the hybrid: logos decides, x86-simd-sort sorts what has no structure at one and two threads (`-DLOGOS_XSS_LEAF`, `make xssleafbench`)
+
+**Asked:** how can we make a hybrid? `make whyfast` had already drawn it: every sort has a regime where it is the best of the
+three. Order of any kind belongs to logos at every thread count; unstructured data belongs to the SIMD sort at one thread and
+at low thread counts, and to logos's partition from eight threads up; IPS4o is never the fastest cell (its contribution is
+memory). So the hybrid is logos as the decision and the library as the kernel for unstructured data where the partition has
+not yet paid for itself. The one-thread half was the previous entry (1.18-1.20x). This is the parallel half: in the parallel
+dispatcher, after every structured route has declined and before the partition allocates anything, up to `XSS_PAR_MAX`
+threads hand the array to the library's parallel quicksort through the same wrapper (NaN decline, signed-zero repair).
+`LOGOS_NO_XSS_PAR=1` keeps the partition. OPTIONAL, off unless built with the flag, as before.
+
+**The gate was laddered lifted, then set.** Library over partition, 8M, both orientations, layout cancelled:
+
+| shape | P = 2 | P = 4 | P = 8 | P = 14 |
+|---|---|---|---|---|
+| uniform | 1.28 | 1.07 | 0.80 | 0.63 |
+| heavy_tail | 1.54 | 1.16 | 0.88 | 0.75 |
+| bimodal | 1.54 | 1.14 | 0.99 | 0.83 |
+| clustered | 2.70 | 2.06 | 1.53 | 1.09 |
+| int_wide | 1.12 | 0.99 | 0.89 | 0.77 |
+
+That table says 4. **The guards said 2**: sixteen log and block shapes in one binary read 0.97-1.08 at two threads (and 1.14-1.42
+on five rows that reach the partition), but at FOUR threads eight concatenated logs read **0.66** and a noisy ring buffer 0.90,
+against 1.02-1.16 on the random shapes. `XSS_PAR_MAX` is 2. And because the engine's thread policy gives two threads to any
+sort of 200-300k elements whatever is requested, the hybrid fires there too: at n = 250,000 **heavy_tail 2.56x, bimodal 1.94x,
+int_wide 1.45x, clustered 1.42x**, uniform 0.95; at 1M, where the policy picks ten threads, 0.97-1.03 (the gate is closed).
+The harness built with the flag and the gate LIFTED (so the path runs at four and eight threads): all 22 sections, 0 failures.
+
+**Predictions graded.** "1.30-1.40 at two threads": right on uniform (1.28), LOW on the rest (1.54-2.70). "1.10-1.20 at four,
+a loss at eight": right. "0.98-1.02 on every structured shape": WRONG at four threads, where concatenated logs lose a third;
+the partition sorts eight interleaved sorted runs well because its buckets arrive nearly sorted, and a quicksort cannot see that.
+
+**What the table says about the engine, flag or no flag.** (1) The partition at two threads is weak: 1.3-2.7x behind a
+quicksort that starts with serial partitions. (2) `clustered` is behind at EVERY thread count, 1.09 even at fourteen. (3) At
+250k elements non-uniform data is 1.4-2.6x behind. All three are engine defects this library happens to cover; they are owed
+whether or not the library is linked.
+
+## (unreleased) — what makes each sort fast: logos, x86-simd-sort and IPS4o profiled by controlled experiment (`make whyfast`, `make pmuprobe`, `make profile-full`)
+
+No engine change. **This machine exposes no hardware counters**: `make pmuprobe` asks the kernel through perf_event_open and
+every hardware event fails to open under WSL2, so instructions, branch misses and cache misses cannot be counted here. The
+mechanism is read instead from how each sort's time responds when ONE property of the input changes, the three sorts
+alternating on identical data inside every cell, every output verified.
+
+| what was changed (one thread, 8.4M, ns per element) | logos | x86-simd-sort | IPS4o |
+|---|---|---|---|
+| shuffled (the baseline of the ORDER rows) | 12.62 | 9.42 | 26.81 |
+| sorted | 0.30 | 11.21 | 0.49 |
+| reversed | 0.81 | 10.50 | 0.92 |
+| sorted, 1% swapped far | 12.82 | 10.40 | 19.03 |
+| 64 sorted blocks, shuffled | 1.48 | 10.20 | 18.60 |
+| 65536 / 256 / 16 / 2 distinct values | 8.58 / 4.17 / 1.78 / 1.83 | 6.61 / 3.31 / 1.90 / 0.56 | 14.97 / 6.43 / 4.51 / 2.72 |
+| exponential tail / two far clusters / lattice 0.01 (uniform = 12.05, 9.65, 26.05) | 11.67 / 11.78 / 13.32 | 9.16 / 9.17 / 9.54 | 26.19 / 26.27 / 24.18 |
+| n = 4096 / 65536 / 1M / 16M, uniform | 7.34 / 9.68 / 10.21 / 12.99 | 3.50 / 5.92 / 7.23 / 9.90 | 18.42 / 20.89 / 23.55 / 26.73 |
+| 14 threads over 1, uniform (Karp-Flatt e) | 6.53x (0.09) | 4.05x (0.19) | 6.43x (0.09) |
+| 14 threads over 1, shuffled blocks | 1.67x (0.57) | 4.12x (0.18) | 6.41x (0.09) |
+
+**x86-simd-sort is fast because it is blind and cheap.** Order changes nothing (1.08-1.19 on the ordered rows: a sorted array
+costs it MORE than a shuffled one) and the value distribution changes nothing (0.95-0.99). What it has is the lowest cost per
+element per level, 0.29-0.41 ns per log2(n), from vector compares, a partition with no data-dependent branch and networks at
+the bottom; and duplicates collapse its recursion (2 distinct values: 0.06 of its uniform time, the best of the three). Its
+weakness is parallel: 4.05x at 14 threads with a serial fraction of 0.19, because its first partitions run on one thread.
+
+**IPS4o is fast because of how it scales, not per element.** At one thread it is the slowest of the three on every unstructured
+row (26-27 ns per element, 2.1-2.8x the others). It reads a fully sorted or reversed array up front (0.02, 0.03) and is a third
+cheaper on partly ordered data (0.69-0.71), and it gains most from duplicates in the middle range. Its strength is the
+parallel form: 6.43x at 14 threads, serial fraction 0.09, on uniform AND on block data alike, in 2 MB of memory.
+
+**logos is fast because it skips work, and where it cannot skip it is an ordinary good sort.** Sorted 0.02, reversed 0.06,
+shuffled sorted blocks **0.12** where the other two read 1.08 and 0.69: that row is the whole thesis. On unstructured data it
+sits 1.3x behind the SIMD sort at one thread at every size (the kernel gap of the previous entry) and scales as well as IPS4o
+(6.53x, e = 0.09), which is why it leads both at 14 threads. The phase profile agrees: at 14 threads the partition shapes are
+66-73% leaf and 23-30% scatter; the structured shapes are one counting or relocation phase.
+
+**Three defects this exposed, none fixed here.** (1) **A lattice of 1e6 levels at ONE thread costs logos 1.11x its uniform
+time**, where the counting routes should make it cheaper: the lattice route declines at one thread (0j (c), already owed).
+(2) **Far-displaced near-sorted data at one thread reads 1.02**: sorted with 1% of elements swapped across the array gets no
+route at all sequentially, where IPS4o gets 0.71. (3) **logos at TWO threads is poor on uniform: 1.42x, serial fraction 0.41**,
+against 1.62x and 1.76x for the others; and on shuffled blocks it stops scaling at four threads (1.67-1.72x from 4 to 14,
+e = 0.45-0.59), which is relocation being copy-bound and is the same finding as the scale report's 0.76-0.86 at 1M.
+
+## (unreleased) — the router's other half: x86-simd-sort's quicksort as the sequential unstructured leaf, OPTIONAL (`make xssleafbench`, `-DLOGOS_XSS_LEAF`)
+
+**Asked:** what if we take the SIMD sort and bolt logos on top? Two ways to bolt them, and the ledger already holds one: the SIMD
+sort UNDER the parallel partition lost twice (it pays the scatter and the sort). The other is open direction 2, the structure
+router: logos decides, and what it finds no structure in goes to the vectorized quicksort whole. The engine already does that
+with its own copy of the design, so the experiment is one substitution: inside `avx2_qsort_f64`, behind the same NaN decline
+and signed-zero repair, the library's `x86simdsortStatic::qsort` replaces the in-house recursion from 4,096 elements up
+(`logos_xss.cpp`, one thread, no OpenMP; `LOGOS_NO_XSS=1` keeps the in-house kernel; `logos_twist_last(14)` counts the ranges
+handed over). The gate that admits it is sequential-only, so the parallel leaf is untouched by construction.
+
+**Measured** (two engine copies, 40 pairs, 8M, both orientations, layout cancelled as sqrt(A/B)): one thread **uniform 1.18,
+heavy_tail 1.18, bimodal 1.18, clustered 1.20**, int_wide 1.01 (its leaf is the int32 radix and never reaches the quicksort);
+14 threads 0.99-1.02 on all five. One binary with the runtime switch, sixteen log and block shapes at 8.4M: the fifteen
+structured rows **0.98-1.04 at both thread counts**, the uniform control 1.16 at one thread. The harness built with the flag:
+all 22 sections, 0 failures, signed zeros and NaN sections included.
+
+**Predictions graded.** "1.25-1.35x on the five unstructured shapes at one thread": LOW on four (1.18-1.20) and WRONG on the
+fifth, because int_wide does not take this leaf at all. "0.98-1.02 on everything else, nothing at 14 threads": right. The
+in-house kernel is therefore about 1.18x behind the original, not the 1.3x the whole-sort gap suggested: the rest of the
+one-thread gap to the SIMD sort (0.75 in the scale report) is the dispatcher, the probes and the scan in front of the kernel.
+
+**Status: OPTIONAL, off by default.** It adds a C++ dependency (header-only, BSD 3-Clause, Intel) to a C engine, and that is a
+decision for the project and not for a benchmark. The engine without the flag does not reference the file. What it settles
+either way: the in-house kernel has 1.18x to find, and a component probe against the original is now worth its cost.
+
+## (unreleased) — scale report: how old the measurements are (`META.measuredAt`)
+
+Under the title the report now reads "measured N minutes / hours / days ago" with the absolute local time beside it, recomputed
+every 30 seconds while the page is open, and says so in bold once the data is older than a week. The moment is stored WITH the
+measurements (`META.measuredAt`, milliseconds since the epoch, taken when the run finishes), so a `LOGOS_SCALE_REUSE` re-render
+keeps the original time instead of looking fresh; a report from before the field is backfilled from the modification time of the
+file it is read from. Both checkers pass. One defect on the way: the refresh timer kept `tools/check_report.js` alive forever
+(node runs a real `setInterval`; the chain sat for ten minutes until its timeout), so the timer is `unref`d where that method
+exists, which is node only.
+
+## (unreleased) — what a sort weighs, halved where it was waste: lazy contexts and lazy scratch (`make memprobe`, `make scalebench`)
+
+**Asked:** what makes the algorithm blow up in size? The scale report's memory circles answered with a shape, and a symbolised
+allocation log (`MEMPROBE_LOG`, a non-PIE `memprobe`, `addr2line`) with the names. Nothing grew with n: **a sort weighed
+16 bytes per element plus ~340 KB per leaf context**, and P contexts per parallel call. At 10,000 elements that was 50 B/elem, of
+which 33 were tables the sort never touched -- the write-combining stage (131 KB, off below 8 threads and allocated anyway) and
+four coarse levels of counts, starts, heads and landing bytes (197 KB, where a sequential leaf below ~65k takes flash or the
+AVX2 quicksort and never coarse). And at 14 threads the dispatcher took its 8-byte scratch and 1-byte bucket index before
+choosing a route, while the route that takes most parallel sorts, the histogram-free partition, never touches either: 9 of 23
+B/elem never written.
+
+**Two changes.** (1) `ctx_alloc` takes `aux` and `idx` only; the stage when staging is on; the coarse tables on first entry
+to the coarse path (`ctx_coarse_ready`, into the pooled bundle so the next sort keeps them; a failure there sends that range to
+the scalar quicksort, and faultprobe fails the site). (2) The parallel dispatcher holds a `scratch_t` and nobody touches it
+until a route needs it: near-sorted after its window gate, relocation after its plan says something will be placed (three
+placement points), the histogram path when the histogram-free one has declined; one `scratch_drop` at every exit. The
+sequential path keeps its buffer (its leaf always needs it). `-DLOGOS_EAGER_CTX` and `-DLOGOS_EAGER_SCRATCH` restore the old
+allocation, for the A/B.
+
+**Measured** (`make memprobe`, peak heap of one cold call, bytes per element, excluding the input): 10,000 elements
+**49.85 -> 15.63** at 1 and 14 threads; 8.4M at 14 threads **uniform 22.83 -> 13.83, heavy_tail 23.14 -> 14.14**; 8.4M at one
+thread 15.56 (unchanged: the sequential leaf needs its buffer); block shapes 9.0, near_sorted 17.2, counting routes ~0
+(unchanged, they never took what was removed). `make test` 40,640 checks, 0 failures; `make faultprobe` 10,666 injected
+allocation failures and 366 thread-creation failures, 0 bad (fewer sites than before: a sort makes fewer allocations); every
+flag variant compiles, the two eager ones included. Speed: `make ledgerbench LB0="-DLOGOS_EAGER_CTX -DLOGOS_EAGER_SCRATCH" LB1=` and the copies swapped, 40 pairs, 8M, layout cancelled as sqrt(A/B): uniform 0.99 / 1.02, heavy_tail 0.99 / 1.02, bimodal 0.99 / 1.00, clustered 1.01 / 1.01, int_wide 0.99 / 1.00 at 1 / 14 threads -- neutral inside the floor, as a fixed allocation cost at 8M should be. `make callbench` against the committed engine, both orientations: random calls of 2-10 elements **0.83-0.87**, sorted 2-10 **0.79-0.91**, 24 and up 0.94-1.00 -- the sequential path's context no longer zeroes a 2 KB staging counter on every call, since there is no staging buffer at one thread. The fresh scale report (`make scale-full`, memory pass 46 s, both checkers clean) shows logos flat at 15.6-15.9 B/elem from 10k to 10M at one thread where it read 50 -> 16 before, and 13.8-21.6 at 14 threads.
+
+**Predictions graded.** 10k: ~16 predicted, 15.6 measured. 14 threads at 8.4M: ~14 predicted, 13.8 measured. The context's
+fixed part had been written into its own comment ("~340 KB fixed") for a round and nobody had asked what a 10k sort did with it.
+## (unreleased) — scale report: the memory values are visible, not only drawn (`make scalebench`, `LOGOS_SCALE_REUSE`)
+
+The circle at each measured point already had its radius set by the peak heap of one cold call (bytes per element), but the number
+itself was nowhere on the page. Now: the tooltip has a "peak heap" column (bytes per element and the total it means at that n) for
+every sort under the cursor; each panel has a third table, "peak heap of one cold call", beside time and ns per element (0 = the sort
+allocated nothing, rows below the seam have no per-sort peak and are left out); the legend, the button title and the intro paragraph
+say "radius" and quote the report's largest reading (214.8 B/elem = 15 px). Re-rendered from the committed measurements with
+`LOGOS_SCALE_REUSE`; both checkers pass (the stub: 312 charts driven; real Chrome: six views clean). Also fixed on the way: the REUSE
+parser now strips carriage returns, because a checkout on Windows writes the report with CRLF and the DATA/META block was then not
+found. And a misread worth its line: the first three memory arrays of the DATA line are the sub-10k rows, which have no memory pass
+by design; `head -3` on them read as "the pass records nothing", and a whole regeneration was nearly run over a report that was fine.
+
+## (unreleased) — the vector two-strand merge, and the knot route's few-runs gate re-priced (`make mergebench`, `./knotbench 40 8388608 simd | few`, `TS_SWITCH=LOGOS_NO_SIMD_MERGE ./tsbench ... switch`)
+
+**Asked:** are there merge-sort alternatives faster and more CPU-efficient "down to the gate level"? Answered with a build.
+The shipped two-strand merge is branch-free but a dependency chain: the next pair of loads waits on the compare that moved
+a cursor, ~3-4 ns per element at one thread whatever the cache. The AVX2 merge replaces the compare with a bitonic network:
+four elements of each strand merged in registers (one compare-exchange across the two vectors, then two inside each), the four
+smallest stored, the four largest carried, the next four loaded from the strand whose head is smaller -- one scalar compare per
+FOUR elements, both candidate loads made so the choice is a blend and not a branch. Every compare-exchange is one predicate and
+two selects: `min`/`max` would return the same operand twice for -0.0 against +0.0 (and for NaN), which is exactly what the
+harness's signed-zero rows exist to catch. A twisted strand is loaded from its far end and reversed in the register. Only
+balanced crossings arrive (`knot_merge2x` sends unbalanced ones to the gallop); k >= 3 crossings go through `merge_all_runs`
+and are untouched. `LOGOS_NO_SIMD_MERGE=1` is the switch; `logos_twist_last(13)` counts the merges taken, `(-4)` says whether
+the build and CPU have it; `-DLOGOS_NO_SIMD_MERGE` compiles it out.
+
+**Three cuts, each measured** (`make mergebench`: the kernels in isolation, paired, four orientation pairs, two sizes, every
+output checked as ascending and the same bit patterns as the input with -0.0/+0.0 and cross-strand ties planted):
+(1) a predicate per LANE inside the vector lost an element on every tie (+0.0 twice, -0.0 gone): the lane that takes the smaller
+and the lane that takes the larger must share ONE mask per pair, permuted to both lanes -- which is also cheaper (one compare,
+one permute, one blend per stage). (2) Correct, and only **1.14-1.29x** against a prediction of 1.5-2.0: the network's ~20-cycle
+latency is serialised through the carried vector, so the kernel is latency-bound like the scalar loop it replaces. (3) A
+BIDIRECTIONAL merge: a second, independent chain runs from the tails (the four largest stored at the far end of the output, the
+four smallest carried, loading from the strand whose tail is larger), the two meet in the middle, and the two carries plus the
+remainders (one under eight) fill the gap with a small scalar merge. **1.96-2.28x** over the scalar merge on every orientation
+pair, 65k and 8.4M (scalar 3.0-4.0 ns per element, vector 1.5-1.6).
+
+**End to end** (one binary, 40 pairs, 8.4M): `./knotbench ... simd`, one thread: **stairs_x10 1.11, x20 1.18, x40 1.32, x60 1.47,
+x80 1.58, x100 1.68** (the more that crosses, the more the merge is of the sort), triple 1.22, zigzag 1.19, shards 1.18;
+quad and k8 (k >= 3, untouched) 1.00, the sparse rows (gallop) 0.98-1.00, blocks 1.01-1.03, guards 0.99-1.01. **14 threads:
+0.96-1.04 on every row**, inside the floor: the knot route is memory-traffic-bound there (0f). tsbench, one thread: **64 blocks
+overlapping 50% 1.51, 64 overlapping batches 1.18**, every other row 0.99-1.02 (the log shapes merge nothing or gallop); 14
+threads 0.94-1.04. Harness: a new `vector merge` section (189 checks, 81 naming the path) and the gallop section's byte
+comparison now holds the vector merge off on both sides, since it compares the gallop's tie order with the SCALAR merge's.
+**The few-runs gate, re-priced.** `KNOT_COST_MAX_FEW`, the knot route's cost gate for sequential sorts of at most `MERGE_MAX_RUNS`
+(8) runs, goes **1.0n -> 3.0n**. It is now measurable on its own: `LOGOS_KNOT_FEW=<f>` moves that gate alone, where `LOGOS_KNOT_MAX`
+moved all three at once (so the old `fewgate` numbers had the R > 8 gate in them; `./sineprobe ... fewgate` uses the new switch, and
+tsbench's switch mode takes `TS_VALUE=<v>`). One thread, 40 pairs, gate 3.0n against shipped: pure cosines of h runs, each spanning
+the range, **h = 3: 3.22, 4: 2.34, 5: 2.48, 6: 2.16, 7: 2.20, 8: 1.72**; the same waves with noise 1.00-1.02 (already on the route);
+h = 9, past the cap, 0.99-1.01; **8 concatenated server logs 1.28** (`TS_SWITCH=LOGOS_KNOT_FEW TS_VALUE=3 ./tsbench 40 8388608
+switch`; 1.00 at 14 threads, where the parallel gate is separate); and the four fully interleaved runs the 1.0n gate had been SET
+from (`./knotbench 40 8388608 few few_runs`) read **1.27**, not the 0.955 of record -- that verdict was taken with every gate lifted
+at once, on an engine several rounds older, and its premise ("the run merge does the same merges without the staging copy") did not
+survive re-measurement; the cause is not traced. Guards: stairs_x20 0.98-0.99, fifteen tsbench rows 0.98-1.02 at both thread counts.
+The vector kernel is NOT why any of this moved: k >= 3 crossings never reach it. Harness: unchanged and green (40,640 checks); every
+flag variant compiles (`-DLOGOS_NO_KNOT` had stopped, because the vector merge's switch was read outside the knot region: fixed);
+`psort_f64`'s frame went **42,576 -> 28,256 bytes** when `reloc_sample_gate` (10,480) stopped being inlined into it, which is the
+kind of move `make callbench` exists to price: sorted calls of 2-24 elements **0.83-0.91** (both orientations, layout cancelled; fewer pages probed), random n = 2 0.89, n = 3-5 0.98-0.99, every row from 32 up 0.97-1.02 -- except sorted n = 1000 at 1.09 in both orientations (+20 ns on a 226 ns call), which nothing on that path explains and its neighbours (0.98-1.00 at 100, 5000, 50000) do not repeat: recorded, not claimed. `make sanitize`: the same 4 reports as the committed engine (the leaves' NaN-to-index casts, 0h (e)), none from the kernel; `make test` on the final source 40,640 checks, 0 failures..
+
+**Predictions graded.** Kernel 1.5-2.0x: the single chain fell short (1.14-1.29), the two-chain kernel exceeded it (1.96-2.28).
+One thread 1.15-1.30 on staircases: LOW, 1.68 at 100% crossing. 14 threads 1.05-1.15: WRONG, a tie -- the same lesson the
+knot route's own 14-thread result taught (traffic, not compares). The other alternatives were not built, on measured grounds:
+multiway merges lost twice here (winner tree, direct 3/4-way), galloping is shipped where it pays and gated where it does not,
+in-place block merges buy scratch with time, and a merge tree loses to the scatter at 14 threads by 3-4x (`make unibench`).
+
+## (unreleased) — the kink gate: the reach probe's reading routes kinked strands at P > 1, and every detector worker lifts strays (`make kgverdict`, `make kinkladder`, `./tsbench 40 8388608 switch kinks`)
+
+**What it is.** The short-reach probe reads four contiguous windows of 4096 pairs and used to say only "sparse, decline"; the
+near-sorted route then claimed a kinked strand at every P > 1 and the detector, whose repair finishes that strand at one thread,
+never ran (the previous entry, `make kinkladder`). The probe now also counts descents that are KINK-SHAPED (`a[i] > a[i+1]`,
+`a[i+1] >= a[i-1]`, `a[i] <= a[i+2]`: an adjacent pair swapped inside a run that goes on), and when at least `REACH_KINK_MIN` (8)
+descents are sparse and at least `REACH_KINK_FRAC` (90%) of them kink-shaped, it declines with a new verdict,
+`LOGOS_REACH_DECLINED_KINKS`. The parallel dispatcher reads that verdict and skips the near-sorted route, so relocation's detector
+takes the strand. Maximum displacement is the discriminator (the ledger asked for "a statistic that tells adjacent swaps from
+displaced ones"): a far-displaced element fails the kink shape at both neighbours, so 1% random swaps read ~0% kink-shaped where
+adjacent swaps read 98-100%. `LOGOS_NO_KINKGATE=1` is the switch. `make kgverdict` prints the verdict and the repairs at P = 1, 4,
+8 on three kinked shapes; the harness's reach section names the verdict on every row (`RM_SPARSE`, `RM_SPARSEFAR`,
+`RM_SPARSEENDS`) and asserts the one-strand finish (`logos_twist_last(12)`) where it must fire.
+
+**The gate alone LOST at 14 threads, and the trace said why.** First A/B on tsbench's kinks row (1% of adjacent pairs swapped at
+RANDOM positions): 1.19 at P = 2, 1.10 at P = 4, **0.91-0.94 at P = 14**. Two causes, found one after the other:
+(1) at P > 1 the detector came back with R > 1 on a strand that is one run at P = 1, so the one-strand finish never fired --
+three boundary geometries, each named by a TRACE of the run list after two arithmetic guesses had missed (a kink straddling a
+chunk edge; a kink at either END of the array; a swapped pair that BEGINS a chunk, emitted as a two-element run lying the other
+way). Each is repaired at the join, which is the one place that sees both sides. (2) Random-position swaps overlap: about 2% of
+them are 3-cycles the kink repair cannot undo, and at P = 1 the STRAY LIST lifts those 801 elements and finishes one run, but the
+list was allocated for `w[0]` at P == 1 only. So at 14 threads the same array came back as **796 runs**, the knot route placed
+796 strands for 14 ms, and the near-sorted route it displaced was cheaper. **Every worker now lifts strays** (its share of the
+n / 64 budget; the join concatenates the lists, which are already in position order), and a run of one or two that touches a
+chunk boundary inside the array is NOT lifted, because the join's boundary repairs need to see it (four harness rows found each
+of the two cases). `LOGOS_STRAY_SEQ=1` restores the one-thread list, for the A/B. The parallel placement paths already finished
+strays (`stray_finish` after `reloc_worker` and `knot_worker`), so nothing there changed.
+
+**Measured** (`TS_SWITCH=<switch> ./tsbench 40 8388608 switch`, t(switch set) / t(shipped), 8.4M): the kinks row with the gate off
+**2.41 at P = 2, 2.36 at P = 4, 3.04 at P = 14** (1-thread column 0.99-1.00: the sequential path is untouched); the parallel stray
+list alone (`LOGOS_STRAY_SEQ`) 3.50 at 14. Guards, both sweeps, 15 shapes at 1 and 14 threads: 0.97-1.03, with one row at 0.91
+[0.71 1.18] that re-read 1.00 [0.76 1.31] at 80 pairs (the gate cannot fire on half-descending blocks: the probe's descent share
+is ~50%). `make kinkladder one`: one strand + 0.5% kinks **5.52 ms at 1 thread -> 2.22 at 14 (2.49x)**, + 2.5% kinks 9.20 ->
+2.79 (3.30x), where the previous entry had 0.56-0.88 (every P slower than one thread); blocks + kinks unchanged (2.6-3.1x).
+`make callbench`: not run, the dispatcher's first page is untouched (the probe and the verdict read are inside `reach_try_f64`
+and the P > 1 branch); frame 42,576 bytes, unchanged. `make test` 40640 checks, 0 failures (two round-6 expectations were lifted from one thread to every thread count: block strays are lifted at P now, and one kinked strand is one run at P; a strand with FAR strays keeps its P-threads verdict open, because the probe reads those as sparse and not kink-shaped and near-sorted rightly takes it first); `make faultprobe` 17,640 injected allocation failures and 366 thread-creation failures, 0 bad, reaching `reloc_detect_worker` and `knot_worker` on `one_kinked`, `blocks_strays` and `block_kinked` at 4 threads (the join's new list allocation among the 24-36 sites failed per shape).
+
+**Predictions graded.** "1.3-1.8x at every P" for the gate alone: WRONG at 14 (0.94) and low at 2 (1.19), because the gate
+rerouted to a route whose parallel form lacked the stray list -- a gate that reroutes must reroute to the WHOLE machinery the
+sequential path had. "P = 14 about 1.5-1.7, P = 2 at least 1.6" for the completed change: right in direction, LOW by 1.5-1.8x,
+because the displaced route was priced at 12.8 ms off a `-DLOGOS_TRACE` build (the ledger's own warning, again).
+
+**Left open, with a number.** One strand + 0.05% kinks still reads 0.27-0.58 at every P > 1 with 0 repaired: 4,049 kinks in
+8.4M put ~7.9 expected descents in the probe's 16,384 pairs, under `REACH_KINK_MIN` = 8. The minimum was a guess; a
+far-displaced element cannot pass the kink shape at any count, so lowering it wants one A/B on that cell and the near-sorted
+family (`make kinkladder one`, the 0.05% row; `NSG_ROUTE`'s swap shapes as guards). Predicted: that cell scales like the 0.5%
+one, guards untouched.
+
 ## (unreleased) — the wave route's sweep priced at 51%, and the kink repair traced to one thread only (`make waveprobe`, `make kinkladder`)
 
 Two diagnoses, no engine change. Both started as ideas that looked good and both died on their first measurement,

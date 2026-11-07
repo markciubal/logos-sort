@@ -1,0 +1,82 @@
+{
+  "Q_C_C1": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD scatter (vpscatter). Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C2": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD histogram (vpconflictd). Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C3": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD bucket-index in coarse. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C4": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD OR/AND byte-skip. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C5": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Winner/loser tree merge, near-sorted. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C6": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Shared per-thread context pool. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C7": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Parallel merge sort (chunk-sort + k-way merge). Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C8": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Cache-conscious COARSE_K (64–512). Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C9": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: logos partition + SIMD leaf, parallel. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C10": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Golden-ratio pivot. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  }
+}

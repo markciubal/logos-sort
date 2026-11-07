@@ -170,10 +170,15 @@ static double pair2(const double *A, const double *B, double *w, size_t n, int P
     double med = (reps & 1) ? r[reps / 2] : 0.5 * (r[reps / 2 - 1] + r[reps / 2]); *p10 = r[(int)(0.10 * reps)]; *p90 = r[(int)(0.90 * reps)]; free(r); return med;
 }
 static int g_gallop_ab = 0;       /* mode `gallop`: the OFF side is the knot route with the branch-free merge alone (LOGOS_NO_KNOT_GALLOP=1) */
+static int g_simd_ab = 0;         /* mode `simd`: the OFF side is the knot route with the scalar two-strand merge (LOGOS_NO_SIMD_MERGE=1) */
+static int g_few_ab = 0;          /* mode `few`: the OFF side is the knot route as shipped, the ON side its few-runs gate at 3.0n (LOGOS_KNOT_FEW=3) */
 static void sort_off(double *a, size_t n, int t) {
     if (g_gallop_ab) { unsetenv("LOGOS_NO_KNOT"); setenv("LOGOS_NO_KNOT_GALLOP", "1", 1); logos_sort_f64(a, n, t); unsetenv("LOGOS_NO_KNOT_GALLOP"); return; }
+    if (g_simd_ab) { unsetenv("LOGOS_NO_KNOT"); setenv("LOGOS_NO_SIMD_MERGE", "1", 1); logos_sort_f64(a, n, t); unsetenv("LOGOS_NO_SIMD_MERGE"); return; }
+    if (g_few_ab) { unsetenv("LOGOS_NO_KNOT"); unsetenv("LOGOS_KNOT_FEW"); logos_sort_f64(a, n, t); return; }
     setenv("LOGOS_NO_KNOT", "1", 1); logos_sort_f64(a, n, t); }
-static void sort_on(double *a, size_t n, int t)  { unsetenv("LOGOS_NO_KNOT"); if (g_lift) setenv("LOGOS_KNOT_MAX", "8", 1); else unsetenv("LOGOS_KNOT_MAX"); logos_sort_f64(a, n, t); }
+static void sort_on(double *a, size_t n, int t)  { unsetenv("LOGOS_NO_KNOT"); if (g_lift) setenv("LOGOS_KNOT_MAX", "8", 1); else unsetenv("LOGOS_KNOT_MAX");
+                                                   if (g_few_ab) { setenv("LOGOS_KNOT_FEW", "3", 1); } logos_sort_f64(a, n, t); if (g_few_ab) { unsetenv("LOGOS_KNOT_FEW"); } }
 
 int main(int argc, char **argv) {
     int pairs = argc > 1 ? atoi(argv[1]) : 20; if (pairs < 5) pairs = 5;
@@ -182,6 +187,8 @@ int main(int argc, char **argv) {
     const char *only = argc > 4 ? argv[4] : NULL;               /* run only shapes whose name contains this */
     g_lift = argc > 3 && !strcmp(argv[3], "lift");
     g_gallop_ab = argc > 3 && !strcmp(argv[3], "gallop");
+    g_simd_ab = argc > 3 && !strcmp(argv[3], "simd");
+    g_few_ab = argc > 3 && !strcmp(argv[3], "few");
     (void)bench_threads_source;
     int P = bench_threads(logos_num_cpus());
     double *base = malloc(n * 8), *w = malloc(n * 8), *ref = malloc(n * 8);

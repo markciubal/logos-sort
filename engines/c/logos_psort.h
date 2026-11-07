@@ -39,6 +39,11 @@ extern "C" {
  *   a value that holds most of the array does not change that (it was 104 bytes per element at 14 threads until
  *   2026-09-20: every thread's context was sized by the largest bucket).
  * This header used to say "~9n". The buffers are kept between calls; logos_release_buffers() returns all of them.
+ * RESIDENT, which is what a page nobody touches does not count (make rssprobe, make mixprobe; 4M elements, 2026-10-24): one thread
+ * 0.1-0.6 bytes per element on the sorting kernels and at most 4.4 on the routes that place or merge (half a scratch); 14 threads
+ * ~8.8 on the partition. Between calls the engine keeps what its calls touched, in one shared block: ~14 after ten mixed sorts.
+ * LOGOS_LOWMEM=1 takes every form that trades speed for memory: the in-place partition (1.25-1.38x the time; 14 threads peak
+ * 1.5-2.6) and the hard pool trim (the next large call refaults, 1.3-2.5x; held after small calls 0.3-0.6).
  * Sizes: n is a size_t, but the buffered engine counts in 32 bits, so arrays above 2^32 - 1 elements are handed to the
  * strict in-place sort (untested at that size: no machine here holds one).
  * Resource exhaustion, TESTED (make faultprobe fails every allocation and every thread creation of a cold call in turn;
@@ -47,6 +52,13 @@ extern "C" {
  * nothing. There is no error return because there is no failure left to report. */
 void logos_sort_f64(double *a, size_t n, int nthreads);
 
+/* Sort many independent arrays in one call. They lie end to end in a: segment k is a[off[k] .. off[k+1]), for k < nseg, so off has
+ * nseg + 1 entries and must not decrease. Each segment comes back as logos_sort_f64 would leave it. With several threads, segments
+ * under 200,000 elements (which logos_sort_f64 would sort on one thread anyway) are sorted in parallel ACROSS segments, each by the
+ * engine's leaf with a context of its worker's own; with one, only segments up to 4,096. Longer ones go to logos_sort_f64 itself,
+ * one after another, with nthreads. Same contract as logos_sort_f64: one call at a time. */
+void logos_sort_f64_batch(double *a, const size_t *off, size_t nseg, int nthreads);
+
 /* Diagnostic, for tests: what the short-reach route (sort index blocks where they lie, repair only the seams; see
  * logos_psort.c) did on this thread's most recent top-level logos_sort_f64 OF AT LEAST 2^18 ELEMENTS. A smaller sort is never
  * offered to the route and leaves the answer as it was: resetting it there would put a thread-local access, which is a
@@ -54,7 +66,8 @@ void logos_sort_f64(double *a, size_t n, int nthreads);
  * tests nothing in particular. NOT_TRIED: the sample's ladder found no short reach (or LOGOS_NO_REACH is set).
  * DECLINED_*: the array went on to the other routes; after PLAN its index blocks have been sorted in place. */
 enum { LOGOS_REACH_NOT_TRIED, LOGOS_REACH_SORTED, LOGOS_REACH_SORTED_STRAYS, LOGOS_REACH_DECLINED_GATE, LOGOS_REACH_DECLINED_PROBE,
-       LOGOS_REACH_DECLINED_PLAN, LOGOS_REACH_DECLINED_NOMEM };
+       LOGOS_REACH_DECLINED_PLAN, LOGOS_REACH_DECLINED_NOMEM,
+       LOGOS_REACH_DECLINED_KINKS };   /* declined as sparse, and the sparse descents were KINK-shaped: the dispatcher reads this */
 int logos_reach_last(void);
 
 /* Diagnostic, for tests: how many TWISTED strands (runs that lie descending and were consumed as they lie, never reversed in
@@ -71,6 +84,50 @@ int logos_reach_last(void);
  * 1 if the loop-back is compiled into this build. Always 0 with LOGOS_NO_LOOPBACK=1.
  * which = 8: arrays the WAVE route placed; 9: sorts the SEAM route rotated first; 10: STRAYS lifted out of strands by routes that
  * completed; 12: sorts finished as ONE STRAND (a single run after the kinks and strays were taken out). Each reading clears it.
+ * which = 15: sequential sorts whose AVX2 kernel read the NaN / -0.0 scan off its FIRST PARTITION instead of a pass of its own
+ * (av_qsort_fused); 16: of those, the ones that met a NaN there and declined (the array then goes on, permuted, to the scalar
+ * leaf); -5 returns 1 if that path is live (an AVX2 build on an AVX2+FMA CPU). 0 with LOGOS_NO_PARTFUSE=1 or LOGOS_NO_FRONTFUSE=1.
+ * which = 17: elements the LOW-CARDINALITY route counted with vector compares against the sample's values (at most 8 of them)
+ * since it was last read; 0 with LOGOS_NO_LCVEC=1.
+ * which = 18: parallel partitions whose scatter chose the per-mode map through the MODE GRID (more than 3 modes, each certified
+ * uniform inside itself) since it was last read; 0 with LOGOS_NO_MDGRID=1.
+ * which = 19: parallel phases the persistent WORKER POOL ran (its threads kept between calls) since it was last read; 0 with
+ * LOGOS_NO_POOL=1, and logos_release_buffers() stops the pool's threads.
+ * which = 20: calls of logos_sort_f64 the THIN FRONT answered (at most 128 elements, before the dispatcher) since it was last
+ * read; 0 in a build with -DLOGOS_NO_THINFRONT (which = -6 says whether the build has it).
+ * which = 21: bytes the POOL TRIM handed back to the system (pooled pages above a decaying high-water mark) since it was last
+ * read; 0 unless LOGOS_TRIM=1 (MADV_FREE) or LOGOS_TRIM=hard (MADV_DONTNEED) is set: it is opt-in, see trim_note.
+ * which = 22: sorts the FLOAT32 PATH finished (a one-thread leaf of 65,536 or more whose values were all exactly floats, sorted
+ * on 32-bit keys) since it was last read; 0 with LOGOS_NO_F32=1 (which = -8 says whether the build has it).
+ * which = 23: vectors of four the lattice route's map counted with AVX2 (no scalar step) since it was last read; 0 with
+ * LOGOS_NO_LATVEC=1 (which = -7 says whether the AVX2 kernels run on this build and CPU).
+ * which = 25: string sorts the prefix-key path (logos_sort_strings_mt) finished since it was last read.
+ * which = 26: f64 sorts the two-halves route finished (two threads: one split at the sample's median, two sequential leaves)
+ * since it was last read; 0 with LOGOS_NO_HALVES=1.
+ * which = 27: string sorts the log-line route finished (one thread: keep the in-order strand, sort the strays, merge) since it
+ * was last read; 0 with LOGOS_STR_NO_NS=1. which = -9: the last large string sort's log-line verdict (0 not tried, 1 taken,
+ * 2 declined at the pre-gate, 3 gave up in the pass, 4 no memory); which = -10: its pre-gate's strays out of 4,096 window lines.
+ * which = 24: parallel partitions done IN PLACE (block permutation, no region buffer) since it was last read; 0 unless
+ * LOGOS_PART_INPLACE=1 is set.
+ * which = 28: f64 sorts the RUN-LENGTH route finished (runs of bit-equal values) since it was last read; 0 with LOGOS_NO_RLE=1.
+ * which = 29: f64 sorts the CUTS route finished (windows in order, unordered inside); 0 with LOGOS_NO_CUTS=1.
+ * which = -11 / -12: the form the sequential TAIL / HEAD route merged with on its last sort (1 the branchy loop, 2 the gallop,
+ * 3 the vector merge; 0 not taken), cleared by the read. which = -13: the thin front's ceiling as this build runs it.
+ * which = 30: leaf ranges the LOW-DISCREPANCY probe sent past the AVX2 kernel since it was last read (windows whose gaps are
+ * even and that cover at least LOWDISC_MIN_COVER of the range; LOGOS_LOWDISC_LOCAL=1 drops the coverage test).
+ * which = 31: leaf profiles the FOUNDER WINDOWS settled where the 64-element prefix could not (LOGOS_SF_FRONT_ONLY=1: none).
+ * which = 32: k-way merges done in VECTORS (merge_runs_vec: the knot route's k >= 3 crossings and the leaf's run merge) since it
+ * was last read; 0 with LOGOS_RUNMERGE_SCALAR=1, LOGOS_NO_SIMD_MERGE=1 or without AVX2.
+ * which = 33: f64 sorts the DOMINANT-VALUE route finished (one value holding a large share: the rest sorted alone, the value
+ * filled in around it) since it was last read; 0 with LOGOS_NO_DOMINANT=1.
+ * which = 34: placements made with HALF A SCRATCH (half_place: the knot route at one thread, the tail and head routes' vector
+ * merge) since it was last read; 0 with LOGOS_PLACE_FULL=1 or below HALF_MIN_N (65,536) elements.
+ * which = 35: parallel partitions whose regions were the buffer pool's block (not a buffer of their own, kept beside it) since it
+ * was last read; 0 with LOGOS_HF_OWN=1.
+ * which = 36: sorts the lattice route took although the sample showed too few repeats for the counting block (lat1_gate) since
+ * it was last read; 0 with LOGOS_NO_LAT1=1.
+ * which = 37: elements the lattice route set aside (off the lattice, outside its window, or a second double on one lattice point)
+ * and merged back in since it was last read; 0 with LOGOS_LAT_NO_SPILL=1.
  * Always 0 with LOGOS_NO_TWIST=1, which restores the in-place reversal. Not thread-safe across concurrent sorts, like the
  * buffer pool. */
 size_t logos_twist_last(int which);
@@ -151,6 +208,9 @@ void logos_apply_perm_i32(const int32_t *src, const uint32_t *perm, size_t n, in
 void logos_inverse_perm(const uint32_t *perm, size_t n, uint32_t *inv);
 size_t logos_find_outliers_f64(const double *a, size_t n, uint32_t *out, size_t cap, size_t budget); /* returns the count, or SIZE_MAX when its two index arrays could not be allocated */
 void logos_sort_strings(const char **a, size_t n);                       /* lexicographic, in place */
+/* Strings in parallel, on 8-byte prefix keys (logos_psort.c): the same order as logos_sort_strings and strcmp (unsigned bytes, a
+ * string before its extensions), identical strings in any order. Takes about 24 bytes per string of scratch. One call at a time. */
+void logos_sort_strings_mt(const char **a, size_t n, int nthreads);
 
 /* ---- per-phase profiling (only populated when the engine is compiled with
  * -DLOGOS_PROFILE; otherwise logos_profile_get() returns NULL). One record per

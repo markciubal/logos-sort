@@ -1,0 +1,162 @@
+{
+  "Q_C_C25": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Exponent-histogram bucket map (-DLOGOS_EXMAP): flat table indexed by binade, linear interpolation on the mantissa, an approximate inverse CDF in one load and one multiply. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C26": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route, first cut of the sweep: every run endpoint cuts BELOW its value. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C27": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route gated at J5's n/2, on a predicted 14-thread break-even at 60–100% crossing. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C28": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route's placement under relocation's one-thread-per-500k cap. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C29": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Untying three or more live strands in a PARALLEL sort (knot route, cost 1.57n). Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C30": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route, first cut: runtime switches read with getenv on every sort, and a cost gate with no minimum run length. Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C31": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Header and README: \"logos_sort_f64 uses ~9n (README: ~8n) bytes of scratch\", \"logos_sort_i32 ~5n (README: ~16n)\". Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_C_C32": {
+    "type": "noul",
+    "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: logos_release_buffers() \"frees the persistent buffers\". Judge whether it BEAT the engine as it shipped.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D1": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Lattice (direct-index) counting. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D2": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Low-cardinality parallel counting (≤1024 distinct). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D3": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Moderate-cardinality hash counting (≤65 536 distinct). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D4": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Near-sorted index-partition + one-pass P-way band merge. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D5": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Bucket-index cache + destination prefetch. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D6": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Dynamic chunking + spin-then-block barrier. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D7": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Native int32 engine (no widening). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D8": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Persistent scratch pool. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D9": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: argSort (stable, index-carrying) + apply / inverse permutation. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D10": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Order model (rank/select) without materialising. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D11": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: One-pass analytics instead of sort-first. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D12": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Strict in-place (~1n) variants. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  }
+}

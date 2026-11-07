@@ -7,6 +7,15 @@ logos-sort-c-*.tar.gz
 scaling-report.html
 faultprobe
 memprobe
+rssprobe
+mixprobe
+batchbench
+stringbench
+pgotrain_0
+pgotrain_1
+pgobench_a.txt
+pgobench_b.txt
+*.gcda
 slopebench
 ipbench
 harness-asan
@@ -25,6 +34,12 @@ unknotprobe
 unknottrace
 tsbench
 tstrace
+boundprobe
+boundprobe_trace
+xyprobe
+primeprobe
+strandgate
+bptrace_*.o
 tstrace_*.o
 mirrortrace
 strandprobe
@@ -39,12 +54,27 @@ bandbench_b
 bandbench_a.txt
 waveprobe
 kinkladder
+kgverdict
+mergebench
+xssleafbench
+whyfast
+avkernbench
+avkernbench_staged
+pmuprobe
+harness_xss
 kinktrace
 chaoshunt
 pairprobe
 callbench_a.txt
 callbench_base.gen.c
 ledgerbench
+# the profile-phase probes, 2026-10-05
+frontprobe
+frontprobe_inhouse
+frontledger_a
+frontledger_b
+frontledger_base.gen.c
+scoreboard
 
 # probe and bench binaries added 2026-09-22/23
 amprobe
@@ -94,3 +124,24 @@ mcbench_*
 parbench
 dt_trace.o
 dt_extra.o
+# 2026-10-19/20 rounds: invariant tests and their A/B benches
+roundbench
+strsmallbench
+orderprobe
+orderprobe_trace
+symprobe
+symprobe_trace
+edgeprobe
+rleprobe
+tailladder
+headladder
+thinbench
+thinbench_nokink
+bandbatch_a
+bandbatch_b
+ordkern
+avkernbench_pf
+fieldprobe
+fieldprobe_trace
+twinbatch_a
+twinbatch_b

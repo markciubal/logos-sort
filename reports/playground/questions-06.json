@@ -1,0 +1,82 @@
+{
+  "Q_D_D41": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Resource exhaustion costs speed, never correctness: every allocation and every thread creation of a cold call can fail, singly or from some point on, and the array still comes back sorted. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D42": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: make memprobe: what one cold sort weighs, what it still holds, what is left after release; f64 and int32, 1 thread and P, the in-place entries beside them. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_S01": {
+    "type": "noul",
+    "instructions": "In logos-sort: Branchless Batcher networks for 4-16 elements in the leaf, generated and proved by the 0-1 principle before being written. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S02": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice MAP phase claims chunks from an atomic counter instead of taking equal slices. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S03": {
+    "type": "noul",
+    "instructions": "In logos-sort: The same work queue applied to relocation's output tiles. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S04": {
+    "type": "noul",
+    "instructions": "In logos-sort: Each lattice worker allocates its own count table rather than the caller allocating all P before the spawn. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S05": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice route's idle threads are its serial merge. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S06": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice route's 2ms of table teardown is worth attacking. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S07": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice emit phase's low concurrency is thread imbalance. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S08": {
+    "type": "noul",
+    "instructions": "In logos-sort: Knowing the data FORMAT (that values are dates) beats certifying the distribution, for NUMERIC timestamps. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  }
+}

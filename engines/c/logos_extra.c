@@ -119,4 +119,11 @@ static void mkqs(const char **a, long lo, long hi, long d) {
     }
     for (long i = lo + 1; i <= hi; i++) { const char *t = a[i]; long j = i; while (j > lo && strcmp(a[j - 1], t) > 0) { a[j] = a[j - 1]; j--; } a[j] = t; }
 }
-void logos_sort_strings(const char **a, size_t n) { if (n > 1) mkqs(a, 0, (long)n - 1, 0); }
+/* Since 2026-10-09 this entry takes the prefix-key path (logos_sort_strings_mt in logos_psort.c, one thread): 2.5-7.5x over this
+   multikey quicksort on every shape of make stringbench, 4.1x on sorted input once that path got its prescan. LOGOS_STR_MKQS=1
+   keeps the quicksort, for the A/B. */
+void logos_sort_strings(const char **a, size_t n) {
+    if (n < 2) return;
+    if (getenv("LOGOS_STR_MKQS")) { mkqs(a, 0, (long)n - 1, 0); return; }
+    logos_sort_strings_mt(a, n, 1);
+}

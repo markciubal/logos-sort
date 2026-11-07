@@ -19,3 +19,4 @@ experiments/paradigm/paradigm
 # external deps live as siblings, not in-tree
 x86-simd-sort/
 ips4o/
+highway/

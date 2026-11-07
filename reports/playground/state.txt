@@ -1,0 +1,10 @@
+PROJECT: logos-sort: a distribution-aware adaptive numeric sort engine in C. Thesis: addressing beats comparing -- detect structure (cardinality, sortedness, skew, quantization) and dispatch to a zero- or low-comparison path instead of a comparison sort.
+HARDWARE: i9-13900H, 6 performance cores + 8 efficient cores, 14 bench threads, WSL2. Single socket.
+METHOD
+  - paired ab: two variants run adjacently on the two halves of one array, order alternated; median of the ratio with p10/p90. Drift cancels inside a pair, ordering bias across pairs.
+  - resolving floor: the same engine on both sides reads 1.000; 40 pairs resolve ~3.7% at 8M and ~6.1% at 1M. An effect below that is not a result.
+  - layout bias: engine copies differing only in renamed symbols differ up to 1.24x from code alignment, so any claim under 1.25x needs the copy assignment permuted or the mechanism traced.
+  - verification: every benchmark checks output against a reference; ~45,899 harness property checks.
+  - calibration line: memcpy 64MB and std::sort 1M are printed per run; quiet is ~2.9ms/~65ms. A loaded box flatters logos, because barrier-heavy opponents lose more to preemption.
+COMPETITIVE POSITION: At 14 threads on AVX2 hardware: parity with x86-simd-sort on random shapes (0.86-1.08x), ahead on structured (few_distinct 1.4x, quantized 1.76x, block shapes 2.2-2.5x). Loses to AVX-512 x86-simd-sort on all unstructured shapes. Loses 2-9x to std::sort below ~100 elements.
+MEMORY: Peak heap of one cold call, bytes per element at 10M, one thread: logos 15.7, LSD radix 16.0, timsort 3.9, IPS4o 0.2, std::sort 0.0, x86-simd-sort 0.0, logos strict in-place entry 0.0.

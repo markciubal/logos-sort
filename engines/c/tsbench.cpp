@@ -459,7 +459,7 @@ static const char *OFF[] = { "LOGOS_NO_REACH", "LOGOS_NO_KNOT", "LOGOS_NO_KINK",
 static void run(int k, double *w, size_t n, int P) {
     if (k == K_LOGOS) logos_sort_f64(w, n, P);
     else if (k == K_LOGOS_OFF) { for (const char *e : OFF) setenv(e, "1", 1); logos_sort_f64(w, n, P); for (const char *e : OFF) unsetenv(e); }
-    else if (k == K_LOGOS_ENV) { setenv(g_env, "1", 1); logos_sort_f64(w, n, P); unsetenv(g_env); }
+    else if (k == K_LOGOS_ENV) { const char *v = std::getenv("TS_VALUE"); setenv(g_env, v ? v : "1", 1); logos_sort_f64(w, n, P); unsetenv(g_env); }   /* TS_VALUE: the switch value, "1" if unset */
     else if (k == K_STD) std::sort(w, w + n);
     else if (k == K_EDGE) edge_sort(w, n, 0);
     else if (k == K_EDGET) edge_sort(w, n, 1);

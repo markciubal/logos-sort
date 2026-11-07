@@ -43,6 +43,8 @@ FEATURES = [
     ("-DLOGOS_INT_NARROW", "bucket-relative int32 digit narrowing", "ledger: mixed, +21%/-16%"),
     ("-DLOGOS_MODEL_TABLE", "linear model splitter table", "ledger: 0.93-1.09x, 'noise'"),
     ("-DAV_PIVOT_NET", "sorting-network pivot for the AVX2 leaf", "ledger: 0.94-1.06x, 'noise'"),
+    ("-march=x86-64-v3", "the whole engine built for AVX2+FMA+BMI2 (the CEILING for per-function target_clones)",
+     "never measured: the engine is built for baseline x86-64 and only its intrinsic kernels are AVX2 (2026-10-08)"),
     ("-DLOGOS_ZERO_SIGN_UNSAFE", "signed-zero fix-up in the AVX2 leaf (a -0.0 test riding the NaN scan)",
      "first version (second compare + AND + OR per block) cost 7% at 1T on uniform and heavy_tail; now one compare", True),
 ]

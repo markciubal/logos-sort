@@ -75,7 +75,7 @@ scaling: scaling.cpp $(LIB).a $(HDR)
 # bias the comparison (it only costs precision). Run: make pfbench && ./pfbench
 # RENAME(prefix): every public symbol of the engine gets the prefix, so several
 # engine variants can be linked into one binary. Keep in sync with logos_psort.h.
-RENAME = -Dlogos_sort_f64=$(1)_sort_f64 -Dlogos_sort_i32=$(1)_sort_i32 -Dlogos_num_cpus=$(1)_num_cpus -Dlogos_release_buffers=$(1)_release_buffers \
+RENAME = -Dlogos_sort_f64=$(1)_sort_f64 -Dlogos_sort_f64_batch=$(1)_sort_f64_batch -Dlogos_sort_strings_mt=$(1)_sort_strings_mt -Dlogos_sort_i32=$(1)_sort_i32 -Dlogos_num_cpus=$(1)_num_cpus -Dlogos_release_buffers=$(1)_release_buffers \
          -Dlogos_set_simd_sort=$(1)_set_simd_sort -Dlogos_set_simd_kernels=$(1)_set_simd_kernels \
          -Dlogos_sort_f64_inplace=$(1)_sort_f64_inplace -Dlogos_sort_i32_inplace=$(1)_sort_i32_inplace \
          -Dlogos_profile_reset=$(1)_profile_reset -Dlogos_profile_get=$(1)_profile_get -Dlogos_profile_phase_names=$(1)_profile_phase_names \
@@ -172,6 +172,28 @@ memprobe: memprobe.c $(LIB).a $(HDR)
 	$(CC) $(CFLAGS) $(BENCHFLAGS) memprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
 	./memprobe
 
+# What a sort keeps RESIDENT (VmHWM / VmRSS, a fresh process per row): peak during one sort, held after it, after 32 small sorts,
+# after logos_release_buffers(). memprobe counts what is ASKED for; a page nobody touches is not resident. ./rssprobe [n] [P list] [shape]
+# C strings: logos_sort_strings_mt (8-byte prefix keys) against std::sort / __gnu_parallel::sort with strcmp, the old multikey
+# quicksort, and the same prefix scheme driven by std::sort and by x86-simd-sort's AVX2 key-value sort. Needs the clone.
+# ./stringbench [n] [reps] [P list] [shape]
+strsmallbench: strsmallbench.cpp bench_strings.h $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -I. strsmallbench.cpp $(LIB).a -o $@ $(LDLIBS)
+stringbench: stringbench.cpp $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -mavx2 -mfma -mbmi2 -fopenmp -DXSS_USE_OPENMP -I. -I $(XSS) stringbench.cpp $(LIB).a -o $@ $(LDLIBS)
+
+# logos_sort_f64_batch against a loop of logos_sort_f64 over the same segments, paired: ./batchbench [pairs] [total] [P list] [row]
+batchbench: batchbench.c $(LIB).a $(HDR) bench_common.h
+	$(CC) $(CFLAGS) $(BENCHFLAGS) batchbench.c $(LIB).a -o $@ $(LDLIBS) -lm
+
+rssprobe: rssprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) rssprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+
+# What ONE process keeps resident across a mixed sequence of sorts (2026-10-24): rssprobe starts every row fresh and cannot see
+# buffers that coexist (the regions beside the pool were 17-20 bytes per element held between calls). ./mixprobe [n]
+mixprobe: mixprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) mixprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+
 # How much dearer does ONE ELEMENT get from 2M to 50M? The scaling exponent p = 1 + ln(c_hi/c_lo) / ln(n_hi/n_lo), measured
 # in PAIRS: one 50M sort against twenty-five 2M sorts of the same shape, adjacent in time, order alternating, so the
 # machine drift that separates two rows of the scale report cancels. std::sort is the calibration (theory: p >= 1.062).
@@ -255,6 +277,34 @@ strandprobe: strandprobe.c $(LIB).a $(HDR)
 # ./amprobe [reps] [n] [ladder]
 amprobe: amprobe.c $(LIB).a $(HDR) bench_common.h
 	$(CC) $(CFLAGS) $(BENCHFLAGS) amprobe.c $(LIB).a -o $@ $(LDLIBS)
+# Order must never cost (2026-10-20): 24 ordered shapes nobody had run, each against ITS OWN VALUES SHUFFLED, paired, at 1 and P
+# threads; above 1 = the order made the sort slower. `./orderprobe 20 4194304 1,14`; `... ab` = OP_SWITCH against shipped;
+# orderprobe_trace + `./orderprobe_trace 0 4194304 14 <filter> once` names the route each shape took.
+orderprobe: orderprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) orderprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+orderprobe_trace: orderprobe.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE orderprobe.c $(SRC) -o $@ $(LDLIBS) -lm
+# The second invented round (2026-10-20, FINDINGS 3bn): the new tests and the A/B benches of what they found.
+# symprobe: an order-isomorphism (negate and reverse; x 2^20; x 2^-30) must not change the cost; symprobe_trace + `once` names routes.
+# edgeprobe: one element across each size gate must not cost 10% more per element. rleprobe: runs of equal values, told (a ceiling)
+# and `ab` (LOGOS_NO_RLE). tailladder / headladder: the tail and head merges' three forms across fractions. thinbench: the thin
+# front's ceiling, moved at run time in a -DLOGOS_THIN_HOOK copy of the engine.
+symprobe: symprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) symprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+symprobe_trace: symprobe.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE symprobe.c $(SRC) -o $@ $(LDLIBS) -lm
+edgeprobe: edgeprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) edgeprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+rleprobe: rleprobe.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) rleprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
+tailladder: tailladder.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) tailladder.c $(LIB).a -o $@ $(LDLIBS) -lm
+headladder: headladder.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) headladder.c $(LIB).a -o $@ $(LDLIBS) -lm
+thinbench: thinbench.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_THIN_HOOK thinbench.c $(SRC) -o $@ $(LDLIBS) -lm
+roundbench: roundbench.c $(LIB).a $(HDR) bench_common.h
+	$(CC) $(CFLAGS) $(BENCHFLAGS) roundbench.c $(LIB).a -o $@ $(LDLIBS)
 capbench: capbench.c $(LIB).a $(HDR) bench_common.h
 	$(CC) $(CFLAGS) $(BENCHFLAGS) capbench.c $(LIB).a -o $@ $(LDLIBS)
 unibench: unibench.cpp $(LIB).a $(HDR) bench_common.h
@@ -264,6 +314,29 @@ tsbench: tsbench.cpp $(LIB).a $(HDR) bench_common.h
 tstrace: tsbench.cpp $(SRC) $(SRC2) logos_view.c $(HDR) bench_common.h
 	$(CC) $(CFLAGS) -DLOGOS_TRACE -c $(SRC) -o tstrace_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o tstrace_extra.o && $(CC) $(CFLAGS) -c logos_view.c -o tstrace_view.o
 	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) tsbench.cpp tstrace_psort.o tstrace_extra.o tstrace_view.o -o $@ $(LDLIBS)
+
+# Where the engine sits against the comparison lower bound, shape by shape (2026-10-31): per-element cost growth 1M -> 16M in
+# adjacent pairs (a comparison sort grows +20%), std::sort as the calibration, cost against uniform, and the bits each input
+# carries (repeats, runs, out-of-place). ./boundprobe [pairs] [n_lo] [n_hi] [shape]; boundprobe_trace + `once [n] [shape] [P]` names the routes.
+# BP_A=NAME=VALUE BP_B=NAME=VALUE [BP_THREADS=P] ./boundprobe ab [pairs] [n list] [shape]: two engine settings on the same input,
+# paired (default A = LOGOS_NO_LAT1=1, B = shipped), over a lattice ladder, spill shapes and guards. FINDINGS 3br
+boundprobe: boundprobe.cpp $(LIB).a $(HDR) bench_common.h
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) boundprobe.cpp $(LIB).a -o $@ $(LDLIBS)
+boundprobe_trace: boundprobe.cpp $(SRC) $(SRC2) logos_view.c $(HDR) bench_common.h
+	$(CC) $(CFLAGS) -DLOGOS_TRACE -c $(SRC) -o bptrace_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o bptrace_extra.o && $(CC) $(CFLAGS) -c logos_view.c -o bptrace_view.o
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) boundprobe.cpp bptrace_psort.o bptrace_extra.o bptrace_view.o -o $@ $(LDLIBS)
+
+# X+Y, the sort on the quadratic line (2026-11-02): the N = n^2 pairwise sums, sorted blind by the engine and by a sort TOLD X and Y
+# (staircase placement into buckets of S, then the engine per bucket); cost per element and its growth 1M -> 16M in adjacent pairs.
+# ./xyprobe [pairs] [n list]. FINDINGS 3bs
+xyprobe: xyprobe.cpp $(LIB).a $(HDR) bench_common.h
+	$(CXX) -O3 -std=gnu++17 -pthread $(BENCHFLAGS) xyprobe.cpp $(LIB).a -o $@ $(LDLIBS)
+
+# A knot solver that unties only the PRIME FACTORS (2026-11-05, FINDINGS 3bv): pinned arcs (elements already in their final place,
+# found from the run list by two binary searches per run) are never moved, the tangles between them are untied in place and
+# independently. Standalone, paired against the engine at 1 and P threads. ./primeprobe [pairs] [n] [P] [row filter]
+primeprobe: primeprobe.cpp $(LIB).a $(HDR) bench_common.h
+	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp -march=native $(BENCHFLAGS) primeprobe.cpp $(LIB).a -o $@ $(LDLIBS)
 
 unknotprobe: unknotprobe.c $(LIB).a $(HDR)
 	$(CC) $(CFLAGS) $(BENCHFLAGS) unknotprobe.c $(LIB).a -o $@ $(LDLIBS) -lm
@@ -345,6 +418,116 @@ kinkladder: kinkladder.c $(LIB).a $(HDR)
 	./kinkladder 9 8388608
 	./kinkladder 9 8388608 one
 
+# The reach probe's verdict and the kinks repaired at P = 1, 4, 8 on the three kinked-strand shapes (the harness's
+# RM_SPARSE and RM_SPARSEENDS, kinkladder's one strand): the witness for the kink gate (2026-09-26). A verdict other
+# than DECLINED_KINKS on any of them means the gate did not fire and the near-sorted route took the array.
+# ./kgverdict [n] [shape 0|1|2]
+kgverdict: kgverdict.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) -I. kgverdict.c $(LIB).a -o $@ $(LDLIBS)
+	./kgverdict 300001
+
+# The in-house AVX2 quicksort against x86-simd-sort's, KERNELS ALONE (2026-09-29): the library built -march=native and again
+# -mavx2 -mfma (the engine's own target), sizes 64 to 8M, the partition count per element against the ideal. Two binaries:
+# avkernbench (networks read the range directly) and avkernbench_staged (-DAV_NET_STAGED, the old staging buffer). ./avkernbench [pairs]
+# -DAV_PREFETCH (the library's one-block-ahead prefetch) measured nothing: every ratio unchanged, 2026-09-29
+avkernbench: avkernbench.cpp xss_base.cpp $(SRC) $(SRC2) $(HDR)
+	$(CXX) -O3 -std=gnu++17 -mavx2 -mfma -I $(XSS) -c xss_base.cpp -o xss_base.o
+	$(CC) $(CFLAGS) -DLOGOS_AV_HOOK -DAV_STATS -c $(SRC) -o avk_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o avk_extra.o
+	$(CC) $(CFLAGS) -DLOGOS_AV_HOOK -DAV_STATS -DAV_NET_STAGED -c $(SRC) -o avk_psort_st.o
+	$(CXX) -O3 -std=gnu++17 -march=native -I $(XSS) -I. avkernbench.cpp avk_psort.o avk_extra.o xss_base.o -o avkernbench $(LDLIBS)
+	$(CXX) -O3 -std=gnu++17 -march=native -I $(XSS) -I. avkernbench.cpp avk_psort_st.o avk_extra.o xss_base.o -o avkernbench_staged $(LDLIBS)
+
+# The vector quicksort's ORDER cost (2026-10-20): the in-house kernel and the library's, alone, each shape against its own values
+# shuffled, with the in-house partition count (levels) on both. ./ordkern [pairs] [n]
+ordkern: ordkern.cpp xss_base.cpp $(SRC) $(SRC2) $(HDR)
+	$(CXX) -O3 -std=gnu++17 -mavx2 -mfma -I $(XSS) -c xss_base.cpp -o xss_base.o
+	$(CC) $(CFLAGS) -DLOGOS_AV_HOOK -DAV_STATS -c $(SRC) -o ordk_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o ordk_extra.o
+	$(CXX) -O3 -std=gnu++17 -march=native -I. ordkern.cpp ordk_psort.o ordk_extra.o xss_base.o -o ordkern $(LDLIBS)
+
+# The other-fields round (2026-10-21, experiments/OTHER_FIELDS.md): ceilings and tests in one binary (small, hub, weave, moire,
+# founder, landauer; see its header). The engine is built with -DLOGOS_AV_HOOK so the bare AVX2 kernel can be timed beside it: the
+# hook adds one exported function and changes no path.
+fieldprobe: fieldprobe.c $(SRC) $(SRC2) $(HDR)
+	$(CC) $(CFLAGS) -DLOGOS_AV_HOOK -c $(SRC) -o fp_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o fp_extra.o
+	$(CC) $(CFLAGS) $(BENCHFLAGS) fieldprobe.c fp_psort.o fp_extra.o -o $@ $(LDLIBS) -lm
+fieldprobe_trace: fieldprobe.c $(SRC) $(SRC2) $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -DLOGOS_TRACE -DLOGOS_AV_HOOK fieldprobe.c $(SRC) $(SRC2) -o $@ $(LDLIBS) -lm
+
+# What makes each sort fast (2026-09-28): logos, x86-simd-sort and IPS4o under five controlled sweeps (order, size,
+# duplicates, distribution, threads), the three alternating on identical data, every output verified. There are no
+# hardware counters here (make pmuprobe says so), so the mechanism is read from how time responds to ONE changed property.
+# ./whyfast [n] [reps]
+whyfast: whyfast.cpp $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp -march=native -DXSS_USE_OPENMP -I $(XSS) -I $(IPS4O) -I. whyfast.cpp $(LIB).a -o $@ $(LDLIBS) -latomic -ltbb
+	./whyfast
+pmuprobe: pmuprobe.c
+	$(CC) -O1 -std=gnu11 pmuprobe.c -o $@
+	-./pmuprobe
+
+# The router's other half (2026-09-28): x86-simd-sort's quicksort as the SEQUENTIAL unstructured leaf, in place of the
+# in-house copy of it. Two engine copies in the ledger bench, one built -DLOGOS_XSS_LEAF, the shim linked beside them;
+# run it in BOTH orientations (XL0 / XL1 swapped) and read sqrt(A/B). Needs the clone: XSS=../x86-simd-sort/src.
+#   make xssleafbench && ./xssleafbench 40 8000000
+#   make -B xssleafbench XL0=-DLOGOS_XSS_LEAF XL1= && ./xssleafbench 40 8000000
+# THE HYBRID'S PARALLEL HALF (unstructured data at low thread counts goes to the library's parallel quicksort): the gate
+# is XSS_PAR_MAX. Ladder it lifted, per thread count, the 1-thread rows skipped by the fourth argument:
+#   make -B xssleafbench XL0="-DLOGOS_XSS_LEAF -DXSS_PAR_MAX=0" XL1="-DLOGOS_XSS_LEAF -DXSS_PAR_MAX=64"
+#   for P in 2 4 8 14; do LOGOS_THREADS=$$P ./xssleafbench 24 8000000 "" $$P; done     (and the copies swapped)
+XL0 ?=
+XL1 ?= -DLOGOS_XSS_LEAF
+xssleafbench: ledgerbench.c logos_xss.cpp $(SRC) $(HDR)
+	$(CXX) -O3 -std=gnu++17 -march=native -fPIC -fopenmp -DXSS_USE_OPENMP -I $(XSS) -c logos_xss.cpp -o logos_xss.o
+	$(CC) $(CFLAGS) $(XL0) $(call RENAME,lg0) -c $(SRC) -o xl0.o
+	$(CC) $(CFLAGS) $(XL1) $(call RENAME,lg1) -c $(SRC) -o xl1.o
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -c ledgerbench.c -o xlbench.o
+	$(CXX) -fopenmp xlbench.o xl0.o xl1.o logos_xss.o -o $@ $(LDLIBS)
+
+# What logos's PROFILE PHASE costs in front of the SIMD kernel (2026-10-05): the hybrid (-DLOGOS_XSS_LEAF) against the same
+# library call with one NaN/-0.0 scan in front (the floor for unvouched data) and alone (the ceiling). One engine copy, the
+# library reached through the same logos_xss.o, so there is no layout term between the library rows. Prediction and stop rule
+# in frontprobe.cpp. ./frontprobe [pairs] [n] [threads] [shape filter] [ab]; frontprobe_inhouse = the same over the DEFAULT engine (in-house kernel)
+frontprobe: frontprobe.cpp logos_xss.cpp $(SRC) $(HDR)
+	$(CXX) -O3 -std=gnu++17 -march=native -fPIC -fopenmp -DXSS_USE_OPENMP -I $(XSS) -c logos_xss.cpp -o logos_xss.o
+	$(CC) $(CFLAGS) -DLOGOS_XSS_LEAF $(FP_FLAGS) -c $(SRC) -o frontprobe_psort.o
+	$(CXX) -O3 -std=gnu++17 -mavx2 -mfma $(BENCHFLAGS) -I. -c frontprobe.cpp -o frontprobe.o
+	$(CXX) -fopenmp frontprobe.o frontprobe_psort.o logos_xss.o -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) $(FP_FLAGS) -c $(SRC) -o frontprobe_ih_psort.o
+	$(CXX) -fopenmp frontprobe.o frontprobe_ih_psort.o logos_xss.o -o frontprobe_inhouse $(LDLIBS)
+
+# WHO IS FASTEST, cell by cell (2026-10-07): logos as shipped, logos with the library leaf (-DLOGOS_XSS_LEAF), x86-simd-sort,
+# Google's VQSort (one thread only, since 2026-11-05), IPS4o and std::sort / __gnu_parallel::sort, interleaved on identical data,
+# every output verified, 1 and P threads, seventeen shapes. The definition of "fastest" the engine is held to. ./scoreboard [n] [reps] [threads] [shape filter]
+scoreboard: scoreboard.cpp logos_xss.cpp $(SRC) $(HDR) libvqsort.a
+	$(CXX) -O3 -std=gnu++17 -march=native -fPIC -fopenmp -DXSS_USE_OPENMP -I $(XSS) -c logos_xss.cpp -o logos_xss.o
+	$(CC) $(CFLAGS) $(SB0) $(call RENAME,lg0) -c $(SRC) -o sb0.o
+	$(CC) $(CFLAGS) -DLOGOS_XSS_LEAF $(SB1) $(call RENAME,lg1) -c $(SRC) -o sb1.o
+	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp -march=native -DXSS_USE_OPENMP -I $(XSS) -I $(IPS4O) -I $(HWY) -I. scoreboard.cpp sb0.o sb1.o logos_xss.o libvqsort.a -o $@ $(LDLIBS) -latomic -ltbb
+
+# Any engine SOURCE against the working tree at scale (2026-10-05; first used for the profile-phase levers against the engine
+# as it was before them): ledgerbench's five shapes at 1 and BENCH_THREADS threads, two copies, built twice with the assignment
+# swapped. frontledger_a measures t(base)/t(work), frontledger_b t(work)/t(base); the layout-free effect is sqrt(a / b).
+#   make frontledger FL_BASE=/path/to/old_logos_psort.c && ./frontledger_a 80 8388608 && ./frontledger_b 80 8388608
+FL_BASE ?=
+frontledger: ledgerbench.c $(SRC) $(HDR)
+	@test -n "$(FL_BASE)" || { echo "make frontledger FL_BASE=<an older logos_psort.c>"; exit 1; }
+	cp "$(FL_BASE)" frontledger_base.gen.c
+	$(CC) $(CFLAGS) -w $(call RENAME,lg0) -I. -c frontledger_base.gen.c -o fl_base0.o
+	$(CC) $(CFLAGS) -w $(call RENAME,lg1) -I. -c frontledger_base.gen.c -o fl_base1.o
+	$(CC) $(CFLAGS) $(call RENAME,lg0) -c $(SRC) -o fl_work0.o
+	$(CC) $(CFLAGS) $(call RENAME,lg1) -c $(SRC) -o fl_work1.o
+	$(CC) $(CFLAGS) $(BENCHFLAGS) -c ledgerbench.c -o fl_bench.o
+	$(CC) fl_bench.o fl_base0.o fl_work1.o -o frontledger_a $(LDLIBS)
+	$(CC) fl_bench.o fl_work0.o fl_base1.o -o frontledger_b $(LDLIBS)
+
+# The two-strand merge kernels in isolation (2026-09-26): the branch-free scalar merge against the AVX2 bitonic merge, paired,
+# every orientation pair, two sizes, every output checked. Links an engine object built -DLOGOS_MERGE_HOOK (the hook is not a
+# public symbol of the library, so RENAME is untouched). End-to-end: ./knotbench 40 8388608 simd, and TS_SWITCH=LOGOS_NO_SIMD_MERGE
+# ./tsbench 40 8388608 switch. ./mergebench [pairs] [n]
+mergebench: mergebench.c $(SRC) $(SRC2) $(HDR)
+	$(CC) $(CFLAGS) -DLOGOS_MERGE_HOOK -c $(SRC) -o mergebench_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o mergebench_extra.o
+	$(CC) $(CFLAGS) -I. mergebench.c mergebench_psort.o mergebench_extra.o -o $@ $(LDLIBS)
+	./mergebench 40 8388608
+
 # The leaf's choice between the AVX2 quicksort and flash_sort, sized (2026-09-23). Both engine copies are
 # TODAY's source; they differ only in -DLOGOS_AVX2_OVER_FLASH_FORCE, which restores the order that shipped
 # before this round. Built twice with the copies swapped, so the layout bias cancels. See bandbench.c for
@@ -364,6 +547,28 @@ bandbench: bandbench.c $(SRC) $(HDR)
 	./bandbench_a 1 > bandbench_a.txt
 	./bandbench_b 0 bandbench_a.txt
 
+# The same two copies as bandbench, measured on BATCHES OF DISTINCT INPUTS (2026-10-20): bandbench repeats one input, which lets
+# a predictor learn flash's branches. Twelve shapes, both orientations: read the geometric mean of bandbatch_a and bandbatch_b.
+bandbatch: bandbatch.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(BB_OLD) $(call RENAME,bb0) -I. -c $(SRC) -o bb_old0.o
+	$(CC) $(CFLAGS) $(BB_OLD) $(call RENAME,bb1) -I. -c $(SRC) -o bb_old1.o
+	$(CC) $(CFLAGS) $(BB_NEW) $(call RENAME,bb0) -I. -c $(SRC) -o bb_new0.o
+	$(CC) $(CFLAGS) $(BB_NEW) $(call RENAME,bb1) -I. -c $(SRC) -o bb_new1.o
+	$(CC) $(CFLAGS) bandbatch.c bb_old0.o bb_new1.o -o bandbatch_a $(LDLIBS) -lm
+	$(CC) $(CFLAGS) bandbatch.c bb_new0.o bb_old1.o -o bandbatch_b $(LDLIBS) -lm
+
+# twinbatch (2026-10-21): any compile-time switch paired on batches of DISTINCT inputs, the copies swapped between the two
+# binaries (bandbatch's method, the question left open). make twinbatch TW_OLD=<flags> TW_NEW=<flags>; see its header.
+TW_OLD ?=
+TW_NEW ?= -DLOGOS_AVX2_INT32
+twinbatch: twinbatch.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(TW_OLD) $(call RENAME,tw0) -I. -c $(SRC) -o tw_old0.o
+	$(CC) $(CFLAGS) $(TW_OLD) $(call RENAME,tw1) -I. -c $(SRC) -o tw_old1.o
+	$(CC) $(CFLAGS) $(TW_NEW) $(call RENAME,tw0) -I. -c $(SRC) -o tw_new0.o
+	$(CC) $(CFLAGS) $(TW_NEW) $(call RENAME,tw1) -I. -c $(SRC) -o tw_new1.o
+	$(CC) $(CFLAGS) twinbatch.c tw_old0.o tw_new1.o -o twinbatch_a $(LDLIBS) -lm
+	$(CC) $(CFLAGS) twinbatch.c tw_new0.o tw_old1.o -o twinbatch_b $(LDLIBS) -lm
+
 callbench: callbench.c $(SRC) $(HDR)
 	@if [ -n "$(CB_BASE)" ]; then cp "$(CB_BASE)" callbench_base.gen.c; else git show HEAD:engines/c/$(SRC) > callbench_base.gen.c; fi
 	$(CC) $(CFLAGS) -w $(call RENAME,cb0) -I. -c callbench_base.gen.c -o cb_base0.o
@@ -379,6 +584,10 @@ callbench: callbench.c $(SRC) $(HDR)
 # poison recovery): paired A/B in one binary, LOGOS_NS_GATE_OLD=1 restores the gates as they were.
 nsgatebench: nsgatebench.c $(LIB).a $(HDR)
 	$(CC) $(CFLAGS) $(BENCHFLAGS) nsgatebench.c $(LIB).a -o $@ $(LDLIBS) -lm
+# the near-sorted route's STRAND gate (FINDINGS 3bw): 27 shapes, the gate's statistics beside a paired timing of SG_SWITCH
+# (default LOGOS_NO_NSSTRAND; LOGOS_NO_NEARSORTED = the whole route) against the shipped engine. ./strandgate [pairs] [n] [P] [filter]
+strandgate: strandgate.c $(LIB).a $(HDR)
+	$(CC) $(CFLAGS) $(BENCHFLAGS) strandgate.c $(LIB).a -o $@ $(LDLIBS) -lm
 
 # Integrity check for zroute: the classifier as coded must reproduce the six shapes it was fitted to.
 ztrain: ztrain.cpp zroute.cpp chaoshunt.cpp cp.o $(LIB).a $(HDR)
@@ -398,6 +607,26 @@ ledgerbench: ledgerbench.c $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(LB0) $(call RENAME,lg0) -c $(SRC) -o lg0.o
 	$(CC) $(CFLAGS) $(LB1) $(call RENAME,lg1) -c $(SRC) -o lg1.o
 	$(CC) $(CFLAGS) $(BENCHFLAGS) ledgerbench.c lg0.o lg1.o -o $@ $(LDLIBS) -lm
+
+# PROFILE-GUIDED BUILD, paired (2026-10-08): a copy instrumented with -fprofile-generate is trained by pgotrain (fourteen shapes,
+# sizes 3 to 8M, 1 and 14 threads), rebuilt with -fprofile-use, and paired by ledgerbench against a plain copy, in BOTH orientations
+# (the profile belongs to the copy it was taken from, so each orientation trains its own). effect = sqrt(pgobench_a / pgobench_b).
+PGO_USE = -fprofile-use -fprofile-correction -Wno-missing-profile
+pgobench: pgotrain.c ledgerbench.c $(SRC) $(HDR)
+	rm -f lg0.gcda lg1.gcda
+	$(CC) $(CFLAGS) -fprofile-generate -fprofile-update=atomic $(call RENAME,lg1) -c $(SRC) -o lg1.o
+	$(CC) $(CFLAGS) -DPGO_COPY=lg1 pgotrain.c lg1.o -o pgotrain_1 -fprofile-generate $(LDLIBS) -lm
+	./pgotrain_1
+	$(MAKE) -B ledgerbench LB0= LB1="$(PGO_USE)"
+	./ledgerbench $(PGO_PAIRS) 8000000 > pgobench_a.txt
+	rm -f lg0.gcda lg1.gcda
+	$(CC) $(CFLAGS) -fprofile-generate -fprofile-update=atomic $(call RENAME,lg0) -c $(SRC) -o lg0.o
+	$(CC) $(CFLAGS) -DPGO_COPY=lg0 pgotrain.c lg0.o -o pgotrain_0 -fprofile-generate $(LDLIBS) -lm
+	./pgotrain_0
+	$(MAKE) -B ledgerbench LB0="$(PGO_USE)" LB1=
+	./ledgerbench $(PGO_PAIRS) 8000000 > pgobench_b.txt
+	python3 ../../tools/pair_orient.py pgobench_a.txt pgobench_b.txt
+PGO_PAIRS ?= 30
 
 # Leaf-phase A/B: flash class count and the flash-to-coarse threshold, four
 # variants in ONE binary, interleaved. Run: make leafbench && ./leafbench
@@ -581,8 +810,10 @@ profile-full: profbench.cpp logos_psort_prof.o $(OBJ2) $(HDR)
 # Time against n for every contender, every shape, 1T and P: scale-report.html. Sizes 0, 1, 3, 5, 10,
 # then half-decades from 32 to LOGOS_MAX_N; below 10k a size is timed as a batch of distinct inputs.
 # Per panel two charts: time per sort (linear, log-log toggle) and ns per element, whose value axis is
-# ALWAYS linear. make scalebench = std::sort / gnu_par / logos; make scale-full adds x86-simd-sort and
-# IPS4o. Overrides: LOGOS_MAX_N (default 1e7 since 2026-09-23, for turnaround; =5e7 restores the old ceiling,
+# ALWAYS linear. make scalebench = std::sort / gnu_par / logos; make scale-full adds x86-simd-sort,
+# IPS4o and (2026-11-05) Google's VQSort at one thread (HWY=../highway, see libvqsort.a). The report opens with a summary
+# written for a reader outside the project (logos against the fastest other sort at the largest n, the contenders, the
+# method) and keeps the detailed charts below. Overrides: LOGOS_MAX_N (default 1e7 since 2026-09-23, for turnaround; =5e7 restores the old ceiling,
 # whose 31.6M and 50M rows were most of the run), LOGOS_MIN_N (10000 = the old ladder), LOGOS_THREADS,
 # LOGOS_MAX_SEC (default 20). LOGOS_SCALE_REUSE=<report.html> ./scalebench re-renders that report's
 # measurements through the current template and measures nothing. The node and browser checks below
@@ -595,8 +826,8 @@ scalebench: scalebench.cpp $(LIB).a $(HDR) uplot_embed.h
 	@if command -v node >/dev/null 2>&1; then node ../../tools/check_report.js scale-report.html | tail -2; fi
 	@if command -v python3 >/dev/null 2>&1; then python3 ../../tools/browser_check.py scale-report.html; elif command -v python >/dev/null 2>&1; then python ../../tools/browser_check.py scale-report.html; fi
 	@if [ -d $(REPORTS) ]; then cp scale-report.html $(REPORTS)/scale-report.html && echo "copied to $(REPORTS)/scale-report.html"; fi
-scale-full: scalebench.cpp $(LIB).a $(HDR) uplot_embed.h
-	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp -march=native -DHAVE_XSS -DXSS_USE_OPENMP -DHAVE_IPS4O -I $(XSS) -I $(IPS4O) $(BENCHFLAGS) scalebench.cpp $(LIB).a -o scalebench $(LDLIBS) -latomic -ltbb
+scale-full: scalebench.cpp $(LIB).a $(HDR) uplot_embed.h bench_strings.h libvqsort.a
+	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp -march=native -DHAVE_XSS -DXSS_USE_OPENMP -DHAVE_IPS4O -DHAVE_VQSORT -I $(XSS) -I $(IPS4O) -I $(HWY) $(BENCHFLAGS) scalebench.cpp $(LIB).a libvqsort.a -o scalebench $(LDLIBS) -latomic -ltbb
 	./scalebench
 	@if command -v node >/dev/null 2>&1; then node ../../tools/check_report.js scale-report.html | tail -2; fi
 	@if command -v python3 >/dev/null 2>&1; then python3 ../../tools/browser_check.py scale-report.html; elif command -v python >/dev/null 2>&1; then python ../../tools/browser_check.py scale-report.html; fi
@@ -621,6 +852,19 @@ parbench-simd: parbench.cpp $(LIB).a $(HDR)
 # Full fair fight: adds IPS4o (the SOTA parallel comparison sort). Needs x86-simd-sort,
 # IPS4o headers, and TBB. Set XSS and IPS4O to the include dirs.
 IPS4O ?= ../ips4o/include
+# Google's VQSort, the vectorized quicksort in the Highway library (google/highway, Apache-2.0), 2026-11-05. Fetch it beside the
+# other opponents: git clone --depth 1 --branch 1.4.0 https://github.com/google/highway.git ../highway. There is no cmake on the
+# reference box, so the eight translation units the sort needs (the dispatcher, the f64 and 128-bit key-value instantiations,
+# run-time target detection) are compiled straight into libvqsort.a, about 25 s. Dynamic dispatch picks the instruction set at run
+# time: AVX2 here, the same class as x86-simd-sort's kernels on this box. VQSort has no multi-threaded form, so the benches use it
+# at one thread only.
+HWY ?= ../highway
+VQ_SRC := $(addprefix $(HWY)/hwy/,abort.cc targets.cc per_target.cc print.cc aligned_allocator.cc) \
+          $(addprefix $(HWY)/hwy/contrib/sort/,vqsort.cc vqsort_f64a.cc vqsort_kv128a.cc)
+libvqsort.a: $(VQ_SRC)
+	rm -f vq_*.o
+	for f in $(VQ_SRC); do $(CXX) -O2 -std=gnu++17 -fPIC -I $(HWY) -c $$f -o vq_$$(basename $$f .cc).o || exit 1; done
+	ar rcs $@ vq_*.o
 parbench-full: parbench.cpp $(LIB).a $(HDR)
 	$(CXX) -O3 -std=gnu++17 -march=native -fopenmp -DHAVE_XSS -DXSS_USE_OPENMP -DHAVE_IPS4O -I $(XSS) -I $(IPS4O) $(BENCHFLAGS) parbench.cpp logos_simd.cpp $(LIB).a -o parbench $(LDLIBS) -latomic -ltbb
 

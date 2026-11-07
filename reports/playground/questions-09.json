@@ -1,0 +1,113 @@
+{
+  "Q_OPEN_O01": {
+    "type": "score",
+    "instructions": "A persistent worker pool replacing per-call pthread_create. Context: The lattice route pays spawn+join twice (map and emit): create+join of 13 workers measures 0.564ms of a 1.597ms emit phase, about 1.13ms of a 6.58ms call. Every pthread_create already goes through par_run/par_spawn, so it is a change to two functions rather than 23 sites. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "above 1.40"
+    ]
+  },
+  "Q_OPEN_O02": {
+    "type": "score",
+    "instructions": "Interleaving the lattice map's keys[] and cnts[] into one 16-byte record. Context: The map is 68% of the route at concurrency 10.72/14. Its hot path touches keys[idx] then cnts[idx] at the same random index in two separate 400KB arrays: two cache lines per element where one record would be one. Caution: the ledger's 'interleaved counters' for the partition histogram measured neutral (0.95-1.04). Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "above 1.40"
+    ]
+  },
+  "Q_OPEN_O03": {
+    "type": "score",
+    "instructions": "A thin front for the dispatcher: prescan and insertion sort in a small-frame function, the large body behind a call. Context: psort_f64's frame is 42,576 bytes, so stack-clash protection probes 11 pages on every call including a sort of 2 elements. Entering the dispatcher costs ~5.6ns before any work. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_OPEN_O04": {
+    "type": "score",
+    "instructions": "An MSD radix for the f64 leaf that stops after the top four key bytes and finishes tie groups by insertion. Context: Measured: on uniform, heavy_tail and int_wide the real tie groups under a 32-bit key prefix hold at most 7-10 elements, and few_distinct/quantized ties are 100% duplicates (free). But clustered collapses to 10,274 and bimodal to 512,897, because the top 32 bits resolve to ~1e-6 of the magnitude inside one binade. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "above 1.40"
+    ]
+  },
+  "Q_OPEN_O05": {
+    "type": "score",
+    "instructions": "Splitting one overlapping chain's merge across threads in relocation's phase 2. Context: Phase 2 is already queue-driven, but one long chain is a single indivisible task, so one thread merges it while thirteen wait at the second barrier. Equalising the output tiles changed nothing (0.96-1.04), which is what points here. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "above 1.40"
+    ]
+  },
+  "Q_OPEN_O06": {
+    "type": "score",
+    "instructions": "Windowing the f64 partition's key grid from trimmed quantiles instead of the raw sample. Context: One zero in the sample is enough to defeat the certificates: a sloped sine starts at 0, a[0] is always sampled, the key grid in total-order key space goes coarse because the neighbourhood of zero spans hundreds of binades, and the grid is rejected. The same wave shifted to its crest runs at 0.85-0.88 of the time. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "above 1.40"
+    ]
+  },
+  "Q_OPEN_O07": {
+    "type": "score",
+    "instructions": "An int32 twin of the short-reach route. Context: The f64 short-reach route (sort index blocks where they lie, repair only the seams) is 1.9-2.5x at one thread and 1.3-1.5x at 14, and weighs 0.10 bytes per element at one thread against 15.5. int32 has no such route, and no relocation either. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "above 1.40"
+    ]
+  },
+  "Q_OPEN_O08": {
+    "type": "score",
+    "instructions": "A GPU/SIMT port of the counting and radix paths. Context: The thesis is that addressing beats comparing; on a CPU the scatter is bound by per-core latency (proved three times: ping-pong removed 37% of traffic for 12% of time, huge pages and streaming stores both measured exactly zero). A GPU is the one hardware where scatter is cheap. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss",
+      "no better than the CPU engine",
+      "2-5x",
+      "5-20x",
+      "above 20x"
+    ]
+  },
+  "Q_OPEN_O09": {
+    "type": "score",
+    "instructions": "logos_query: promoting the order/analytics API (rank, select, quantiles, topk, count_in_range, distinct) to first-class entry points. Context: When the deliverable is ORDER or ANALYTICS rather than a sorted array, the no-scatter model already measures quantiles 87x, top-k 7x, range-count 42x against sort-first baselines -- but those baselines were unfair (sort-first and nth_element), and a fair querybench against radix-select and streaming heaps is still owed. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss",
+      "inside the floor",
+      "1.5-3x",
+      "3-10x",
+      "above 10x"
+    ]
+  },
+  "Q_OPEN_O10": {
+    "type": "score",
+    "instructions": "A structure-router: probe cheaply, send structured data to logos's counting/lattice paths and everything else to x86-simd-sort wholesale. Context: logos beats x86-simd-sort only on structured data (few_distinct 1.4x, quantized 1.76x, block shapes 2.2-2.5x) and loses on every unstructured shape. The probe is the shared sample, already 1-4% of a call. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+    "criteria": [
+      "a loss",
+      "inside the floor",
+      "1.1-1.3x",
+      "1.3-2.0x",
+      "above 2.0x"
+    ]
+  }
+}

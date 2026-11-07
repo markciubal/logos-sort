@@ -92,8 +92,8 @@ int pthread_create(pthread_t *th, const pthread_attr_t *at, void *(*fn)(void *),
 static uint64_t RS = 1;
 static uint64_t nr(void) { RS ^= RS << 13; RS ^= RS >> 7; RS ^= RS << 17; return RS; }
 static double fr(void) { return (double)(nr() >> 11) / (double)(1ULL << 53); }
-enum { E_F64, E_I32, E_VIEW64, E_VIEW32, E_INPLACE64, E_INPLACE32 };
-static const char *EN[] = { "sort f64", "sort i32", "view f64", "view i32", "inplace f64", "inplace i32" };
+enum { E_F64, E_I32, E_VIEW64, E_VIEW32, E_INPLACE64, E_INPLACE32, E_BATCH64, E_IPP64, E_STR };
+static const char *EN[] = { "sort f64", "sort i32", "view f64", "view i32", "inplace f64", "inplace i32", "batch f64", "ipart f64", "strings" };
 typedef struct { const char *name; int entry; } case_t;
 static const case_t CASES[] = {
     { "uniform", E_F64 }, { "heavy_tail", E_F64 }, { "few_distinct", E_F64 }, { "quantized", E_F64 }, { "mod_card_2k", E_F64 },
@@ -103,10 +103,44 @@ static const case_t CASES[] = {
     { "ring_buffer", E_F64 }, { "ring_prefix", E_F64 }, { "blocks_1000", E_F64 },
     { "blocks_strays", E_F64 }, { "sine_wave", E_F64 }, { "ring_reach", E_F64 }, { "one_kinked", E_F64 }, { "one_strays", E_F64 },   /* one strand: finished without a plan */   /* round six: strays lifted and the holes closed (a failure after that must put them back), the wave route, the seam */   /* the loop-back: scratch from the pool or malloc, three reversals without; the floor: 2,100 runs at one thread */
     { "dominant_90", E_F64 }, { "few_runs", E_F64 }, { "prefix_95", E_F64 }, { "many_runs", E_F64 }, { "short_reach", E_F64 }, { "short_reach_stray", E_F64 },
+    { "stairs_order", E_F64 },                                       /* 2026-11-06: 64 runs IN ORDER, overlapping: the near-sorted strand gate's sample (sample_by_pos) fails here */
     { "int_wide", E_I32 }, { "int_span_1000", E_I32 }, { "int_sentinel", E_I32 },
     { "uniform", E_VIEW64 }, { "dominant_90", E_VIEW64 }, { "int_wide", E_VIEW32 },
     { "uniform", E_INPLACE64 }, { "dominant_90", E_INPLACE64 }, { "heavy_tail", E_INPLACE64 }, { "int_wide", E_INPLACE32 },
+    { "uniform", E_BATCH64 }, { "near_sorted", E_BATCH64 },        /* 2026-10-08: the batch entry (segments on both sides of 128 and 65,536) */
+    { "uniform", E_IPP64 }, { "heavy_tail", E_IPP64 }, { "dominant_90", E_IPP64 },   /* the in-place partition (LOGOS_PART_INPLACE=1) */
+    { "urls", E_STR }, { "uuids", E_STR },                          /* 2026-10-09: strings on prefix keys (logos_sort_strings_mt) */
+    { "loglines", E_STR },                                          /* 2026-10-19: near-ordered lines, the log-line route (one thread) */
+    { "runs16", E_F64 }, { "head_5", E_F64 }, { "windows_64k", E_F64 }, { "halves", E_F64 },   /* 2026-10-20: the run-length, head, cuts routes; the tail's vector merge */
+    { "strands4", E_F64 }, { "tri1024", E_F64 },
+    { "lattice_spill", E_F64 },   /* 2026-10-31: the one-thread lattice entry with spills (mod_card_30k reaches it with none) */
+    { "dominant_50", E_F64 },   /* 2026-10-22: the dominant-value route (its two inner sorts; its own buffer is an mmap, failed by the harness instead) */   /* 2026-10-21: the k-way merge in vectors (a k >= 3 crossing); a triangle wave (the coverage test, the deferred range) */
 };
+/* the string cases: a pool of n strings, pointers kept in the f64 array's storage (8 bytes each) */
+static char *s_pool; static const char **s_ptr;
+static void gen_strings(double *a64, size_t n, const char *shape) {
+    free(s_pool); s_pool = (char *)__libc_malloc(n * 48); s_ptr = (const char **)(void *)a64; if (!s_pool) return;
+    size_t o = 0; RS = 11;
+    for (size_t i = 0; i < n; i++) {
+        char *s = s_pool + o; int L;
+        if (!strcmp(shape, "urls")) L = snprintf(s, 48, "https://www.site%03u.com/p%u/q%u", (unsigned)(nr() % 300), (unsigned)(nr() % 50), (unsigned)(nr() % 100000));
+        else if (!strcmp(shape, "loglines")) { unsigned long long ts = (unsigned long long)i * 2 - ((nr() % 20 == 0) ? nr() % 1000 : 0);   /* 5% late lines */
+            if (ts > (unsigned long long)i * 2) ts = 0;
+            L = snprintf(s, 48, "%012llu|h%02u|line", ts, (unsigned)(nr() % 32)); }
+        else L = snprintf(s, 48, "%016llx%016llx", (unsigned long long)nr(), (unsigned long long)nr());
+        s_ptr[i] = s; o += (size_t)L + 1;
+    }
+}
+static uint64_t mix(uint64_t x);
+static uint64_t hash_ptrs(const char **p, size_t n) { uint64_t s = 0; for (size_t i = 0; i < n; i++) s += mix((uint64_t)(uintptr_t)p[i]); return s; }
+/* the batch entry's segments: a fixed cycle of lengths over the array, some past the leaf's limit, some under the thin front's */
+static size_t b_off[4097]; static size_t b_nseg;
+static void batch_layout(size_t n) {
+    static const size_t L[] = { 50000, 3000, 100, 70000, 17, 2, 0, 131072, 9000, 65536 };
+    size_t o = 0; b_nseg = 0; b_off[0] = 0;
+    while (o < n && b_nseg < 4096) { size_t l = L[b_nseg % (sizeof L / sizeof *L)]; if (o + l > n) l = n - o; o += l; b_off[++b_nseg] = o; }
+    if (o < n) b_off[b_nseg] = n;                                   /* the last segment takes what is left */
+}
 #define NCASES ((int)(sizeof CASES / sizeof CASES[0]))
 /* three long sorted blocks, shuffled, then 70 short ascending runs interleaved over one value range (one chain of 70):
    relocation merges the chain with merge_all_runs, past the 64 runs it keeps on its stack */
@@ -129,18 +163,27 @@ static void gen64(double *a, size_t n, const char *s) {
         else if (!strcmp(s, "quantized")) a[i] = (double)(nr() % 4096) / 64.0;
         else if (!strcmp(s, "mod_card_2k")) a[i] = sqrt((double)(nr() % 2000));
         else if (!strcmp(s, "mod_card_30k")) a[i] = (double)(nr() % 30000) * 1.5;
+        else if (!strcmp(s, "lattice_spill")) a[i] = (double)(nr() % 30000) * 1.5 + (i >= n - n / 2000 ? 0.1 : 0.0);   /* the last 0.05% off it */
         else if (!strcmp(s, "near_sorted") || !strcmp(s, "ring_buffer")) a[i] = (double)i + fr() * 0.5;
         else if (!strcmp(s, "block_perm") || !strcmp(s, "block_twist") || !strcmp(s, "block_kinked") || !strcmp(s, "sparse_over") || !strcmp(s, "blocks_strays")) a[i] = (double)perm[i / blk] * (double)blk + (double)(i % blk) + fr() * 0.5;
         else if (!strcmp(s, "sine_wave")) { double T = (double)n / 32.0; a[i] = (double)i + 0.3 * T * sin(6.283185307179586 * (double)i / T) + (fr() * 2.0 - 1.0) * 50.0; }
         else if (!strcmp(s, "stairs_x20") || !strcmp(s, "stairs_twist")) a[i] = (double)perm[i / blk] * (double)blk + (double)(i % blk) * (1.0 + 1.0 / 9.0) + fr() * 0.5;
         else if (!strcmp(s, "stairs_triple")) a[i] = (double)perm[i / blk] * (double)blk + (double)(i % blk) * 2.5 + fr() * 0.5;
+        else if (!strcmp(s, "stairs_order")) a[i] = (double)(i / blk) * (double)blk + (double)(i % blk) * 1.2 + fr() * 0.5;           /* in order, each run overlapping the next by 20% */
         else if (!strcmp(s, "dominant_90")) a[i] = (nr() % 10) ? 12345.0 : fr() * 2e9 - 1e9;
         else if (!strcmp(s, "few_runs")) a[i] = (double)(i % q4) * 4.0 + (double)(i / q4) + fr() * 0.5;
         else if (!strncmp(s, "short_reach", 11) || !strcmp(s, "mirror_reach") || !strcmp(s, "ring_reach")) a[i] = (double)i + (fr() * 2.0 - 1.0) * 60.0;           /* the short-reach route: blocks in place, seams */
         else if (!strcmp(s, "mirror_streams")) a[i] = (double)(i % 4) * (double)n + (double)(i / 4) + fr() * 0.5;
+        else if (!strcmp(s, "runs16")) a[i] = (double)(((uint64_t)(i / 16) * 2654435761u) % 1000003u) + 0.25;                         /* runs of 16 equal values */
+        else if (!strcmp(s, "head_5")) a[i] = i < n / 20 ? fr() * (double)n : (double)i + 0.5;                                          /* a random head, a sorted suffix */
+        else if (!strcmp(s, "windows_64k")) a[i] = (double)(i / 65536) * 65536.0 + fr() * 65536.0;                                       /* windows in order */
+        else if (!strcmp(s, "dominant_50")) a[i] = (nr() & 1) ? 12345.0 : fr() * 2e9 - 1e9;
+        else if (!strcmp(s, "strands4")) a[i] = (double)(i % (n / 4 + 1)) * 4.0 + (double)(i / (n / 4 + 1)) + 0.25;                         /* four sorted strands laid out, crossing everywhere */
+        else if (!strcmp(s, "tri1024")) { size_t ph = i % 1024; a[i] = (double)(ph < 512 ? ph : 1024 - ph) + (double)(i / 1024) / (double)(n / 1024 + 2) + (ph < 512 ? 0.0 : 0.25 / (double)(n / 1024 + 2)); }
         else a[i] = i < n - n / 20 ? (double)i : fr() * (double)n;                                   /* prefix_95 */
     }
     if (!strcmp(s, "near_sorted")) for (size_t k = 0; k < n / 100; k++) { size_t x = nr() % n, y = nr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; }
+    if (!strcmp(s, "halves")) { size_t h = n / 2; for (size_t i = 0; i < n; i++) a[i] = i < h ? (double)i * 2.0 + 0.25 : (double)(i - h) * 2.0 + 1.25; }   /* two sorted halves, crossing everywhere */
     /* every block of block_twist and every other block of stairs_twist lies descending: backward copies into tiles (an orphaned
        tile is filled by the caller), and crossings of one strand up and one down */
     if (!strcmp(s, "block_twist") || !strcmp(s, "stairs_twist")) { size_t every = !strcmp(s, "block_twist") ? 1 : 2;
@@ -182,6 +225,9 @@ static size_t v_starts[LOGOS_MAX_VIEW_BUCKETS + 1]; static unsigned char v_done[
 static double v_min64[LOGOS_MAX_VIEW_BUCKETS], v_max64[LOGOS_MAX_VIEW_BUCKETS]; static int32_t v_min32[LOGOS_MAX_VIEW_BUCKETS], v_max32[LOGOS_MAX_VIEW_BUCKETS];
 static void call_entry(int entry, double *a64, int32_t *a32, size_t n, int T) {
     if (entry == E_F64) logos_sort_f64(a64, n, T);
+    else if (entry == E_STR) logos_sort_strings_mt((const char **)(void *)a64, n, T);
+    else if (entry == E_BATCH64) { batch_layout(n); logos_sort_f64_batch(a64, b_off, b_nseg, T); }
+    else if (entry == E_IPP64) { setenv("LOGOS_PART_INPLACE", "1", 1); logos_sort_f64(a64, n, T); unsetenv("LOGOS_PART_INPLACE"); }
     else if (entry == E_INPLACE64) logos_sort_f64_inplace(a64, n, T);
     else if (entry == E_INPLACE32) logos_sort_i32_inplace(a32, n, T);
     else if (entry == E_I32) logos_sort_i32(a32, n, T);
@@ -207,7 +253,9 @@ static result_t run(int entry, double *a64, int32_t *a32, size_t n, uint64_t hin
         if (target == 0) r.out = atomic_load(&fp_allocs) | (atomic_load(&fp_spawns) << 32);
         else {
             int ok = 1;
-            if (entry == E_F64 || entry == E_VIEW64 || entry == E_INPLACE64) { for (size_t i = 1; i < n; i++) if (a64[i] < a64[i - 1]) { ok = 0; break; } if (hash64(a64, n) != hin) ok = 0; }
+            if (entry == E_STR) { const char **sp = (const char **)(void *)a64; for (size_t i = 1; i < n; i++) if (strcmp(sp[i - 1], sp[i]) > 0) { ok = 0; break; } if (hash_ptrs(sp, n) != hin) ok = 0; }
+            else if (entry == E_BATCH64) { for (size_t k = 0; k < b_nseg && ok; k++) for (size_t i = b_off[k] + 1; i < b_off[k + 1]; i++) if (a64[i] < a64[i - 1]) { ok = 0; break; } if (hash64(a64, n) != hin) ok = 0; }
+            else if (entry == E_F64 || entry == E_VIEW64 || entry == E_INPLACE64 || entry == E_IPP64) { for (size_t i = 1; i < n; i++) if (a64[i] < a64[i - 1]) { ok = 0; break; } if (hash64(a64, n) != hin) ok = 0; }
             else { for (size_t i = 1; i < n; i++) if (a32[i] < a32[i - 1]) { ok = 0; break; } if (hash32(a32, n) != hin) ok = 0; }
             r.out = ok ? 0 : 1;
         }
@@ -254,9 +302,9 @@ int main(int argc, char **argv) {
         int ci = -1; char full[96];
         for (int i = 0; i < NCASES && ci < 0; i++) { snprintf(full, sizeof full, "%s:%s", EN[CASES[i].entry], CASES[i].name); if (!strcmp(CASES[i].name, argv[2]) || !strcmp(full, argv[2])) ci = i; }
         if (ci < 0) { fprintf(stderr, "unknown case %s\n", argv[2]); return 2; }
-        int e = CASES[ci].entry, is64 = e == E_F64 || e == E_VIEW64 || e == E_INPLACE64, T = atoi(argv[3]), kind = !strncmp(argv[4], "spawn", 5), rest = strstr(argv[4], "rest") != NULL; long k = atol(argv[5]);
-        if (is64) gen64(a64, n, CASES[ci].name); else gen32(a32, n, CASES[ci].name);
-        uint64_t h = is64 ? hash64(a64, n) : hash32(a32, n);
+        int e = CASES[ci].entry, is64 = e == E_F64 || e == E_VIEW64 || e == E_INPLACE64 || e == E_BATCH64 || e == E_IPP64, T = atoi(argv[3]), kind = !strncmp(argv[4], "spawn", 5), rest = strstr(argv[4], "rest") != NULL; long k = atol(argv[5]);
+        if (CASES[ci].entry == E_STR) gen_strings(a64, n, CASES[ci].name); else if (is64) gen64(a64, n, CASES[ci].name); else gen32(a32, n, CASES[ci].name);
+        uint64_t h = CASES[ci].entry == E_STR ? hash_ptrs((const char **)(void *)a64, n) : is64 ? hash64(a64, n) : hash32(a32, n);
         result_t c = run(e, a64, a32, n, h, T, 0, 0, 0, 0);
         printf("%s %s, %d threads, n=%zu: %ld allocations, %ld thread creations in one cold call\n", EN[e], CASES[ci].name, T, n, c.out & 0xffffffffL, c.out >> 32);
         result_t v = run(e, a64, a32, n, h, T, kind, rest, k, 1);
@@ -270,10 +318,10 @@ int main(int argc, char **argv) {
     printf("  %-8s %-14s %2s %6s %6s | %-13s | %-13s | %-11s | %-11s\n", "entry", "shape", "T", "allocs", "spawns", "alloc one", "alloc rest", "spawn one", "spawn rest");
     long bad[2] = { 0, 0 }, runs[2] = { 0, 0 };
     for (int ci = 0; ci < NCASES; ci++) {
-        int e = CASES[ci].entry, is64 = e == E_F64 || e == E_VIEW64 || e == E_INPLACE64;
+        int e = CASES[ci].entry, is64 = e == E_F64 || e == E_VIEW64 || e == E_INPLACE64 || e == E_BATCH64 || e == E_IPP64;
         if (filter && !strstr(CASES[ci].name, filter) && !strstr(EN[CASES[ci].entry], filter)) continue;      /* a shape or an entry */
-        if (is64) gen64(a64, n, CASES[ci].name); else gen32(a32, n, CASES[ci].name);
-        uint64_t h = is64 ? hash64(a64, n) : hash32(a32, n);
+        if (CASES[ci].entry == E_STR) gen_strings(a64, n, CASES[ci].name); else if (is64) gen64(a64, n, CASES[ci].name); else gen32(a32, n, CASES[ci].name);
+        uint64_t h = CASES[ci].entry == E_STR ? hash_ptrs((const char **)(void *)a64, n) : is64 ? hash64(a64, n) : hash32(a32, n);
         for (int ti = 0; ti < 2; ti++) {
             result_t c = run(e, a64, a32, n, h, tlist[ti], 0, 0, 0, 0);
             if (c.out < 0) { printf("  %-8s %-14s %2d   the unfaulted run itself failed (%ld)\n", EN[e], CASES[ci].name, tlist[ti], c.out); bad[0]++; continue; }

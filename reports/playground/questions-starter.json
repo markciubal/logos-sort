@@ -1,0 +1,34 @@
+{
+  "Q_M_trace": {
+    "type": "noul",
+    "instructions": "A build instrumented with per-phase tracing (fprintf at each phase boundary) times a phase at 2 ms. Judge the claim: that number must not be used to decide whether the phase is worth optimising.",
+    "criteria": {
+      "true": "The claim holds: the trace calls change the whole function's code generation, so such a build says WHICH path ran and what share each phase took, never a price against a normal build",
+      "false": "The claim fails: the traced build runs the same code, so its phase timing is usable"
+    }
+  },
+  "Q_SZ_networks": {
+    "type": "score",
+    "instructions": "Branchless Batcher sorting networks for 4-16 elements replacing insertion sort in the leaf. Rate the speedup on RANDOM calls at n=16, one thread.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_MECH_lattice_idle": {
+    "type": "choice",
+    "instructions": "logos-sort's lattice counting route at 14 threads shows only 8.4 of 14 threads busy on average, with NONE waiting at a barrier and no preemption (cpu/busy = 1.00). Every thread is handed exactly n/P work in both of its parallel phases. Which is the binding constraint?",
+    "criteria": {
+      "serial_merge": "the serial merge between the two parallel phases",
+      "table_teardown": "freeing the per-thread count tables at the end",
+      "thread_creation": "creating and joining the worker threads, paid once per parallel phase",
+      "memory_bandwidth": "the emit phase saturating memory bandwidth, so extra threads cannot help",
+      "thread_imbalance": "unequal work per thread inside the phases",
+      "cache_pressure": "the per-thread tables being too large for L2"
+    }
+  }
+}

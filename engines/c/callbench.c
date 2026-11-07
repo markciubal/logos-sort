@@ -12,6 +12,20 @@
  * the prescan returns a sorted array before the leaf is reached. Ships if the random rows from 4 to 16 clear 1.15 in both
  * orientations and two runs, with no sorted row under 0.97 and nothing at n <= 5 under 0.97.
  *
+ * THE THIN FRONT (2026-10-08, open direction 0g). PREDICTION, written before the first run: calls of 2 to 128 elements are answered
+ * by thin_sort_f64 before the dispatcher (no 28 KB frame probed page by page, no pool lock, no context, no relocation plan built
+ * and declined from 25 elements up). SORTED rows of 2 to 10 elements 1.3-1.6x (the frame's seven probes are most of such a call);
+ * RANDOM rows of 3 to 10 1.03-1.10 (the network or insertion sort is most of it); random 24 1.05-1.15; random 32-100 1.5-2.5x
+ * (the plan the dispatcher builds and throws away there is the larger part of the call: 72 doubles took 1.9 us, 96 took 1.0);
+ * sorted 24-100 1.1-1.3; 0 and 1 and every row from 1000 up 0.97-1.03. Ships if no row reads under 0.97 in both orientations and
+ * two runs, and the rows at n <= 5 and from 32 to 100 clear 1.05.
+ * MEASURED (against the engine just before it, both orientations, two runs): far past the prediction, because the baseline was
+ * dearer than recorded. An UNSORTED call took the buffer pool's lock, initialised a context and built a relocation plan before the
+ * tiny case sorted it: 160-219 ns for 3 random elements (the committed engine the same), where the record said 48. Random n = 2
+ * 0.55-0.62, n = 3 0.17-0.18, 5 0.11, 10 0.16, 32 0.07, 72 0.11-0.12, 100 0.27-0.30; sorted n = 2-5 0.31-0.40, 10 0.52, 24 0.60-0.62,
+ * 32-100 0.69-0.86; n = 0, 1 and every row from 1000 up 0.98-1.01. A second cut sends 17-24 elements to the AVX2 kernel instead of
+ * insertion sort (its vector networks): random 17 0.54, 20 0.37, 24 0.28 against the first cut, everything else 0.99-1.03.
+ *
  *   make callbench                        baseline = the committed engine (git show HEAD:engines/c/logos_psort.c)
  *   make callbench CB_BASE=/path/old.c    baseline = any engine source that builds against today's logos_psort.h
  *   make callbench CB_BASE=a.c SRC=b.c    any two sources (a = baseline)

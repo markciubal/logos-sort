@@ -1,0 +1,94 @@
+{
+  "Q_S09": {
+    "type": "noul",
+    "instructions": "In logos-sort: Knowing the date format pays when the dates are TEXT. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S10": {
+    "type": "noul",
+    "instructions": "In logos-sort: Projecting each element onto a sphere of radius n (x=value, y=a prime, z=the index) and sorting the projection. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S11": {
+    "type": "noul",
+    "instructions": "In logos-sort: The scale report's memory column reproduces make memprobe from an independent code path. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S12": {
+    "type": "noul",
+    "instructions": "In logos-sort: The dispatcher's frame grew across one session and that is the untraced small-call drift. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S13": {
+    "type": "noul",
+    "instructions": "In logos-sort: A trace build can be used to price a phase. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S14": {
+    "type": "noul",
+    "instructions": "In logos-sort: The triple-reversal weld (condense into runs, meta-sort by min edge, in-place triple reversals, seam weld behind an O(1) check). Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S15": {
+    "type": "noul",
+    "instructions": "In logos-sort: The handed-off Moebius hybrid's micro-kink branch (Reidemeister I on 2-3 element dips). Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_SZ_networks": {
+    "type": "score",
+    "instructions": "Branchless Batcher sorting networks for 4-16 elements replacing insertion sort in the leaf. Rate the speedup on RANDOM calls at n=16, one thread.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_net4": {
+    "type": "score",
+    "instructions": "The same networks, rated on RANDOM calls at n=4.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  },
+  "Q_SZ_latqueue": {
+    "type": "score",
+    "instructions": "The lattice map phase claiming chunks from a counter instead of equal slices, at 14 threads on quantized. Rate the speedup.",
+    "criteria": [
+      "a loss (<1.00)",
+      "inside the floor (1.00-1.04)",
+      "1.05-1.15",
+      "1.15-1.40",
+      "1.40-2.0",
+      "above 2.0"
+    ]
+  }
+}

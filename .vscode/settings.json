@@ -1,0 +1,32 @@
+{
+    "workbench.colorCustomizations": {
+        "activityBar.background": "#f5f5f5",
+        "titleBar.activeBackground": "#f5f5f5",
+        "titleBar.activeForeground": "#000000",
+        "titleBar.inactiveBackground": "#f5f5f5",
+        "titleBar.inactiveForeground": "#000000",
+        "statusBar.background": "#f5f5f5",
+        "statusBar.foreground": "#000000",
+        "statusBar.debuggingBackground": "#875000",
+        "statusBar.debuggingForeground": "#FFFAF2",
+        "statusBar.noFolderBackground": "#f5f5f5",
+        "statusBar.noFolderForeground": "#FFFAF2",
+        "editor.background": "#f5f5f5",
+        "editorGutter.background": "#f5f5f5",
+        "minimap.background": "#f5f5f5",
+        "sideBar.background": "#f5f5f5",
+        "sideBarSectionHeader.background": "#f5f5f5",
+        "panel.background": "#f5f5f5",
+        "terminal.background": "#f5f5f5",
+        "tab.activeBackground": "#f5f5f5",
+        "tab.inactiveBackground": "#f5f5f5",
+        "editorGroupHeader.tabsBackground": "#f5f5f5",
+        "breadcrumb.background": "#f5f5f5",
+        "editor.foreground": "#000000",
+        "sideBar.foreground": "#000000",
+        "activityBar.foreground": "#000000",
+        "tab.activeForeground": "#000000",
+        "tab.inactiveForeground": "#000000"
+    },
+    "liveServer.settings.port": 5501
+}

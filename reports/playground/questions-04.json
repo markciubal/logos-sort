@@ -1,0 +1,82 @@
+{
+  "Q_D_D3": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Moderate-cardinality hash counting (≤65 536 distinct). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D4": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Near-sorted index-partition + one-pass P-way band merge. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D5": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Bucket-index cache + destination prefetch. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D6": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Dynamic chunking + spin-then-block barrier. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D7": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Native int32 engine (no widening). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D8": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Persistent scratch pool. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D9": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: argSort (stable, index-carrying) + apply / inverse permutation. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D10": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Order model (rank/select) without materialising. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D11": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: One-pass analytics instead of sort-first. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D12": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Strict in-place (~1n) variants. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  }
+}

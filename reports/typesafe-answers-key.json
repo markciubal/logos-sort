@@ -1,0 +1,873 @@
+{
+  "about": "Scoring key for typesafe-questions.json, keyed by the same ids. NEVER send this: the schema rejects unexpected properties, so expected/kind/provenance cannot ride inside a question.",
+  "kinds": {
+    "calibration": "settled here, with ground truth -- score probabilities against outcomes",
+    "open": "no measurement yet -- a prior that would order the next round",
+    "methodology": "generalises beyond this repo"
+  },
+  "counts": {
+    "calibration": 78,
+    "open": 12,
+    "methodology": 10
+  },
+  "scoring": "noul returns P(true), so Brier = (returned - expected.noul)^2. For score, compare the returned level index with expected.score. For choice, expected.choice is the answer and expected.acceptable_alternate, where present, is defensible on the same evidence.",
+  "answers": {
+    "Q_C_C1": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "1.05×",
+        "why": "decomposes to serial stores"
+      },
+      "provenance": "TRUTH_TABLE.md C1 (negative ledger)"
+    },
+    "Q_C_C2": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.65×",
+        "why": "needs gather+scatter per step"
+      },
+      "provenance": "TRUTH_TABLE.md C2 (negative ledger)"
+    },
+    "Q_C_C3": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "−3 to −5.5%",
+        "why": "store-then-reload beats nothing"
+      },
+      "provenance": "TRUTH_TABLE.md C3 (negative ledger)"
+    },
+    "Q_C_C4": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.1%",
+        "why": "correct kernel, irrelevant share"
+      },
+      "provenance": "TRUTH_TABLE.md C4 (negative ledger)"
+    },
+    "Q_C_C5": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "1.4–1.9× slower",
+        "why": "one live run most of the time; heap pops O(1)"
+      },
+      "provenance": "TRUTH_TABLE.md C5 (negative ledger)"
+    },
+    "Q_C_C6": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "regressed, then segfaulted",
+        "why": "call sites need different sizes"
+      },
+      "provenance": "TRUTH_TABLE.md C6 (negative ledger)"
+    },
+    "Q_C_C7": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "merge 15–26× costlier than scatter",
+        "why": "replaces the cheap op, leaves the expensive one"
+      },
+      "provenance": "TRUTH_TABLE.md C7 (negative ledger)"
+    },
+    "Q_C_C8": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.58–0.90×",
+        "why": "per-level overhead exceeds cache gain; 2048 optimal"
+      },
+      "provenance": "TRUTH_TABLE.md C8 (negative ledger)"
+    },
+    "Q_C_C9": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "worse than plain logos, twice",
+        "why": "pays scatter plus SIMD sort"
+      },
+      "provenance": "TRUTH_TABLE.md C9 (negative ledger)"
+    },
+    "Q_C_C10": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "−6% vs random",
+        "why": "—"
+      },
+      "provenance": "TRUTH_TABLE.md C10 (negative ledger)"
+    },
+    "Q_C_C11": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "neutral 1T, ~12% at 20T",
+        "why": "kept; taught B1"
+      },
+      "provenance": "TRUTH_TABLE.md C11 (negative ledger)"
+    },
+    "Q_C_C12": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "unmeasurable",
+        "why": "single socket"
+      },
+      "provenance": "TRUTH_TABLE.md C12 (negative ledger)"
+    },
+    "Q_C_C13": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "rejected",
+        "why": "engines/js/CHANGELOG.md"
+      },
+      "provenance": "TRUTH_TABLE.md C13 (negative ledger)"
+    },
+    "Q_C_C14": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "withdrawn",
+        "why": "convention only"
+      },
+      "provenance": "TRUTH_TABLE.md C14 (negative ledger)"
+    },
+    "Q_C_C15": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "never fired, 0.99×",
+        "why": "ascending block boundaries fuse runs around holes; gap-split first"
+      },
+      "provenance": "TRUTH_TABLE.md C15 (negative ledger)"
+    },
+    "Q_C_C16": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "−16% segmented 20T",
+        "why": "scan chunk 0 on the caller, sample pre-gate"
+      },
+      "provenance": "TRUTH_TABLE.md C16 (negative ledger)"
+    },
+    "Q_C_C17": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "mixed: one shape each up 12–25%, others down 10–45%",
+        "why": "the leaf cost is the insertion fix-up (Devroye's n·∫f²) and the per-bucket probes, not the counters or the level count; lever is equi-depth classes gated by an ∫f² estimate, branchless fix-up, fewer probes"
+      },
+      "provenance": "TRUTH_TABLE.md C17 (negative ledger)"
+    },
+    "Q_C_C19": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "−5 to −28% at 14T, −10 to −16% at 6T on every random shape",
+        "why": "the scalar flash/coarse leaf on an L2-resident bucket is already ~9 ns/elem; the vectorized quicksort is 8.5 at 1 thread and slower under 14, on a hybrid P+E CPU (E-cores run 256-bit AVX2 double-pumped). The same code wins 1.2–1.6× sequentially, so it ships sequential-only"
+      },
+      "provenance": "TRUTH_TABLE.md C19 (negative ledger)"
+    },
+    "Q_C_C20": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.93–1.09× at 14T over two runs, 0.97–1.03× at 7T: noise",
+        "why": "the histogram's residual cost on bimodal is branch behaviour on alternating modes, not the child-table dereference the model removes; a model with worst error ≥2 buckets loops and cost −12% on heavy_tail even as a trial chunk"
+      },
+      "provenance": "TRUTH_TABLE.md C20 (negative ledger)"
+    },
+    "Q_C_C21": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "3.0 vs 1.9 ns/elem for the 64 network",
+        "why": "32 vectors spill; one more partition level (0.4–0.7 ns/elem) plus the 64 network is cheaper"
+      },
+      "provenance": "TRUTH_TABLE.md C21 (negative ledger)"
+    },
+    "Q_C_C25": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "lognormal 0.91×, exponential 0.80× against the key splitter table it displaces",
+        "why": "a heavy tail decays *inside* each binade too, so its buckets take up to 3× their share and spill where the table's do not; the trial picks it anyway because it times the lookup, not the partition (which is what D37 now catches). First cut was worse still: indexed on the key's top byte, which holds 7 of the 11 exponent bits, so Pareto fell into two entries and 63% spilled"
+      },
+      "provenance": "TRUTH_TABLE.md C25 (negative ledger)"
+    },
+    "Q_C_C26": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "98.5% crossing mass on a staircase built with 10%",
+        "why": "a strand's last element lands at the head of the next interval and turns the neighbour's whole middle into a two-strand crossing; a first value cuts below itself, a last value above. Caught by the trace build before anything was timed"
+      },
+      "provenance": "TRUTH_TABLE.md C26 (negative ledger)"
+    },
+    "Q_C_C27": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.92–0.96 on the shapes just past the gate; the predicted break-even does not exist on the two-strand ladder",
+        "why": "see B58. Shipped gates are measured: 1.0n parallel (the pure-partition control), 3.0n sequential, 1.0n sequential with at most MERGE_MAX_RUNS runs"
+      },
+      "provenance": "TRUTH_TABLE.md C27 (negative ledger)"
+    },
+    "Q_C_C28": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.84–0.99 at 1M and 14 threads on rows that win at 8.4M",
+        "why": "the cap was measured on copies, which are bandwidth-bound; merges are compute-bound and ran on 2 threads against the partition's 10. The cap now counts work, n + 3 × cost: 1.26–1.43"
+      },
+      "provenance": "TRUTH_TABLE.md C28 (negative ledger)"
+    },
+    "Q_C_C29": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "0.89 against the pure partition at 14 threads, 2.4× at one",
+        "why": "staged copy plus an in-place merge tournament; declined early instead, the row rose from 1.16 to 1.24 against the shipped engine. A direct 3- or 4-way merge from the source is the untried angle"
+      },
+      "provenance": "TRUTH_TABLE.md C29 (negative ledger)"
+    },
+    "Q_C_C30": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "three sorted elements 6 → 42 ns; random n = 32 781 → 2431 ns; block_perm n = 100 2105 → 4969 ns",
+        "why": "two getenv calls are ~40 ns; and when runs hold two or three elements nearly every element is a run endpoint, so almost nothing \"crosses\", the gate says go, and the sweep sorts the array the slow way. Switches now read from 512 elements up, route asked only at an average run ≥ 256: 0.93–1.03 of the committed engine from n = 0 to 3162"
+      },
+      "provenance": "TRUTH_TABLE.md C30 (negative ledger)"
+    },
+    "Q_C_C31": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "f64 15.5 at 1 thread, 23 at 14, 104 on a dominant value before the fix; int32 11.5 and 6.5 per 4-byte element",
+        "why": "inferred from the design (one n-sized buffer), never measured; the contexts, the partition's slack regions and the index cache were left out"
+      },
+      "provenance": "TRUTH_TABLE.md C31 (negative ledger)"
+    },
+    "Q_C_C32": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "it freed 9 of 23 bytes per element (9 of 104 on a dominant value), and none of the int32 counting route's table pool (up to 64 MB)",
+        "why": "it knew about the scratch pool and not about the three caches added after it: the context bundles, the partition's regions, the count tables"
+      },
+      "provenance": "TRUTH_TABLE.md C32 (negative ledger)"
+    },
+    "Q_D_D1": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "quantized 109 → 52 ms seq; 30k-distinct 105 → 53",
+        "why": "lattice_try_f64"
+      },
+      "provenance": "TRUTH_TABLE.md D1 (positive results)"
+    },
+    "Q_D_D2": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "few_distinct 130 → 49 ms seq",
+        "why": "lowcard_try_f64"
+      },
+      "provenance": "TRUTH_TABLE.md D2 (positive results)"
+    },
+    "Q_D_D3": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "2.5× at 256 distinct, 1.2–1.4× to 32k",
+        "why": "modcard_try_f64"
+      },
+      "provenance": "TRUTH_TABLE.md D3 (positive results)"
+    },
+    "Q_D_D4": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "28 → 22.5 ms at 20T",
+        "why": "nearsorted_parallel_f64"
+      },
+      "provenance": "TRUTH_TABLE.md D4 (positive results)"
+    },
+    "Q_D_D5": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "20T floor 65 → 41–49 ms",
+        "why": "3.4.0"
+      },
+      "provenance": "TRUTH_TABLE.md D5 (positive results)"
+    },
+    "Q_D_D6": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "load degradation 2–5× → 1.3–2×",
+        "why": "3.3.x"
+      },
+      "provenance": "TRUTH_TABLE.md D6 (positive results)"
+    },
+    "Q_D_D7": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "int32 loss 0.71× → win 2.5×",
+        "why": "3.2.0"
+      },
+      "provenance": "TRUTH_TABLE.md D7 (positive results)"
+    },
+    "Q_D_D8": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "measured the page-fault floor; ~13%",
+        "why": "3.6.0"
+      },
+      "provenance": "TRUTH_TABLE.md D8 (positive results)"
+    },
+    "Q_D_D9": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "makes records-by-key possible",
+        "why": "logos_extra.c"
+      },
+      "provenance": "TRUTH_TABLE.md D9 (positive results)"
+    },
+    "Q_D_D10": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "1.57× at 64 distinct; loses ≥4096",
+        "why": "paradigm #2"
+      },
+      "provenance": "TRUTH_TABLE.md D10 (positive results)"
+    },
+    "Q_D_D11": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "quantiles 87× (approx), top-k 7× (exact), range-count 42× (exact)",
+        "why": "paradigm #3"
+      },
+      "provenance": "TRUTH_TABLE.md D11 (positive results)"
+    },
+    "Q_D_D12": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "1.6–6× slower; raises the RAM ceiling, not speed",
+        "why": "3.6.0+"
+      },
+      "provenance": "TRUTH_TABLE.md D12 (positive results)"
+    },
+    "Q_D_D13": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "2.3–3.4× 1T, 1.9–2.2× 20T on block-permuted 8M; guards ±5%; parbench 20T 6.1× vs gnu_par",
+        "why": "relocate_try_f64, make j5bench"
+      },
+      "provenance": "TRUTH_TABLE.md D13 (positive results)"
+    },
+    "Q_D_D14": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "found B13 on its first run",
+        "why": "-DLOGOS_PROFILE, make profile"
+      },
+      "provenance": "TRUTH_TABLE.md D14 (positive results)"
+    },
+    "Q_D_D15": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "1.6–3.0× at 20T on every shape that partitions; guards noise",
+        "why": "bt_init, do_hist, make stbench"
+      },
+      "provenance": "TRUTH_TABLE.md D15 (positive results)"
+    },
+    "Q_D_D16": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "12/t alone 1.08–1.44× on 9 of 12 partitioning rows across three runs; vs the old engine the adaptive leaf reads 1.13–1.37× at 20T on the partitioning shapes. Unresolved: adaptive vs always-branch-free, because that run hit a ±25% load burst; adaptive ships as the better of the two by construction. Interleaved counters and line repair mixed across three runs, opt-in",
+        "why": "BUCKETS_PER_THREAD, BT_LEAF, do_hist, make theorybench"
+      },
+      "provenance": "TRUTH_TABLE.md D16 (positive results)"
+    },
+    "Q_D_D17": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "first AVX2 fair fight, FINDINGS §1c",
+        "why": "make profile-full, make parbench-full"
+      },
+      "provenance": "TRUTH_TABLE.md D17 (positive results)"
+    },
+    "Q_D_D18": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "20T rows at 1e5 3–20× faster (uniform 8.8 → 1.6 ms, block_perm 9.9 → 0.5), 1e6 14.0 → 4.3 with ten threads beating twenty; ≥2M unchanged",
+        "why": "effective_threads, make scale-full"
+      },
+      "provenance": "TRUTH_TABLE.md D18 (positive results)"
+    },
+    "Q_D_D19": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "reports/scale-report.html",
+        "why": "make scale-full, scalebench.cpp"
+      },
+      "provenance": "TRUTH_TABLE.md D19 (positive results)"
+    },
+    "Q_D_D23": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED (make chaosbench): sawtooth whose period equals the old stride, 14T 546 → 38 ms; van der Corput 14T 177 → 19 ms (bit-reversal aliased the stride too, unpredicted); no shape outside its noise band. The collatz 1.18–1.25× first credited here was NOT the sampler (both samples saw ~280 distinct): see D27",
+        "why": "SAMPLE_POS, weyl_pos"
+      },
+      "provenance": "TRUTH_TABLE.md D23 (positive results)"
+    },
+    "Q_D_D39": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED with the copy-swap control in both directions (make tailbench, FINDINGS §3s): bimodal 14T 1.25–1.38×, three uniform bands 1.23–1.33×, gaussian mixture 1.01–1.03× (declines at mode KS 0.164), all other shapes and every 1-thread row inside the band",
+        "why": "hf_lookup_md, md_ok, -DLOGOS_NO_MODEKS"
+      },
+      "provenance": "TRUTH_TABLE.md D39 (positive results)"
+    },
+    "Q_D_D40": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED (make knotbench, FINDINGS §3ac): 1 thread 2.6–4.4× from 10% to 100% of elements crossing, three live strands 2.6×, eight 1.4×; 14 threads 1.2–1.5× against the shipped engine, a TIE (0.96–1.11) against the pure partition; guards 1.00; 401 harness checks, clean under ASan/UBSan",
+        "why": "knot_plan, knot_worker in relocate_try_f64 / runs_relocate_f64; LOGOS_NO_KNOT=1, -DLOGOS_NO_KNOT"
+      },
+      "provenance": "TRUTH_TABLE.md D40 (positive results)"
+    },
+    "Q_D_D41": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED (make faultprobe: on the same 19 cases 7,008 injected failures, 0 bad, where 2,369 of 8,502 had been; the final engine's 23 cases, with the in-place entries and a 70-run chain, 7,894 and 0 bad; with the targeted sweeps all 19 worker functions and the spill path are reached; about 2,150 harness checks repeat a sample in-process, and the thread-creation half also runs under ThreadSanitizer: 186 failed creations, 0 races)",
+        "why": "par_run, par_spawn, barrier_drop, TILE_IS_MINE, all-or-nothing ctx_alloc, merge_all_runs on stack lists"
+      },
+      "provenance": "TRUTH_TABLE.md D41 (positive results)"
+    },
+    "Q_D_D42": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED, and it is the only bench in the tree that does not time",
+        "why": "memprobe.c; MEMPROBE_LOG=<bytes> prints each large allocation with its call site, which is how the double allocation was found"
+      },
+      "provenance": "TRUTH_TABLE.md D42 (positive results)"
+    },
+    "Q_S01": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED",
+        "why": "random calls 1.03-1.06x at n=4 rising monotonically to 1.57-1.58x at n=16, two runs and both copy orientations; n=18 and 24 read 0.99 as the control; sorted rows 0.97-1.04. A small-end result, not a result at scale. SHIPPED",
+        "human_prediction_before_measuring": "1.5-3x across n=4-16"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S02": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED",
+        "why": "quantized and mod_card_30k 0.90-0.97 on 12 of 12 cells at 4M+, two runs of 60 pairs, against a null switch on the same rows at 0.97-1.04. ~1.05x. SHIPPED",
+        "human_prediction_before_measuring": "0.75-0.90 (i.e. 1.11-1.33x)"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S03": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "0.96-1.04 on every cell of two runs against a prediction of 0.88-0.97. A work queue buys balance only where the CORES are the bottleneck; those phases are memcpy over disjoint ranges, bound by one memory controller. REVERTED",
+        "human_prediction_before_measuring": "0.88-0.97 (i.e. 1.03-1.14x)"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S04": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED",
+        "why": "~1.03x, 20 of 20 cells on the winning side against a measured null. SHIPPED",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S05": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "split into four profiler phases at 14 threads: map 68% at concurrency 10.72/14, merge 1.0%, emit 28% at concurrency 3.17/14, teardown 0.14%. The merge is not the problem",
+        "human_prediction_before_measuring": "the serial merge was ~55% of the route"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S06": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "9-14 MICROseconds, 0.14% of the route. The 2ms came from a TRACE build; a trace build gives shares, never a price against a normal build",
+        "human_prediction_before_measuring": "2ms, worth a persistent pool"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S07": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "every thread gets exactly n/P output positions, so it cannot be. A standalone replica splits it: create+join of 13 workers is 0.564ms of 1.597ms (35%), and the remaining fill gets only 2.7x from 14 threads because 67MB of stores at 65 GB/s is the DDR5 ceiling",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S08": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "a sort TOLD the origin and step is 0.24-0.77 of the engine (1.3-4.2x slower) across six date shapes, and returns WRONG OUTPUT on day-plus-fraction, which has no exact integer form. Predicted 2-4x available",
+        "human_prediction_before_measuring": "2-4x available on epoch_ms_day"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S09": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED",
+        "why": "parse to a numeric key + logos_argsort_f64 + one gather is 8.48x over std::sort on std::string and 4.87x over fixed 24-byte memcmp records, 2M records, one thread. A format is worth what it saves in COMPARISON WIDTH, not in distribution knowledge",
+        "human_prediction_before_measuring": "8-25x over std::string, 3-8x over fixed records"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S10": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "22.2% of 2.0M pairs at different indices come back order-INVERTED. proj_x = R*x/sqrt(x^2+p^2+z^2), and with z to 8.4M against values to 1e4 the z^2 term dwarfs x^2, so it orders by value/index. Cost alone would NOT have killed it: 2.89 ns/element against the engine's 0.60 ns addressing multiply-add",
+        "human_prediction_before_measuring": "the projection would collide and cost more than the sort"
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S11": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED",
+        "why": "logos 15.7 bytes/element at 10M against memprobe's documented 15.5 (1.3%); the strict in-place entry and std::sort both exactly 0.0. Agreement between two independent instruments",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S12": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 1.0,
+        "outcome": "MEASURED",
+        "why": "psort_f64 is 36,640 bytes in the committed engine and 42,576 in the working tree; stack-clash protection probes every 4096-byte page on every call, so 9 probes against 11 -- two extra on a ~17ns sorted call, which matches the recorded 1.08-1.14 drift",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S13": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "it timed the lattice teardown at 2ms where a normal build measures 9-14us, and once timed a lookup table 1.3x FASTER than the compares it replaced where the normal build read 0.66-0.71x",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S14": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "2 to 4,600x behind the engine on 14 of 16 shapes at one thread, and the O(1) check bypassed 0.0% of seams on every shape: a maximal run swallows the next block, so units span holes and the merge behind the test is O(prefix), i.e. quadratic",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_S15": {
+      "kind": "calibration",
+      "expected": {
+        "noul": 0.0,
+        "outcome": "FALSE",
+        "why": "fires 0 times on the shape it was written for. A dip's first element belongs to the PRECEDING ascending run, so the descending run is one element, never 2 or 3 -- which is why the engine's own repair asks BOTH neighbours instead, and that one is worth 5.8x/5.0x/3.2x",
+        "human_prediction_before_measuring": null
+      },
+      "provenance": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)"
+    },
+    "Q_SZ_networks": {
+      "kind": "calibration",
+      "expected": {
+        "score": 4,
+        "legend": "1.40-2.0",
+        "why": "measured 1.57-1.58x (two runs, both copy orientations)"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_net4": {
+      "kind": "calibration",
+      "expected": {
+        "score": 1,
+        "legend": "inside the floor (1.00-1.04)",
+        "why": "measured 1.03-1.06x"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_latqueue": {
+      "kind": "calibration",
+      "expected": {
+        "score": 2,
+        "legend": "1.05-1.15",
+        "why": "measured ~1.05x (0.90-0.97 on 12 of 12 cells)"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_tiles": {
+      "kind": "calibration",
+      "expected": {
+        "score": 1,
+        "legend": "inside the floor (1.00-1.04)",
+        "why": "measured 0.96-1.04: neutral"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_prescan": {
+      "kind": "calibration",
+      "expected": {
+        "score": 4,
+        "legend": "1.40-2.0",
+        "why": "measured 1.72-2.22x"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_kink": {
+      "kind": "calibration",
+      "expected": {
+        "score": 5,
+        "legend": "above 2.0",
+        "why": "measured 5.8x"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_datestr": {
+      "kind": "calibration",
+      "expected": {
+        "score": 5,
+        "legend": "above 2.0",
+        "why": "measured 8.48x"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_datenum": {
+      "kind": "calibration",
+      "expected": {
+        "score": 0,
+        "legend": "a loss (<1.00)",
+        "why": "measured 0.77: the told sort is SLOWER"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_hugepage": {
+      "kind": "calibration",
+      "expected": {
+        "score": 1,
+        "legend": "inside the floor (1.00-1.04)",
+        "why": "measured 0.98-1.01: exactly neutral"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_SZ_gallop": {
+      "kind": "calibration",
+      "expected": {
+        "score": 5,
+        "legend": "above 2.0",
+        "why": "measured 2.45-2.70x"
+      },
+      "provenance": "measured in this repo"
+    },
+    "Q_MECH_lattice_idle": {
+      "kind": "calibration",
+      "expected": {
+        "choice": "thread_creation",
+        "why": "create+join of 13 workers is 0.564ms of a 1.597ms emit phase (35%), and the rest is bandwidth-bound (14 threads buy 2.7x; 67MB of stores at 65 GB/s). The merge is 1.0% and the teardown 0.14%. memory_bandwidth is the defensible second answer.",
+        "acceptable_alternate": "memory_bandwidth"
+      },
+      "provenance": "make profile with the route split into four phases; make spawnprobe"
+    },
+    "Q_MECH_proposal_failure": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "the five outside proposals measured in this repo hit, respectively: already_subsumed, destroys_order, per_element_cost, gate_never_fires, isolated_win_only"
+    },
+    "Q_MECH_small_end": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction 0g"
+    },
+    "Q_OPEN_O01": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O02": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O03": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O04": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O05": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O06": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O07": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O08": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O09": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_OPEN_O10": {
+      "kind": "open",
+      "expected": null,
+      "provenance": "open direction, no measurement yet"
+    },
+    "Q_M_floor": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_layout": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_trace": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_oracle": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_microbench": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_loaded": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_fallback": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_stub": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_precision": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    },
+    "Q_M_statistic": {
+      "kind": "methodology",
+      "expected": {
+        "noul": 1.0,
+        "why": "the 'true' criterion is what this repo measured"
+      },
+      "provenance": "CLAUDE.md methodology and ledger"
+    }
+  }
+}

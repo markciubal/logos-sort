@@ -1,0 +1,162 @@
+{
+  "Q_D_D13": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Disjoint-run relocation (J5): memcpy shuffled sorted blocks into place from sorted run descriptors. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D14": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Per-phase profiler: CPU vs preempted vs stalled vs idle per thread, leaf path per bucket, HTML treemaps. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D15": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Direct-index splitter tables with per-thread trial (H0b + J15): O(1) bucket lookup in the histogram. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D16": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: 12 buckets/thread (J16) + table leaf with the root style chosen per thread from the trial's root-resolution fraction. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D17": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Profiler and parbench carry x86-simd-sort (AVX-512 or AVX2 per build) and IPS⁴o at equal thread counts; single-thread SIMD column now really single-threaded. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D18": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Thread-count policy: at most one thread per 100k elements (found by the scaling benchmark, A13). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D19": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Scaling benchmark: time vs n for every contender and shape, 1T and P, linear axes with O(n) / O(n log n) references and fitted exponents. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D23": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Weyl sample positions (floor(frac(i·φ)·n) in every sampler; three-gap theorem). Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D39": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Per-mode certificate and linear map: each mode's slice of the sample is tested for uniformity on its own, and if every mode certifies the partition buckets with branch-free mode selection plus one multiply-add instead of a table per mode. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D40": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: The knot route: runs as strands, a sweep over the 2R run endpoints, pieces that lie alone are copied and only what crosses is merged; staircases of overlapping sorted blocks, which relocation declines because one chain covers everything, no longer pay for a full sort. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D41": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Resource exhaustion costs speed, never correctness: every allocation and every thread creation of a cold call can fail, singly or from some point on, and the array still comes back sorted. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_D_D42": {
+    "type": "noul",
+    "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: make memprobe: what one cold sort weighs, what it still holds, what is left after release; f64 and int32, 1 thread and P, the in-place entries beside them. Judge whether it BEAT the engine by more than the resolving floor.",
+    "criteria": {
+      "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+      "false": "It did not: neutral, mixed, or slower"
+    }
+  },
+  "Q_S01": {
+    "type": "noul",
+    "instructions": "In logos-sort: Branchless Batcher networks for 4-16 elements in the leaf, generated and proved by the 0-1 principle before being written. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S02": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice MAP phase claims chunks from an atomic counter instead of taking equal slices. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S03": {
+    "type": "noul",
+    "instructions": "In logos-sort: The same work queue applied to relocation's output tiles. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S04": {
+    "type": "noul",
+    "instructions": "In logos-sort: Each lattice worker allocates its own count table rather than the caller allocating all P before the spawn. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S05": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice route's idle threads are its serial merge. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S06": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice route's 2ms of table teardown is worth attacking. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S07": {
+    "type": "noul",
+    "instructions": "In logos-sort: The lattice emit phase's low concurrency is thread imbalance. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  },
+  "Q_S08": {
+    "type": "noul",
+    "instructions": "In logos-sort: Knowing the data FORMAT (that values are dates) beats certifying the distribution, for NUMERIC timestamps. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+    "criteria": {
+      "true": "It held up and shipped",
+      "false": "It did not hold up: neutral, slower, or the claim was false"
+    }
+  }
+}

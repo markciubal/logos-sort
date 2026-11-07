@@ -1,8 +1,14 @@
 /* scalebench.cpp — time against n for every contender, every shape, at 1 thread and at P.
  *
  * Sizes 0, 1, 3, 5, 10, then half-decade steps 32, 100, ... up to LOGOS_MAX_N (default 1e7, and the ceiling is itself
- * a point), thirteen shapes (nine standard, four from the twist-and-knot rounds). Single-threaded section: std::sort, logos, logos in-place (no scratch at all), x86-simd-sort
- * (-DHAVE_XSS, OpenMP threads set to 1), IPS4o sequential (-DHAVE_IPS4O), LSD radix, timsort.
+ * a point), thirteen shapes (nine standard, four from the twist-and-knot rounds), and since 2026-10-11 four STRING shapes
+ * (uuids, words, urls, logs: pointers to NUL-terminated strings in strcmp order, bench_strings.h; LOGOS_SCALE_STRINGS=0
+ * skips them), each panel naming its own contenders: std::sort / __gnu_parallel::sort and IPS4o with strcmp, logos
+ * (logos_sort_strings_mt), x86-simd-sort's key-value sort under the same 8-byte-prefix scheme, and the multikey quicksort
+ * logos used before. Single-threaded section: std::sort, logos, logos in-place (no scratch at all), x86-simd-sort
+ * (-DHAVE_XSS, OpenMP threads set to 1), Google's VQSort from the Highway library (-DHAVE_VQSORT, since 2026-11-05: one thread
+ * only, it has no parallel form; on strings, its key-value sort under the same 8-byte-prefix scheme), IPS4o sequential
+ * (-DHAVE_IPS4O), LSD radix, timsort.
  * Parallel section at P threads: __gnu_parallel::sort, logos, logos in-place (parallel from 2026-09-20),
  * x86-simd-sort OpenMP, IPS4o parallel. Never one thread against many. std::sort's output is the reference;
  * every other output is checked equal to it. From 10k up, reps shrink with n (5 / 3 / 1) and the minimum is
@@ -36,6 +42,8 @@
 #include <cstdint>
 #include <cmath>
 #include <chrono>
+#include <sys/stat.h>
+#include <ctime>
 #include <atomic>
 #include <malloc.h>
 #ifdef HAVE_XSS
@@ -45,6 +53,15 @@
 #ifdef HAVE_IPS4O
 #include "ips4o.hpp"
 #endif
+#ifdef HAVE_XSS
+#define BENCH_STRINGS_XSS 1
+#endif
+#ifdef HAVE_VQSORT
+#include "hwy/contrib/sort/vqsort.h"
+#include "hwy/targets.h"
+#define BENCH_STRINGS_VQ 1
+#endif
+#include "bench_strings.h"            /* the string shapes and the prefix scheme, shared with stringbench */
 
 struct Rng { uint64_t s; uint64_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; } double f() { return (double)(next() >> 11) / 9007199254740992.0; } };
 static double nowms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -79,10 +96,165 @@ static std::vector<double> gen(const std::string &shape, size_t n, uint64_t seed
     else if (shape == "reach_mirror") { for (size_t i = 0; i < n; i++) a[i] = (double)i + (r.f() * 2.0 - 1.0) * 60.0; std::reverse(a.begin(), a.end()); }
     return a;
 }
+/* ---- "the shapes": every shape described, and shown from its OWN generator ----
+   Built when the report is written, so a LOGOS_SCALE_REUSE re-render carries it too, from the same gen() / gen_strings()
+   the timing used (seed 7) at DEMO_N elements: the whole array at DEMO_OV evenly spaced positions, DEMO_W consecutive
+   elements around the feature that defines the shape, DEMO_T of their values as text, and a profile counted over all
+   DEMO_N elements. A string has no numeric value, so strings are plotted by RANK, their position in sorted order.
+   The descriptions are of the DATA, not of the route logos takes: routes move from round to round, and a trace build
+   (`make knottrace`, `make tstrace`, ... with `once`) is where to read them. */
+static const size_t DEMO_N = (size_t)1 << 20, DEMO_OV = 512, DEMO_W = 48, DEMO_T = 12, DEMO_TS = 10;
+struct ShapeDoc { const char *shape, *brief, *desc; };
+static const ShapeDoc SHAPE_DOCS[] = {
+    { "uniform", "random doubles: no order, no repeats, no skew",
+      "Doubles drawn uniformly from −1e9 to 1e9 and laid out in random order. There is nothing to exploit: no runs, no repeated "
+      "values, no skew. It is the case general-purpose sorts are built for, and the baseline every other shape is read against." },
+    { "near_sorted", "sorted, then 1% of positions swapped at random",
+      "The values 0, 1, 2, … n−1 in order, then n/100 random pairs of positions swapped, so about 2% of the elements sit far "
+      "from where they belong and the rest are already in place. Models an index or a log that was sorted once and then lightly "
+      "disturbed. Every value is an integer, and the set of values is exactly 0 … n−1." },
+    { "few_distinct", "five values, repeated in random order",
+      "Every element is one of five values (0, 1e6, 2e6, 3e6, 4e6), chosen at random, so each fills about a fifth of the "
+      "array. Models status codes, categories or any low-cardinality column: a sort that counts instead of comparing can "
+      "finish in one pass." },
+    { "heavy_tail", "Pareto: mostly small, a few enormous",
+      "A Pareto distribution with shape 1.2 and minimum 1000: half of the values are under about 1,800, and the largest are "
+      "100,000 times the smallest. Models file sizes, prices, incomes and latencies. Dividing the value range evenly puts "
+      "nearly everything into the first bucket, which is why the plots use a log value axis." },
+    { "bimodal", "two tight clusters, 2e9 apart",
+      "Each value is about −1e9 or about +1e9 (a coin flip), plus a random offset under 10, in random order. Two dense "
+      "clusters with an enormous empty gap between them: a sort that divides the value range evenly puts almost everything "
+      "into two buckets and still has to sort inside each cluster." },
+    { "quantized", "4,096 grid values, multiples of 1/64",
+      "Multiples of 1/64 from 0 to 63.984375, chosen at random: 4,096 distinct values on an exact grid, each repeated about "
+      "n/4096 times. Models readings or prices with a fixed resolution. Too many values to call few, but a sort that "
+      "recognizes the grid can count instead of comparing." },
+    { "int_wide", "random 32-bit integers, stored as doubles",
+      "Random signed 32-bit integers over their whole range (about ±2.1e9), stored as doubles. Every value is an integer, "
+      "but there are far too many distinct values to count. Models wide IDs and hash values; it asks whether a sort notices "
+      "that 4-byte keys would do." },
+    { "block_perm", "64 sorted blocks, shuffled",
+      "The array is cut into 64 equal blocks of length L = n/64. Block b holds b·L, b·L + 1, … plus a jitter under 0.5, so "
+      "every block is sorted and no two blocks' value ranges overlap. Then the blocks are put in random order. Models sorted "
+      "chunks or shards concatenated out of order: sorting it only moves 64 pieces, with nothing to compare inside them." },
+    { "block_overlap", "64 shuffled blocks, 1 in 8 overlapping its neighbour",
+      "block_perm, except that one block in eight is shifted down by a tenth of a block length, so its value range overlaps "
+      "the block below it by 10%. Those eight pairs have to be merged, not just moved; the other blocks still only move." },
+    { "block_twist", "64 shuffled blocks, every other one descending",
+      "block_perm with the 1st, 3rd, 5th … blocks (by position) reversed, so half of the sorted runs lie in descending "
+      "order. Models data in which some segments were written newest-first. A sort that only recognizes ascending runs sees "
+      "half of the structure." },
+    { "block_kinked", "64 shuffled blocks with 1% of adjacent pairs swapped",
+      "block_perm, then n/100 adjacent pairs at even positions swapped. Each swap is a tiny local defect, a kink, that "
+      "breaks a long sorted run in two, so a sort that only accepts clean runs sees thousands of short ones. Models sorted "
+      "data with occasional neighbours out of order, such as two log lines in the same millisecond written the wrong way round." },
+    { "sine_slope", "a rising trend, a sine wave on it, and noise",
+      "a[i] = i + A·sin(2πi/T) + noise, with 32 full cycles (T = n/32), amplitude A = 0.3·T and noise uniform in ±50. "
+      "The wave is steep enough that the array falls for part of every cycle, and the noise disorders every neighbourhood. "
+      "Order at two scales: long rising and falling stretches, short-reach disorder inside them. Models a periodic signal on "
+      "a trend, such as the daily load of a growing service." },
+    { "reach_mirror", "short-reach disorder, delivered back to front",
+      "a[i] = i + noise uniform in ±60, then the whole array reversed: every element is within about 120 positions of its "
+      "place, but the array runs from high to low. Models a newest-first log whose records arrived slightly out of order; a "
+      "sort that reads order in one direction only sees chaos." },
+    { "strings: uuids", "random UUIDs: all distinct, all 36 characters",
+      "UUID-formatted strings, 32 random hex digits in groups of 8-4-4-4-12. Every string is distinct, all have the same "
+      "length and the first bytes are already random, so the first 8 bytes nearly settle the order: the easy case for a "
+      "sort on prefixes." },
+    { "strings: words", "pseudo-words, heavily repeated",
+      "Pronounceable pseudo-words of 2 to 14 letters from a vocabulary of 60,000, drawn with a heavy head: a few words make "
+      "up a large share of the array and most appear rarely. Models tokens from text. Many strings are identical, and a sort "
+      "can only find that out by reading them to the end." },
+    { "strings: urls", "URLs sharing a long common prefix",
+      "https://www.<site><tld>/<1 to 4 path segments>, half of them with ?id=N. Every string begins with the same 12 bytes, so "
+      "the first 8 bytes say nothing and a sort on prefixes must look deeper; sites and paths repeat with a heavy head. "
+      "Models crawl lists and access logs keyed by URL." },
+    { "strings: logs", "timestamped log lines, nearly in time order",
+      "Lines of the form 2026-10-09T14:03:27.512Z host-07 [INFO] word word. Time advances about 1 ms per line, and 5% of the "
+      "lines carry a timestamp up to 500 ms older than their neighbours' (late arrivals), so the array is nearly sorted "
+      "behind a long shared prefix, the date. Models a server log written from a buffer." },
+};
+static std::string jstr(const char *s) {          /* a JSON string that is also safe inside a <script> element */
+    std::string o = "\"";
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { o += '\\'; o += (char)*p; }
+        else if (*p < 0x20 || *p == '<' || *p == '>' || *p == '&') { char t[8]; snprintf(t, sizeof t, "\\u%04x", *p); o += t; }
+        else o += (char)*p;
+    }
+    return o + "\"";
+}
+static std::string jnums(const std::vector<double> &v, const char *fmt) {
+    std::string o = "["; char t[40];
+    for (size_t i = 0; i < v.size(); i++) { snprintf(t, sizeof t, fmt, v[i]); if (i) o += ','; o += t; }
+    return o + "]";
+}
+static std::string shape_demos_json() {
+    const size_t N = DEMO_N, NONE = (size_t)-1, blk = (N + 63) / 64;
+    std::string o = "[";
+    for (const ShapeDoc &d : SHAPE_DOCS) {
+        const bool is_str = !strncmp(d.shape, "strings: ", 9);
+        std::vector<double> ov(DEMO_OV), win; std::vector<size_t> hl; size_t c = NONE; char t[400];
+        std::string stats, text;
+        if (!is_str) {
+            const std::string sh = d.shape;
+            std::vector<double> a = gen(sh, N);
+            size_t inord = 0; bool ints = true;
+            for (size_t i = 0; i + 1 < N; i++) inord += a[i] <= a[i + 1];
+            for (double v : a) if (v != std::floor(v)) { ints = false; break; }
+            std::vector<double> s = a; std::sort(s.begin(), s.end());
+            size_t distinct = 1; for (size_t i = 1; i < N; i++) distinct += s[i] != s[i - 1];
+            snprintf(t, sizeof t, "{\"distinct\":%zu,\"min\":%.17g,\"max\":%.17g,\"inorder\":%.8f,\"runs\":%zu,\"ints\":%s}",
+                     distinct, s[0], s[N - 1], (double)inord / (double)(N - 1), N - inord, ints ? "true" : "false");
+            stats = t;
+            /* the feature: where the shape is most itself, so the window shows it */
+            if (sh == "near_sorted") { for (size_t i = 0; i < N; i++) if (a[i] != (double)i) { c = i; break; } if (c != NONE) hl = { c }; }
+            else if (sh == "block_perm" || sh == "block_overlap" || sh == "block_twist") { c = blk; hl = { blk - 1, blk }; }
+            else if (sh == "block_kinked") { for (size_t i = 0; i + 1 < N; i++) if (a[i] > a[i + 1] && (i + 1) % blk) { c = i; hl = { i, i + 1 }; break; } }
+            else if (sh == "sine_slope") c = N / 64;          /* half a cycle in: the wave's steepest fall */
+            else if (sh == "reach_mirror") c = N / 2;
+            for (size_t k = 0; k < DEMO_OV; k++) ov[k] = a[k * N / DEMO_OV];
+            size_t w0 = c == NONE ? 0 : c >= DEMO_W / 2 ? c - DEMO_W / 2 : 0; if (w0 + DEMO_W > N) w0 = N - DEMO_W;
+            win.assign(a.begin() + (std::ptrdiff_t)w0, a.begin() + (std::ptrdiff_t)(w0 + DEMO_W));
+            size_t t0 = c == NONE ? w0 : std::max(w0, c >= DEMO_T / 2 ? c - DEMO_T / 2 : 0); if (t0 + DEMO_T > w0 + DEMO_W) t0 = w0 + DEMO_W - DEMO_T;
+            snprintf(t, sizeof t, ",\"w0\":%zu,\"t0\":%zu,\"tn\":%zu", w0, t0, DEMO_T); text = t;
+        } else {
+            StrSet S = gen_strings(d.shape + 9, N);
+            const std::vector<const char *> &p = S.p;
+            size_t inord = 0, lmin = (size_t)-1, lmax = 0; double lsum = 0;
+            for (size_t i = 0; i + 1 < N; i++) inord += strcmp(p[i], p[i + 1]) <= 0;
+            for (const char *x : p) { size_t L = strlen(x); lmin = std::min(lmin, L); lmax = std::max(lmax, L); lsum += (double)L; }
+            std::vector<const char *> s = p; std::sort(s.begin(), s.end(), str_less);
+            size_t distinct = 1; for (size_t i = 1; i < N; i++) distinct += strcmp(s[i], s[i - 1]) != 0;
+            snprintf(t, sizeof t, "{\"distinct\":%zu,\"minLen\":%zu,\"maxLen\":%zu,\"meanLen\":%.2f,\"inorder\":%.8f,\"runs\":%zu}",
+                     distinct, lmin, lmax, lsum / (double)N, (double)inord / (double)(N - 1), N - inord);
+            stats = t;
+            if (!strcmp(d.shape + 9, "logs")) for (size_t i = 0; i + 1 < N; i++) if (strcmp(p[i], p[i + 1]) > 0) { c = i + 1; hl = { c }; break; }
+            auto rank = [&](const char *x) { return (double)(std::lower_bound(s.begin(), s.end(), x, str_less) - s.begin()); };
+            for (size_t k = 0; k < DEMO_OV; k++) ov[k] = rank(p[k * N / DEMO_OV]);
+            size_t w0 = c == NONE ? 0 : c >= DEMO_W / 2 ? c - DEMO_W / 2 : 0; if (w0 + DEMO_W > N) w0 = N - DEMO_W;
+            for (size_t i = w0; i < w0 + DEMO_W; i++) win.push_back(rank(p[i]));
+            size_t t0 = c == NONE ? w0 : std::max(w0, c >= DEMO_TS / 2 ? c - DEMO_TS / 2 : 0); if (t0 + DEMO_TS > w0 + DEMO_W) t0 = w0 + DEMO_W - DEMO_TS;
+            snprintf(t, sizeof t, ",\"w0\":%zu,\"t0\":%zu,\"tn\":%zu,\"lines\":[", w0, t0, DEMO_TS); text = t;
+            for (size_t i = t0; i < t0 + DEMO_TS; i++) { if (i > t0) text += ','; text += jstr(p[i]); }
+            text += "]";
+        }
+        if (o.size() > 1) o += ",";
+        o += "{\"shape\":" + jstr(d.shape) + ",\"kind\":\"" + (is_str ? "str" : "num") + "\",\"brief\":" + jstr(d.brief) + ",\"desc\":" + jstr(d.desc);
+        snprintf(t, sizeof t, ",\"n\":%zu,\"step\":%zu,\"ylog\":%s,\"stats\":", N, N / DEMO_OV, !strcmp(d.shape, "heavy_tail") ? "true" : "false");
+        o += t; o += stats; o += text;
+        o += ",\"ov\":" + jnums(ov, is_str ? "%.0f" : "%.6g") + ",\"win\":" + jnums(win, is_str ? "%.0f" : "%.17g") + ",\"hl\":[";
+        for (size_t k = 0; k < hl.size(); k++) { snprintf(t, sizeof t, "%s%zu", k ? "," : "", hl[k]); o += t; }
+        o += "]}";
+    }
+    return o + "]";
+}
 /* every contender is a callable on (pointer, length), so one list serves a single large array and a batch of small ones */
-template <class F> static double best_of(const std::vector<double> &base, int reps, F f, std::vector<double> &out, double budget_ms) {
+/* equal outputs: doubles bit for bit as before; strings as strings (identical strings may come back in any pointer order) */
+static bool same(const std::vector<double> &a, const std::vector<double> &b) { return a == b; }
+static bool same(const std::vector<const char *> &a, const std::vector<const char *> &b) { return str_same(a, b); }
+template <class T, class F> static double best_of(const std::vector<T> &base, int reps, F f, std::vector<T> &out, double budget_ms) {
     double b = 1e300;
-    for (int i = 0; i < reps; i++) { std::vector<double> a = base; double t = nowms(); f(a.data(), a.size()); double ms = nowms() - t; if (ms < b) { b = ms; out.swap(a); } if (ms > budget_ms) break; }
+    for (int i = 0; i < reps; i++) { std::vector<T> a = base; double t = nowms(); f(a.data(), a.size()); double ms = nowms() - t; if (ms < b) { b = ms; out.swap(a); } if (ms > budget_ms) break; }
     return b;
 }
 /* ---- small sizes ----------------------------------------------------------------------------------------------
@@ -95,7 +267,8 @@ template <class F> static double best_of(const std::vector<double> &base, int re
  * inlines to nothing on an empty range measures zero; it is floored at 0.01 ns so that "measured" and "absent"
  * (0 in the report's data) stay distinguishable. */
 #define SMALL_N 10000
-struct Small { size_t n = 0, ni = 0; std::vector<double> pristine, work, ref; };
+template <class T> struct SmallT { size_t n = 0, ni = 0; std::vector<T> pristine, work, ref; std::vector<StrSet> pools; };   /* pools: the strings' storage */
+typedef SmallT<double> Small;
 static Small make_small(const std::string &shape, size_t n) {
     Small s; s.n = n; s.ni = n == 0 ? 4096 : std::min<size_t>(4096, std::max<size_t>(16, 262144 / n));
     s.pristine.assign(s.ni * n + 1, 0.0);                                   /* + 1: data() is never null, even for n = 0 */
@@ -105,11 +278,21 @@ static Small make_small(const std::string &shape, size_t n) {
     s.work = s.pristine;
     return s;
 }
-template <class F> static double best_small(Small &s, F f, bool &ok, double budget_ms) {
+/* the string twin of make_small: ni instances of n strings, each with its own pool, pointers end to end */
+static SmallT<const char *> make_small_str(const char *shape, size_t n) {
+    SmallT<const char *> s; s.n = n; s.ni = n == 0 ? 4096 : std::min<size_t>(4096, std::max<size_t>(16, 262144 / n));
+    s.pristine.assign(s.ni * n + 1, nullptr); s.pools.reserve(s.ni);
+    for (size_t k = 0; k < s.ni; k++) { s.pools.push_back(gen_strings(shape, n, 7 + k)); std::copy(s.pools.back().p.begin(), s.pools.back().p.end(), s.pristine.begin() + (std::ptrdiff_t)(k * n)); }
+    s.ref = s.pristine;
+    for (size_t k = 0; k < s.ni; k++) std::sort(s.ref.begin() + (std::ptrdiff_t)(k * n), s.ref.begin() + (std::ptrdiff_t)((k + 1) * n), str_less);
+    s.work = s.pristine;
+    return s;
+}
+template <class T, class F> static double best_small(SmallT<T> &s, F f, bool &ok, double budget_ms) {
     double best = 1e300, acc = 0;
     for (int batch = 0; batch < 25; batch++) {
         std::copy(s.pristine.begin(), s.pristine.end(), s.work.begin());
-        double *w = s.work.data(); const size_t n = s.n, ni = s.ni;
+        T *w = s.work.data(); const size_t n = s.n, ni = s.ni;
         double t = nowms();
         for (size_t k = 0; k < ni; k++) f(w + k * n, n);
         double ms = nowms() - t;
@@ -117,7 +300,7 @@ template <class F> static double best_small(Small &s, F f, bool &ok, double budg
         acc += ms;
         if ((batch >= 4 && acc > 120.0) || ms > budget_ms) break;
     }
-    ok &= (s.work == s.ref);
+    if (s.ni * s.n) { std::vector<T> a(s.work.begin(), s.work.begin() + (std::ptrdiff_t)(s.ni * s.n)), b(s.ref.begin(), s.ref.begin() + (std::ptrdiff_t)(s.ni * s.n)); ok &= same(a, b); }
     double per = best / (double)s.ni;
     return per > 1e-8 ? per : 1e-8;
 }
@@ -170,8 +353,8 @@ void free(void *p) { sm_sub(p); __libc_free(p); }
 }
 /* one cold call, traced: bytes per element. The work array is filled BEFORE arming so it is not counted, and
    the engine's pools are released first, since a warm call allocates nothing and would read zero. */
-template <class F>
-static double mem_of(std::vector<double> &work, const std::vector<double> &base, F f, bool is_logos) {
+template <class T, class F>
+static double mem_of(std::vector<T> &work, const std::vector<T> &base, F f, bool is_logos) {
     std::copy(base.begin(), base.end(), work.begin());
     if (is_logos) logos_release_buffers();
     sm_live.store(0); sm_peak.store(0); sm_active.store(1);
@@ -180,12 +363,14 @@ static double mem_of(std::vector<double> &work, const std::vector<double> &base,
     return (double)sm_peak.load() / (double)work.size();
 }
 
-struct Row { size_t n; double t[7]; double m[7]; bool ok; };       /* t: [0]=std::sort or gnu_par, [1]=logos, [2]=xss, [3]=ips4o, [4]=LSD radix, [5]=timsort, [6]=logos in-place (4-6: 1T only); 0 = absent */
+#define NC 8                                                        /* contenders per row */
+struct Row { size_t n; double t[NC]; double m[NC]; bool ok; };     /* t: [0]=std::sort or gnu_par, [1]=logos, [2]=xss, [3]=ips4o, [4]=LSD radix, [5]=timsort, [6]=logos in-place, [7]=VQSort (4, 5, 7: 1T only); 0 = absent */
 /* seam[k]: n = seam_n (SMALL_N) measured the SMALL way -- a batch of distinct instances -- beside the row that
    measured the same n the big way. seam[k] / row.t[k] is the measurement-mode step, at the one size where BOTH
    modes resolve. It is not a universal correction: where it comes out near 1 and the chart still has a cliff, the
    cliff belongs to the data and not to the harness, which is exactly what it is there to let a reader tell apart. */
-struct Series { std::string shape; int threads; std::vector<Row> rows; double seam[7] = {0,0,0,0,0,0,0}; size_t seam_n = 0; };
+struct Series { std::string shape; int threads; std::vector<Row> rows; double seam[NC] = {}; size_t seam_n = 0;
+                std::vector<std::string> names; std::string note; const char *str = nullptr; };   /* str: a string shape (names/note: its own) */
 
 int main() {
     int P = bench_threads(logos_num_cpus());   /* bench_common.h: LOGOS_THREADS, else BENCH_THREADS, else physical cores */
@@ -222,9 +407,17 @@ int main() {
     if (reuse) {
         FILE *rf = fopen(reuse, "rb"); if (!rf) { fprintf(stderr, "cannot open %s\n", reuse); return 1; }
         std::string s; char rb[65536]; size_t got; while ((got = fread(rb, 1, sizeof rb, rf)) > 0) s.append(rb, got); fclose(rf);
+        s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());   /* a checkout on Windows may have written CRLF; the block ends in a semicolon and a bare newline */
         size_t a = s.find("const DATA="), b = a == std::string::npos ? a : s.find(",META=", a), c = b == std::string::npos ? b : s.find(";\n", b);
         if (c == std::string::npos) { fprintf(stderr, "%s: no DATA/META block found\n", reuse); return 1; }
         j = s.substr(a + 11, b - (a + 11)); meta_s = s.substr(b + 6, c - (b + 6));
+        /* WHEN it was measured travels with the data. A report older than the field gets the modification time of the
+           file it is read from, which is when that run wrote it (or when it was last copied: the best there is). */
+        if (meta_s.find("\"measuredAt\"") == std::string::npos) {
+            struct stat sb; double at = stat(reuse, &sb) == 0 ? (double)sb.st_mtime * 1000.0 : 0.0;
+            size_t e = meta_s.rfind('}');
+            if (e != std::string::npos && at > 0) { char t[64]; snprintf(t, sizeof t, ",\"measuredAt\":%.0f", at); meta_s.insert(e, t); }
+        }
         printf("re-rendering the measurements in %s through the current template; nothing is measured\n", reuse);
     } else {
     /* calibration */
@@ -250,12 +443,12 @@ int main() {
             auto T = [&](auto f, bool &ok, bool is_ref) -> double {
                 if (small) return best_small(sm, f, ok, budget);
                 double t = best_of(base, reps, f, o, budget);
-                if (is_ref) ref.swap(o); else ok &= (o == ref);
+                if (is_ref) ref.swap(o); else ok &= same(o, ref);
                 return t;
             };
             /* ---- single-threaded ---- */
             omp_set_num_threads(1);
-            Row r1{n, {0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0}, true};
+            Row r1{n, {}, {}, true};
             r1.t[0] = T([](double *p, size_t m) { std::sort(p, p + m); }, r1.ok, true);
             r1.t[1] = T([](double *p, size_t m) { logos_sort_f64(p, m, 1); }, r1.ok, false);
 #ifdef HAVE_XSS
@@ -269,10 +462,13 @@ int main() {
             /* the strict in-place entry: no scratch at all (make memprobe: 0 bytes of heap) against 15-23 bytes per element
                for the buffered sort. An outside review's headline comparison; here it is one more line on the same axes. */
             r1.t[6] = T([](double *p, size_t m) { logos_sort_f64_inplace(p, m, 1); }, r1.ok, false);
+#ifdef HAVE_VQSORT
+            r1.t[7] = T([](double *p, size_t m) { hwy::VQSort(p, m, hwy::SortAscending()); }, r1.ok, false);
+#endif
             s1.rows.push_back(r1);
             /* ---- P threads ---- */
             omp_set_num_threads(P);
-            Row rp{n, {0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0}, true};
+            Row rp{n, {}, {}, true};
             rp.t[0] = T([](double *p, size_t m) { __gnu_parallel::sort(p, p + m); }, rp.ok, false);
             rp.t[1] = T([P](double *p, size_t m) { logos_sort_f64(p, m, P); }, rp.ok, false);
             rp.t[6] = T([P](double *p, size_t m) { logos_sort_f64_inplace(p, m, P); }, rp.ok, false);   /* parallel from 2026-09-20: placement passes as tasks */
@@ -280,20 +476,92 @@ int main() {
             rp.t[2] = T([](double *p, size_t m) { x86simdsortStatic::qsort(p, m, false, false); }, rp.ok, false);
 #endif
 #ifdef HAVE_IPS4O
-            rp.t[3] = T([](double *p, size_t m) { ips4o::parallel::sort(p, p + m); }, rp.ok, false);
+            rp.t[3] = T([P](double *p, size_t m) { ips4o::parallel::sort(p, p + m, std::less<double>(), P); }, rp.ok, false);   /* P threads, like every P-thread contender (the default is all hardware threads) */
 #endif
             sp.rows.push_back(rp);
             if (!r1.ok || !rp.ok) bad++;
             /* Nanoseconds per sort throughout; then nanoseconds PER ELEMENT for logos, the only column that may be
                compared down the page -- and the one that shows there is no cliff where the units used to imply one. */
-            printf("  %-13s n=%-9zu 1T ns: std %14s logos %14s inplace %14s xss %14s ips4o %14s radix %14s tim %14s | %dT ns: gnu_par %14s logos %14s inplace %14s xss %14s ips4o %14s | logos ns/elem 1T %8.2f %dT %8.2f%s\n",
+            printf("  %-13s n=%-9zu 1T ns: std %14s logos %14s inplace %14s xss %14s vqsort %14s ips4o %14s radix %14s tim %14s | %dT ns: gnu_par %14s logos %14s inplace %14s xss %14s ips4o %14s | logos ns/elem 1T %8.2f %dT %8.2f%s\n",
                    sh, n,
-                   fmt_ns(r1.t[0]), fmt_ns(r1.t[1]), fmt_ns(r1.t[6]), fmt_ns(r1.t[2]), fmt_ns(r1.t[3]), fmt_ns(r1.t[4]), fmt_ns(r1.t[5]),
+                   fmt_ns(r1.t[0]), fmt_ns(r1.t[1]), fmt_ns(r1.t[6]), fmt_ns(r1.t[2]), fmt_ns(r1.t[7]), fmt_ns(r1.t[3]), fmt_ns(r1.t[4]), fmt_ns(r1.t[5]),
                    P, fmt_ns(rp.t[0]), fmt_ns(rp.t[1]), fmt_ns(rp.t[6]), fmt_ns(rp.t[2]), fmt_ns(rp.t[3]),
                    n ? r1.t[1] * 1e6 / (double)n : 0.0, P, n ? rp.t[1] * 1e6 / (double)n : 0.0,
                    (r1.ok && rp.ok) ? "" : "  <-- MISMATCH");
             fflush(stdout);
             if (r1.t[0] > budget * 0.5) over = true;        /* the slowest contender is at half the budget: stop this shape here */
+        }
+        all.push_back(s1); all.push_back(sp);
+    }
+
+    /* ---- strings (2026-10-11): pointers to NUL-terminated strings in strcmp order, the four shapes that span the cases --
+       high-entropy keys (uuids), short keys with heavy duplicates (words), long shared prefixes (urls), nearly in order (logs).
+       Same ladder, same batching below SMALL_N, same verification (std::sort's output, compared as STRINGS). The columns keep
+       their colours and take their names from the series: x86-simd-sort cannot sort strings, so its column is its key-value
+       sort under the same 8-byte-prefix scheme logos uses (bench_strings.h); the radix column is the multikey quicksort
+       logos_sort_strings was until 2026-10-09; timsort and the in-place entry have no string form. LOGOS_SCALE_STRINGS=0 skips. */
+    static const char *sshapes[] = { "uuids", "words", "urls", "logs" };
+    const bool do_str = !getenv("LOGOS_SCALE_STRINGS") || atoi(getenv("LOGOS_SCALE_STRINGS")) != 0;
+    for (const char *ssh : sshapes) {
+        if (!do_str) break;
+        Series s1{std::string("strings: ") + ssh, 1, {}}, sp{std::string("strings: ") + ssh, P, {}};
+        s1.str = sp.str = ssh;
+        s1.names = { "std::sort (strcmp)", "logos", std::string("x86-simd-sort ") + xss_isa + " key-value, on 8-byte prefixes", "IPS\\u2074o (strcmp)", "multikey quicksort (logos before 2026-10-09)", "", "", "VQSort (Google) key-value, on 8-byte prefixes" };
+        sp.names = { "__gnu_parallel::sort (strcmp)", "logos", std::string("x86-simd-sort ") + xss_isa + " key-value, on 8-byte prefixes (OpenMP)", "IPS\\u2074o (strcmp)", "", "", "", "" };
+        s1.note = sp.note = "Strings: an array of pointers to NUL-terminated strings, sorted in strcmp order (unsigned bytes, a string before its extensions). "
+                            "logos is logos_sort_strings_mt: each string's next 8 bytes become one 64-bit key, the keys are sorted as numbers, and only groups of equal keys go 8 bytes deeper. "
+                            "x86-simd-sort and Google's VQSort cannot sort strings; their lines are their key-value sorts driven by the SAME prefix scheme, so they compare the kernels under one method "
+                            "(VQSort takes 16-byte records, so its line also pays one pack and one unpack per call; it has no parallel form and appears at one thread only). "
+                            "std::sort, __gnu_parallel::sort and IPS\\u2074o compare with strcmp. Every output is checked against std::sort's as strings. FINDINGS 3bl.";
+        bool over = false;
+        for (size_t n : sizes) {
+            if (over) break;
+            const bool small = n < SMALL_N;
+            SmallT<const char *> sm; StrSet S; std::vector<const char *> base;
+            if (small) sm = make_small_str(ssh, n); else { S = gen_strings(ssh, n); base = S.p; }
+            int reps = n <= 1000000 ? 5 : n <= 10000000 ? 3 : 1; double budget = max_sec * 1e3;
+            std::vector<const char *> ref, o;
+            auto T = [&](auto f, bool &ok, bool is_ref) -> double {
+                if (small) return best_small(sm, f, ok, budget);
+                double t = best_of(base, reps, f, o, budget);
+                if (is_ref) ref.swap(o); else ok &= same(o, ref);
+                return t;
+            };
+            omp_set_num_threads(1);
+            Row r1{n, {}, {}, true};
+            r1.t[0] = T([](const char **p, size_t m) { std::sort(p, p + m, str_less); }, r1.ok, true);
+            r1.t[1] = T([](const char **p, size_t m) { logos_sort_strings_mt(p, m, 1); }, r1.ok, false);
+#ifdef HAVE_XSS
+            r1.t[2] = T([](const char **p, size_t m) { prefix_xss_sort(p, m, false); }, r1.ok, false);
+#endif
+#ifdef HAVE_IPS4O
+            r1.t[3] = T([](const char **p, size_t m) { ips4o::sort(p, p + m, str_less); }, r1.ok, false);
+#endif
+            r1.t[4] = T([](const char **p, size_t m) { if (m > 1) bs_mkqs(p, 0, (long)m - 1, 0); }, r1.ok, false);
+#ifdef HAVE_VQSORT
+            r1.t[7] = T([](const char **p, size_t m) { prefix_vq_sort(p, m); }, r1.ok, false);
+#endif
+            s1.rows.push_back(r1);
+            omp_set_num_threads(P);
+            Row rp{n, {}, {}, true};
+            rp.t[0] = T([](const char **p, size_t m) { __gnu_parallel::sort(p, p + m, str_less); }, rp.ok, false);
+            rp.t[1] = T([P](const char **p, size_t m) { logos_sort_strings_mt(p, m, P); }, rp.ok, false);
+#ifdef HAVE_XSS
+            rp.t[2] = T([](const char **p, size_t m) { prefix_xss_sort(p, m, true); }, rp.ok, false);
+#endif
+#ifdef HAVE_IPS4O
+            rp.t[3] = T([P](const char **p, size_t m) { ips4o::parallel::sort(p, p + m, str_less, P); }, rp.ok, false);
+#endif
+            sp.rows.push_back(rp);
+            if (!r1.ok || !rp.ok) bad++;
+            printf("  %-15s n=%-9zu 1T ns: std %14s logos %14s xss-prefix %14s vq-prefix %14s ips4o %14s mkqs %14s | %dT ns: gnu_par %14s logos %14s xss-prefix %14s ips4o %14s | logos ns/string 1T %8.2f %dT %8.2f%s\n",
+                   s1.shape.c_str(), n,
+                   fmt_ns(r1.t[0]), fmt_ns(r1.t[1]), fmt_ns(r1.t[2]), fmt_ns(r1.t[7]), fmt_ns(r1.t[3]), fmt_ns(r1.t[4]),
+                   P, fmt_ns(rp.t[0]), fmt_ns(rp.t[1]), fmt_ns(rp.t[2]), fmt_ns(rp.t[3]),
+                   n ? r1.t[1] * 1e6 / (double)n : 0.0, P, n ? rp.t[1] * 1e6 / (double)n : 0.0,
+                   (r1.ok && rp.ok) ? "" : "  <-- MISMATCH");
+            fflush(stdout);
+            if (r1.t[0] > budget * 0.5) over = true;
         }
         all.push_back(s1); all.push_back(sp);
     }
@@ -320,9 +588,34 @@ int main() {
             if (!at) continue;
             s.seam_n = at->n;
             omp_set_num_threads(s.threads);
-            Small sm = make_small(s.shape, (size_t)SMALL_N);
             bool ok = true; const double budget = max_sec * 1e3;
             const int P2 = s.threads;
+            if (s.str) {                                     /* a string series: its own contenders, batched the same way */
+                SmallT<const char *> ss = make_small_str(s.str, (size_t)SMALL_N);
+                if (at->t[0] > 0) s.seam[0] = P2 == 1
+                    ? best_small(ss, [](const char **p, size_t m) { std::sort(p, p + m, str_less); }, ok, budget)
+                    : best_small(ss, [](const char **p, size_t m) { __gnu_parallel::sort(p, p + m, str_less); }, ok, budget);
+                if (at->t[1] > 0) s.seam[1] = best_small(ss, [P2](const char **p, size_t m) { logos_sort_strings_mt(p, m, P2); }, ok, budget);
+#ifdef HAVE_XSS
+                if (at->t[2] > 0) s.seam[2] = best_small(ss, [P2](const char **p, size_t m) { prefix_xss_sort(p, m, P2 > 1); }, ok, budget);
+#endif
+#ifdef HAVE_IPS4O
+                if (at->t[3] > 0) s.seam[3] = best_small(ss, [P2](const char **p, size_t m) { if (P2 == 1) ips4o::sort(p, p + m, str_less); else ips4o::parallel::sort(p, p + m, str_less, P2); }, ok, budget);
+#endif
+                if (at->t[4] > 0) s.seam[4] = best_small(ss, [](const char **p, size_t m) { if (m > 1) bs_mkqs(p, 0, (long)m - 1, 0); }, ok, budget);
+#ifdef HAVE_VQSORT
+                if (at->t[7] > 0) s.seam[7] = best_small(ss, [](const char **p, size_t m) { prefix_vq_sort(p, m); }, ok, budget);
+#endif
+                if (!ok) { printf("  seam %s %dT: MISMATCH\n", s.shape.c_str(), s.threads); bad++; }
+                printf("  seam %-15s %2dT n=%-6zu batch/single  std %.2fx logos %.2fx xss-prefix %.2fx vq-prefix %.2fx ips4o %.2fx mkqs %.2fx\n",
+                       s.shape.c_str(), s.threads, at->n,
+                       at->t[0] > 0 ? s.seam[0] / at->t[0] : 0.0, at->t[1] > 0 ? s.seam[1] / at->t[1] : 0.0,
+                       at->t[2] > 0 ? s.seam[2] / at->t[2] : 0.0, at->t[7] > 0 ? s.seam[7] / at->t[7] : 0.0,
+                       at->t[3] > 0 ? s.seam[3] / at->t[3] : 0.0, at->t[4] > 0 ? s.seam[4] / at->t[4] : 0.0);
+                fflush(stdout);
+                continue;
+            }
+            Small sm = make_small(s.shape, (size_t)SMALL_N);
             if (at->t[0] > 0) s.seam[0] = P2 == 1
                 ? best_small(sm, [](double *p, size_t m) { std::sort(p, p + m); }, ok, budget)
                 : best_small(sm, [](double *p, size_t m) { __gnu_parallel::sort(p, p + m); }, ok, budget);
@@ -331,16 +624,19 @@ int main() {
             if (at->t[2] > 0) s.seam[2] = best_small(sm, [](double *p, size_t m) { x86simdsortStatic::qsort(p, m, false, false); }, ok, budget);
 #endif
 #ifdef HAVE_IPS4O
-            if (at->t[3] > 0) s.seam[3] = best_small(sm, [P2](double *p, size_t m) { if (P2 == 1) ips4o::sort(p, p + m); else ips4o::parallel::sort(p, p + m); }, ok, budget);
+            if (at->t[3] > 0) s.seam[3] = best_small(sm, [P2](double *p, size_t m) { if (P2 == 1) ips4o::sort(p, p + m); else ips4o::parallel::sort(p, p + m, std::less<double>(), P2); }, ok, budget);
 #endif
             if (at->t[4] > 0) s.seam[4] = best_small(sm, [](double *p, size_t m) { radix_sort_f64(p, m); }, ok, budget);
             if (at->t[5] > 0) s.seam[5] = best_small(sm, [](double *p, size_t m) { timsort_f64(p, m); }, ok, budget);
             if (at->t[6] > 0) s.seam[6] = best_small(sm, [P2](double *p, size_t m) { logos_sort_f64_inplace(p, m, P2); }, ok, budget);
+#ifdef HAVE_VQSORT
+            if (at->t[7] > 0) s.seam[7] = best_small(sm, [](double *p, size_t m) { hwy::VQSort(p, m, hwy::SortAscending()); }, ok, budget);
+#endif
             if (!ok) { printf("  seam %s %dT: MISMATCH\n", s.shape.c_str(), s.threads); bad++; }
-            printf("  seam %-13s %2dT n=%-6zu batch/single  std %.2fx logos %.2fx xss %.2fx ips4o %.2fx radix %.2fx tim %.2fx inplace %.2fx\n",
+            printf("  seam %-13s %2dT n=%-6zu batch/single  std %.2fx logos %.2fx xss %.2fx vqsort %.2fx ips4o %.2fx radix %.2fx tim %.2fx inplace %.2fx\n",
                    s.shape.c_str(), s.threads, at->n,
                    at->t[0] > 0 ? s.seam[0] / at->t[0] : 0.0, at->t[1] > 0 ? s.seam[1] / at->t[1] : 0.0,
-                   at->t[2] > 0 ? s.seam[2] / at->t[2] : 0.0, at->t[3] > 0 ? s.seam[3] / at->t[3] : 0.0,
+                   at->t[2] > 0 ? s.seam[2] / at->t[2] : 0.0, at->t[7] > 0 ? s.seam[7] / at->t[7] : 0.0, at->t[3] > 0 ? s.seam[3] / at->t[3] : 0.0,
                    at->t[4] > 0 ? s.seam[4] / at->t[4] : 0.0, at->t[5] > 0 ? s.seam[5] / at->t[5] : 0.0,
                    at->t[6] > 0 ? s.seam[6] / at->t[6] : 0.0);
             fflush(stdout);
@@ -361,8 +657,26 @@ int main() {
             for (size_t ri = 0; ri < s.rows.size(); ri++) {
                 Row &r = s.rows[ri];
                 if (r.n < (size_t)SMALL_N) continue;
-                std::vector<double> base = gen(s.shape, r.n), work(r.n);
                 const int P2 = s.threads;
+                if (s.str) {                                 /* bytes per STRING: the pointer array is filled before arming, the pool too */
+                    StrSet S = gen_strings(s.str, r.n); std::vector<const char *> sw(r.n);
+                    if (r.t[0] > 0) r.m[0] = s.threads == 1
+                        ? mem_of(sw, S.p, [](const char **q, size_t m) { std::sort(q, q + m, str_less); }, false)
+                        : mem_of(sw, S.p, [](const char **q, size_t m) { __gnu_parallel::sort(q, q + m, str_less); }, false);
+                    if (r.t[1] > 0) r.m[1] = mem_of(sw, S.p, [P2](const char **q, size_t m) { logos_sort_strings_mt(q, m, P2); }, true);
+#ifdef HAVE_XSS
+                    if (r.t[2] > 0) r.m[2] = mem_of(sw, S.p, [P2](const char **q, size_t m) { prefix_xss_sort(q, m, P2 > 1); }, false);
+#endif
+#ifdef HAVE_IPS4O
+                    if (r.t[3] > 0) r.m[3] = mem_of(sw, S.p, [P2](const char **q, size_t m) { if (P2 == 1) ips4o::sort(q, q + m, str_less); else ips4o::parallel::sort(q, q + m, str_less, P2); }, false);
+#endif
+                    if (r.t[4] > 0) r.m[4] = mem_of(sw, S.p, [](const char **q, size_t m) { if (m > 1) bs_mkqs(q, 0, (long)m - 1, 0); }, false);
+#ifdef HAVE_VQSORT
+                    if (r.t[7] > 0) r.m[7] = mem_of(sw, S.p, [](const char **q, size_t m) { prefix_vq_sort(q, m); }, false);
+#endif
+                    continue;
+                }
+                std::vector<double> base = gen(s.shape, r.n), work(r.n);
                 if (r.t[0] > 0) r.m[0] = s.threads == 1
                     ? mem_of(work, base, [](double *q, size_t m) { std::sort(q, q + m); }, false)
                     : mem_of(work, base, [](double *q, size_t m) { __gnu_parallel::sort(q, q + m); }, false);
@@ -371,11 +685,14 @@ int main() {
                 if (r.t[2] > 0) r.m[2] = mem_of(work, base, [](double *q, size_t m) { x86simdsortStatic::qsort(q, m, false, false); }, false);
 #endif
 #ifdef HAVE_IPS4O
-                if (r.t[3] > 0) r.m[3] = mem_of(work, base, [](double *q, size_t m) { ips4o::sort(q, q + m); }, false);
+                if (r.t[3] > 0) r.m[3] = mem_of(work, base, [P2](double *q, size_t m) { if (P2 == 1) ips4o::sort(q, q + m); else ips4o::parallel::sort(q, q + m, std::less<double>(), P2); }, false);
 #endif
                 if (r.t[4] > 0) r.m[4] = mem_of(work, base, [](double *q, size_t m) { radix_sort_f64(q, m); }, false);
                 if (r.t[5] > 0) r.m[5] = mem_of(work, base, [](double *q, size_t m) { timsort_f64(q, m); }, false);
                 if (r.t[6] > 0) r.m[6] = mem_of(work, base, [P2](double *q, size_t m) { logos_sort_f64_inplace(q, m, P2); }, true);
+#ifdef HAVE_VQSORT
+                if (r.t[7] > 0) r.m[7] = mem_of(work, base, [](double *q, size_t m) { hwy::VQSort(q, m, hwy::SortAscending()); }, false);
+#endif
             }
         }
         omp_set_num_threads(P);
@@ -383,43 +700,75 @@ int main() {
     }
 
     /* ---- JSON ---- */
+    auto arr = [](const double *v) { std::string o = "["; for (int k = 0; k < NC; k++) { if (k) o += ","; o += jnum(v[k]); } return o + "]"; };
     j = "[";
     for (size_t si = 0; si < all.size(); si++) {
         const Series &s = all[si]; j += (si ? ",{" : "{"); j += "\"shape\":\"" + s.shape + "\",\"threads\":" + std::to_string(s.threads);
         j += ",\"seamN\":" + std::to_string(s.seam_n);
-        j += ",\"seam\":[" + jnum(s.seam[0]) + "," + jnum(s.seam[1]) + "," + jnum(s.seam[2]) + "," + jnum(s.seam[3]) + "," + jnum(s.seam[4]) + "," + jnum(s.seam[5]) + "," + jnum(s.seam[6]) + "]";
+        if (!s.names.empty()) { j += ",\"names\":["; for (size_t k = 0; k < s.names.size(); k++) j += std::string(k ? "," : "") + "\"" + s.names[k] + "\""; j += "]"; }
+        if (!s.note.empty()) j += ",\"note\":\"" + s.note + "\"";
+        j += ",\"seam\":" + arr(s.seam);
         j += ",\"rows\":[";
-        for (size_t ri = 0; ri < s.rows.size(); ri++) { const Row &r = s.rows[ri]; j += (ri ? ",{" : "{"); j += "\"n\":" + std::to_string(r.n) + ",\"t\":[" + jnum(r.t[0]) + "," + jnum(r.t[1]) + "," + jnum(r.t[2]) + "," + jnum(r.t[3]) + "," + jnum(r.t[4]) + "," + jnum(r.t[5]) + "," + jnum(r.t[6]) + "]";
-            j += ",\"m\":[" + jnum(r.m[0]) + "," + jnum(r.m[1]) + "," + jnum(r.m[2]) + "," + jnum(r.m[3]) + "," + jnum(r.m[4]) + "," + jnum(r.m[5]) + "," + jnum(r.m[6]) + "]";
+        for (size_t ri = 0; ri < s.rows.size(); ri++) { const Row &r = s.rows[ri]; j += (ri ? ",{" : "{"); j += "\"n\":" + std::to_string(r.n) + ",\"t\":" + arr(r.t);
+            j += ",\"m\":" + arr(r.m);
             j += std::string(",\"ok\":") + (r.ok ? "true" : "false") + "}"; }
         j += "]}";
     }
     j += "]";
-    char meta[400]; snprintf(meta, sizeof meta, "{\"threads\":%d,\"memcpyMs\":%.3f,\"std1mMs\":%.2f,\"maxN\":%.0f,\"xss\":%s,\"xssIsa\":\"%s\",\"ips4o\":%s,\"ncpus\":%d,\"smallBelow\":%d}", P, memcpy_ms, std1m_ms, max_n,
+    const char *vq_isa =
+#ifdef HAVE_VQSORT
+        hwy::TargetName(hwy::SupportedTargets() & -hwy::SupportedTargets());   /* the instruction set its dispatch picked on this machine */
+#else
+        "";
+#endif
+    char meta[600]; snprintf(meta, sizeof meta, "{\"threads\":%d,\"memcpyMs\":%.3f,\"std1mMs\":%.2f,\"maxN\":%.0f,\"xss\":%s,\"xssIsa\":\"%s\",\"vqsort\":%s,\"vqIsa\":\"%s\",\"ips4o\":%s,\"ncpus\":%d,\"smallBelow\":%d,\"measuredAt\":%.0f}", P, memcpy_ms, std1m_ms, max_n,
 #ifdef HAVE_XSS
              "true",
 #else
              "false",
 #endif
              xss_isa,
+#ifdef HAVE_VQSORT
+             "true",
+#else
+             "false",
+#endif
+             vq_isa,
 #ifdef HAVE_IPS4O
              "true",
 #else
              "false",
 #endif
-             logos_num_cpus(), (int)SMALL_N);
+             logos_num_cpus(), (int)SMALL_N, (double)time(NULL) * 1000.0);
     meta_s = meta;
+    /* WHAT it was measured on, for a reader outside the project: the CPU's model name, the compiler, and the version of each
+       opponent that carries one in its headers. Read at measuring time, so a LOGOS_SCALE_REUSE re-render keeps the original's. */
+    {
+        std::string cpu;
+        if (FILE *ci = fopen("/proc/cpuinfo", "r")) { char ln[512];
+            while (fgets(ln, sizeof ln, ci)) if (!strncmp(ln, "model name", 10)) { const char *c = strchr(ln, ':'); if (c) { cpu = c + 1; while (!cpu.empty() && (cpu[0] == ' ' || cpu[0] == '\t')) cpu.erase(0, 1); while (!cpu.empty() && (cpu.back() == '\n' || cpu.back() == ' ')) cpu.pop_back(); } break; }
+            fclose(ci); }
+        std::string add = ",\"cpu\":" + jstr(cpu.c_str()) + ",\"compiler\":" + jstr("GCC " __VERSION__);
+#ifdef HAVE_VQSORT
+        char v[64]; snprintf(v, sizeof v, "%d.%d.%d", HWY_MAJOR, HWY_MINOR, HWY_PATCH); add += ",\"vqVersion\":" + jstr(v);
+#endif
+        meta_s.insert(meta_s.size() - 1, add);
+    }
     }
 
-    static const char *TMPL = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>logos-sort scaling</title>
+    static const char *TMPL = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>logos-sort Benchmarks</title><meta name="claude:viewport-fit-sides" content="cover">
 <style>
 :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;
---s-logos:#2a78d6;--s-base:#898781;--s-xss:#eb6834;--s-ips:#1baf7a;--s-radix:#eda100;--s-tim:#e87ba4;--s-inpl:#7a5cd6}
+--s-logos:#2a78d6;--s-base:#898781;--s-xss:#eb6834;--s-vq:#1baf7a;--s-ips:#eda100;--s-radix:#e87ba4;--s-tim:#008300;--s-inpl:#6250d6;
+--pos:#2a78d6;--neg:#e34948;--mid:#c3c2b7}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;
---s-logos:#3987e5;--s-base:#898781;--s-xss:#d95926;--s-ips:#199e70;--s-radix:#c98500;--s-tim:#d55181;--s-inpl:#9a82ee}}
+--s-logos:#3987e5;--s-base:#898781;--s-xss:#d95926;--s-vq:#199e70;--s-ips:#c98500;--s-radix:#d55181;--s-tim:#008300;--s-inpl:#9085e9;
+--pos:#3987e5;--neg:#e66767;--mid:#383835}}
 :root[data-theme="dark"]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;
---s-logos:#3987e5;--s-base:#898781;--s-xss:#d95926;--s-ips:#199e70;--s-radix:#c98500;--s-tim:#d55181;--s-inpl:#9a82ee}
-*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding-block:0 3rem;padding-inline:clamp(16px,3vw,32px)}
+--s-logos:#3987e5;--s-base:#898781;--s-xss:#d95926;--s-vq:#199e70;--s-ips:#c98500;--s-radix:#d55181;--s-tim:#008300;--s-inpl:#9085e9;
+--pos:#3987e5;--neg:#e66767;--mid:#383835}
+*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding-block:0 3rem;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:41;background:var(--page)}
 .wrap{max-width:1100px;margin:0 auto}h1{font-size:22px;margin:28px 0 4px}h2{font-size:16px;margin:26px 0 6px}h3{font-size:13px;margin:0 0 4px;color:var(--ink2);font-weight:600}
 .sub{color:var(--ink2);margin:0 0 12px;font-size:13px}.warn{background:var(--surface);border-left:3px solid #fab219;padding:8px 12px;margin:10px 0}
 .legend{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--ink2);margin:6px 0 10px}.sw{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:6px;border-radius:2px}
@@ -446,7 +795,7 @@ __UPLOT_CSS__
 .u-cursor-pt{border-color:var(--surface)}
 .hint{color:var(--muted);font-size:12px;margin:2px 0 0}.cap2{margin-top:14px}
 .sep{display:inline-block;width:1px;height:18px;background:var(--axis);margin:0 4px}
-.bar{position:sticky;top:0;z-index:40;background:var(--page);padding:6px 0 2px;margin:0 0 8px;border-bottom:1px solid var(--grid)}.bar .row{margin:2px 0 4px}
+.bar{position:sticky;top:env(safe-area-inset-top,0px);z-index:40;background:var(--page);padding:6px 0 2px;margin:0 0 8px;border-bottom:1px solid var(--grid)}.bar .row{margin:2px 0 4px}
 select.f{font:inherit;font-size:13px;padding:4px 10px;border:1px solid var(--axis);background:var(--surface);color:var(--ink);border-radius:999px;cursor:pointer;max-width:220px}
 h2{scroll-margin-top:64px}.card.wide{grid-column:1/-1}
 .hd{display:flex;align-items:center;gap:6px;margin:0 0 4px}.hd h3{margin:0;flex:1}
@@ -458,10 +807,90 @@ button.t:hover{color:var(--ink);border-color:var(--ink2)}button.t[aria-pressed="
 .tip{position:absolute;z-index:30;display:none;pointer-events:none;background:var(--surface);color:var(--ink);border:1px solid var(--axis);border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.35;white-space:nowrap;box-shadow:0 3px 12px rgba(0,0,0,.18)}
 .tip table{width:auto;margin-top:2px;font-size:12px;background:none}.tip th,.tip td{border:0;padding:1px 0 1px 12px}.tip th:first-child,.tip td:first-child{padding-left:0}.tip th{font-size:11px}.tip .sw{margin-right:5px}
 .how{margin:0 0 10px;font-size:13px;color:var(--ink2)}.how ul{margin:6px 0 4px;padding-left:20px}.how li{margin:2px 0}.how b{color:var(--ink);font-weight:600}
+.shapes{margin:12px 0 16px;scroll-margin-top:64px}.shapes>summary{font-size:15px;font-weight:600;color:var(--ink);padding:4px 0}
+.shapes>.sub{margin:8px 0 10px}
+.shp{border:1px solid var(--grid);border-radius:8px;background:var(--surface);margin:6px 0;padding:0 12px;scroll-margin-top:64px}
+.shp>summary{padding:8px 0;color:var(--ink);font-size:13px}.shp>summary b{font-weight:600;margin-right:10px}.shp>summary span{color:var(--ink2)}
+.shp[open]>summary{border-bottom:1px solid var(--grid)}
+.shp .body{padding:4px 0 12px;font-size:13px;color:var(--ink2)}.shp .body p{margin:8px 0}
+.shp .prof{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px}.shp .cap{margin:10px 0 2px;font-size:12px;color:var(--muted)}
+.plots{display:grid;grid-template-columns:1fr 1fr;gap:12px 20px}@media(max-width:640px){.plots{grid-template-columns:1fr}}
+.plots figure{margin:0;min-width:0}.plots figcaption{font-size:12px;color:var(--muted);margin:0 0 2px}
+.plots svg{display:block;width:100%;height:auto;max-width:440px}
+.plots .ax{stroke:var(--axis);stroke-width:1;fill:none}.plots .lbl{fill:var(--muted);font-size:10px;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.plots .d{fill:var(--s-logos)}.plots .ln{stroke:var(--axis);stroke-width:1;fill:none}.plots .mk{fill:var(--s-xss)}
+.vals{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1px 16px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);font-variant-numeric:tabular-nums}
+.vals span{color:var(--muted)}.vals .h,.lines .h{color:var(--s-xss);font-weight:600}
+.lines{margin:0;padding:0;list-style:none;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);overflow-x:auto}
+.lines li{white-space:pre}.lines li span{color:var(--muted);display:inline-block;min-width:8ch}
+p.sub a{color:var(--s-logos)}
 .whint{position:absolute;z-index:31;left:50%;top:6px;transform:translateX(-50%);pointer-events:none;opacity:0;transition:opacity .25s;background:var(--ink);color:var(--page);font-size:12px;padding:3px 10px;border-radius:999px;white-space:nowrap}
+/* the front matter: what logos-sort is, the summary chart (computed from DATA), the contenders, the method */
+.top{padding-block:30px 4px}.eyebrow{margin:0;color:var(--muted);font-size:12px;letter-spacing:.07em;text-transform:uppercase}
+.top h1{font-size:30px;line-height:1.15;margin:6px 0 12px;letter-spacing:-.01em;text-wrap:balance}
+.lede{font-size:16px;line-height:1.55;max-width:66ch;margin:0 0 14px}
+.front{margin:34px 0 0}.front>h2{font-size:19px;margin:0 0 8px;text-wrap:balance}
+.prose{max-width:72ch}.prose p{margin:0 0 10px}
+.score{font-size:15px;margin:0 0 14px;max-width:72ch}
+.gl{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:860px){.gl{grid-template-columns:1fr}}
+.glc{background:var(--surface);border:1px solid var(--grid);border-radius:8px;padding:12px 14px 10px;min-width:0}
+.glc h3{margin:0 0 6px;color:var(--ink)}
+.glr{display:grid;grid-template-columns:7.4rem minmax(0,1fr) 7.6rem;gap:0 10px;align-items:start;padding:4px 0}
+@media(max-width:480px){.glr{grid-template-columns:5.8rem minmax(0,1fr) 6.6rem}}
+.glr .nm{font-size:12px;line-height:16px;color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.glr .trk{position:relative;height:16px}
+.glr .mid{position:absolute;top:-4px;bottom:-17px;width:1px;background:var(--mid)}
+.glr .b{position:absolute;top:3px;height:10px;border-radius:2px}
+.b.pos{background:var(--pos)}.b.neg{background:var(--neg)}.b.eq{background:var(--muted)}
+.glr .v{font-size:12px;line-height:16px;color:var(--ink2);font-variant-numeric:tabular-nums}
+.glr .v b{color:var(--ink);font-weight:600}.glr .v small{display:block;color:var(--muted);font-size:11px;line-height:13px}
+.glr.ax{padding-top:2px}.glr.ax .trk{height:30px}
+.tk{position:absolute;top:2px;font-style:normal;font-size:11px;color:var(--muted);transform:translateX(-50%);font-variant-numeric:tabular-nums;white-space:nowrap}
+.tk.l{transform:none}.tk.r{transform:translateX(-100%)}.tk.cap{top:16px}
+.who{display:grid;grid-template-columns:minmax(10rem,max-content) minmax(0,1fr);gap:9px 20px;max-width:84ch;margin:0}
+@media(max-width:600px){.who{grid-template-columns:minmax(0,1fr);gap:2px}.who dd{margin-bottom:10px}}
+.who dt{font-weight:600;color:var(--ink)}.who dd{margin:0;color:var(--ink2)}.who a{color:var(--s-logos)}.who .sw{height:10px;width:10px;border-radius:50%}
+.method{margin:0;padding-left:20px;max-width:76ch;color:var(--ink2)}.method li{margin:0 0 7px}.method b{color:var(--ink)}
+pre.cmd{background:var(--surface);border:1px solid var(--grid);border-radius:8px;padding:10px 14px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);margin:6px 0 10px;max-width:100%}
+.glance-t td:nth-child(5),.glance-t th:nth-child(5){text-align:left}
 </style></head><body><div class="wrap">
-<h1>logos-sort — time against n</h1>
-<p class="sub" id="sub"></p><div id="cal"></div>
+<header class="top">
+<p class="eyebrow">Benchmark report</p>
+<h1>logos-sort benchmarks</h1>
+<p class="lede">logos-sort is a sorting engine that reads the shape of its input before it sorts. When the data has structure, such as stretches already in order, a handful of distinct values, numbers on a fixed grid, or sorted blocks in the wrong order, it places elements by address instead of comparing them. This report times it against the fastest open-source sorts available, on the same inputs, from an empty array to <span id="nmaxw">ten million</span> elements, on one thread and on many.</p>
+<p class="sub" id="sub"></p><p class="sub" id="age"></p>
+</header>
+
+<section class="front" id="glance-sec" aria-labelledby="h-glance">
+<h2 id="h-glance">At the largest size</h2>
+<p class="score" id="score"></p>
+<div class="gl" id="glance"></div>
+<p class="hint">Each bar compares logos with the fastest other sort on that input, at the largest size measured. To the right of the line logos is faster by the factor shown; to the left, the other sort is. Hover a row for both times. Differences under 5% are shown as level: that is within this machine's run-to-run noise.</p>
+<details><summary>the same comparison as a table</summary><div class="tw" id="glance-table"></div></details>
+</section>
+
+<section class="front prose" aria-labelledby="h-why">
+<h2 id="h-why">Where the speed comes from</h2>
+<p>Most of the inputs below have structure that real data often has: logs that arrive nearly in time order, columns with a few distinct values, prices on a grid of cents, shards concatenated out of order. logos detects that from a small sample and takes a route that does less work than any comparison sort can: it counts, places whole runs, or merges only where runs overlap. On those inputs the margin is generally larger at ten million elements than at one million.</p>
+<p>Uniformly random numbers have no structure to use. On one thread logos then runs its own vectorized quicksort, the same design as x86-simd-sort and VQSort, so those rows are a race between kernels; on many threads it splits the values into ranges across all cores and sorts each range. The uniform, heavy_tail and bimodal inputs are that case.</p>
+<p>The trade is memory. logos often allocates scratch space, where std::sort and the vector quicksorts sort in place; the circles on the detailed charts show the peak heap per element for every sort.</p>
+</section>
+
+<section class="front" aria-labelledby="h-who">
+<h2 id="h-who">The contenders</h2>
+<dl class="who" id="who"></dl>
+</section>
+
+<section class="front" aria-labelledby="h-how">
+<h2 id="h-how">How it was measured</h2>
+<ul class="method" id="method"></ul>
+<div id="cal"></div>
+</section>
+
+<section class="front" id="detail" aria-labelledby="h-detail">
+<h2 id="h-detail">Every size, every sort</h2>
+<p class="sub">One section per input. In each, the left panel compares sorts that each use one thread and the right panel sorts that each use the same number of threads, never one against many. Each panel has two charts of the same measurements: the time per sort, and below it the time per element, which shows how the cost grows with n. The tables under each panel hold every number.</p>
+</section>
 <div class="legend" id="legend"></div>
 <div class="bar"><div class="row" id="filters" role="group" aria-label="view controls"></div></div>
 <p class="sub"><b>Every chart zooms and pans.</b> Ctrl + scroll, or a pinch, zooms around the pointer; a sideways drag picks a range of n; a double-click goes back. The box by the pointer lists every sort at that n, fastest first, with its time relative to logos.</p>
@@ -474,16 +903,36 @@ button.t:hover{color:var(--ink);border-color:var(--ink2)}button.t[aria-pressed="
 <li><b>Series.</b> Click a legend row to hide one, Ctrl + click to show it alone. The value axis refits to what is in view.</li>
 <li><b>Panels.</b> The two charts of a panel share their n window and their pointer. &ldquo;expand&rdquo; gives a panel the full width. The bar above stays in view and jumps to any shape.</li>
 </ul></details>
-<p class="sub">The dashed grey curves are O(n) and O(n log n) references anchored at logos's largest measured point, so a series that bends above the O(n log n) curve is growing faster than a comparison sort should. The label after each series name is its empirical exponent, the least-squares slope of log t against log n over n &ge; 100k (below that fixed costs dominate). The single-threaded panel compares sorts that each use one thread; the parallel panel compares sorts that each use all threads. Every output was checked equal to std::sort's on the same data; the minimum of the repetitions is plotted. A line that stops early hit the per-sort time budget.</p>
-<p class="sub">Each panel holds two charts of the same measurements: time per sort, and below it nanoseconds per element, whose value axis is always linear (only its n axis follows the axis toggle). n = 0 is the cost of one call: it has no per-element value, and it cannot sit on a log axis, so the log view leaves it to the tables. The size buttons cut every chart down to the small end, because a linear n axis puts everything below a million into its first pixels. The last row of the ns-per-element table is the scaling slope read off two points: with c the cost per element, p = 1 + ln(c_hi / c_lo) / ln(n_hi / n_lo), so p = 1 is linear scaling and the percentage beside it is how much dearer one element became from 1M to the largest size. Those two rows are measured minutes apart on a machine whose speed drifts, so read that row as a sketch: make slopebench measures the same number in adjacent pairs, where the drift cancels. Sizes below 10k are timed as batches of distinct inputs sorted back to back, since one such sort is shorter than the clock can resolve and repeating one input would train the branch predictor; the parallel sorts are called with all threads there too, so what they show at small n is what such a call costs. <b>That change of method is a SEAM, and the dashed line marks it.</b> Three things flip there at once, all favouring the right-hand side: the working set (a batch is about 2 MB and exceeds L2, one array at n = 10k is 78 KB and does not), the branch history (every batch instance is a different input; the single array is the same input every rep), and the statistic (a batch's total divided by its count, against the minimum of several reps). So a curve may be read along either side of the line, but a step ACROSS it is partly the method. The <b>batch &divide; single</b> row in the ns-per-element table measures that step for this panel: the same n timed both ways, at the one size where both modes resolve. Use it to tell the two apart. Where it is well above 1 a jump at the line is the harness; the sequential contenders sit around 2-4x. Where it is near 1 and the chart still jumps, the jump is real and belongs to the data - a shape is not the same shape at 3162 as at 10000, since the number of runs, cycles or distinct values in it moves with n, and the engine's routing gates are ratios of n. Both happen in this report. The extreme values, tens to hundreds, are all __gnu_parallel::sort at P threads, and they are not a measurement fault but the point restated: a batch calls the sort 26 times back to back, so 26 parallel regions are opened and joined on 10k elements, where the single measurement opens one and keeps the best of five. Everything that panel plots LEFT of the line for a parallel contender is dominated by that per-call cost rather than by sorting, which is what "the parallel sorts are called with all threads there too" means in practice. <b>The circle around a point is memory</b>: the peak heap of one COLD call at that size, in bytes per element, measured in a pass of its own after all the timing (releasing the pools is what makes a call cold, and doing that between timed rows would have left the next row paying for its buffers). The largest reading anywhere in the report is 30 px across and every other scales linearly by it, so a circle means the same number in every panel; with a linear diameter, twice the memory draws four times the ink, so read them as ranks rather than areas. No circle means nothing was allocated - std::sort and the strict in-place entry draw none at any size - and sizes below 10k have none because a size there is a BATCH of distinct inputs, where a peak would be the batch's and not one sort's. Per element, not absolute: absolute bytes would simply grow with n and say nothing, and this way the small-n rows show the fixed pool costs before they amortize.</p>
+<details class="how"><summary>reading the charts in detail: the reference curves, exponents, the seam at 10k and the memory circles</summary>
+<p class="sub">The dashed grey curves are O(n) and O(n log n) references anchored at logos's largest measured point, so a series that bends above the O(n log n) curve is growing faster than a comparison sort should. The label after each series name is its empirical exponent, the least-squares slope of log t against log n over n &ge; 100k (below that fixed costs dominate). The single-threaded panel compares sorts that each use one thread; the parallel panel compares sorts that each use the same P threads (VQSort, the LSD radix and timsort have no parallel form and appear in the first only). Every output was checked equal to std::sort's on the same data; the minimum of the repetitions is plotted. A line that stops early hit the per-sort time budget.</p>
+<p class="sub">Each panel holds two charts of the same measurements: time per sort, and below it nanoseconds per element, whose value axis is always linear (only its n axis follows the axis toggle). n = 0 is the cost of one call: it has no per-element value, and it cannot sit on a log axis, so the log view leaves it to the tables. The size buttons cut every chart down to the small end, because a linear n axis puts everything below a million into its first pixels. The last row of the ns-per-element table is the scaling slope read off two points: with c the cost per element, p = 1 + ln(c_hi / c_lo) / ln(n_hi / n_lo), so p = 1 is linear scaling and the percentage beside it is how much dearer one element became from 1M to the largest size. Those two rows are measured minutes apart on a machine whose speed drifts, so read that row as a sketch: make slopebench measures the same number in adjacent pairs, where the drift cancels. Sizes below 10k are timed as batches of distinct inputs sorted back to back, since one such sort is shorter than the clock can resolve and repeating one input would train the branch predictor; the parallel sorts are called with all threads there too, so what they show at small n is what such a call costs. <b>That change of method is a SEAM, and the dashed line marks it.</b> Three things flip there at once, all favouring the right-hand side: the working set (a batch is about 2 MB and exceeds L2, one array at n = 10k is 78 KB and does not), the branch history (every batch instance is a different input; the single array is the same input every rep), and the statistic (a batch's total divided by its count, against the minimum of several reps). So a curve may be read along either side of the line, but a step ACROSS it is partly the method. The <b>batch &divide; single</b> row in the ns-per-element table measures that step for this panel: the same n timed both ways, at the one size where both modes resolve. Use it to tell the two apart. Where it is well above 1 a jump at the line is the harness; the sequential contenders sit around 2-4x. Where it is near 1 and the chart still jumps, the jump is real and belongs to the data - a shape is not the same shape at 3162 as at 10000, since the number of runs, cycles or distinct values in it moves with n, and the engine's routing gates are ratios of n. Both happen in this report. The extreme values, tens to hundreds, are all __gnu_parallel::sort at P threads, and they are not a measurement fault but the point restated: a batch calls the sort 26 times back to back, so 26 parallel regions are opened and joined on 10k elements, where the single measurement opens one and keeps the best of five. Everything that panel plots LEFT of the line for a parallel contender is dominated by that per-call cost rather than by sorting, which is what "the parallel sorts are called with all threads there too" means in practice. <b>The circle around a point is memory</b>: the peak heap of one COLD call at that size, in bytes per element, measured in a pass of its own after all the timing (releasing the pools is what makes a call cold, and doing that between timed rows would have left the next row paying for its buffers). The value is the circle's RADIUS: the largest reading anywhere in the report is 15 px and every other scales linearly by it, so a circle means the same number in every panel; with a linear radius, twice the memory draws four times the ink, so read them as ranks rather than areas. The numbers themselves are in the tooltip (the peak heap column, bytes per element and the total it means at that n) and in each panel's third table. No circle means nothing was allocated - std::sort and the strict in-place entry draw none at any size - and sizes below 10k have none because a size there is a BATCH of distinct inputs, where a peak would be the batch's and not one sort's. Per element, not absolute: absolute bytes would simply grow with n and say nothing, and this way the small-n rows show the fixed pool costs before they amortize.</p>
+</details>
+<details class="shapes" id="shapes"><summary>The <span id="shapecount">17</span> shapes: what each one is, with demo data from its own generator</summary>
+<p class="sub">Every shape below is drawn by the bench's own generator, seed 7, at n = 1,048,576: the data the charts sorted at that size, not a picture of it. Left, the whole array at 512 evenly spaced positions; right, 48 consecutive elements around the feature that defines the shape (in orange where there is one), and below them twelve of those values in the order the sort receives them. The line under each description counts all n elements. Strings have no numeric value, so they are plotted by rank, their position in sorted order. Shapes are defined partly in proportion (64 blocks, 32 cycles, n/100 swaps) and partly in absolute terms (noise of &plusmn;50 or &plusmn;60), so at small n the second kind is relatively noisier, one reason a curve can bend between sizes. The batches below 10k use seeds 7, 8, 9, &hellip; for their instances. Each panel's heading links back to its entry here.</p>
+<div id="shapelist"></div>
+</details>
 <div id="charts"></div>
+<section class="front prose" aria-labelledby="h-repro">
+<h2 id="h-repro">Reproducing it</h2>
+<p>Everything here is one command on Linux with GCC and an x86-64 CPU with AVX2. From a checkout of logos-sort (github.com/markciubal/logos-sort), fetch the opponents beside it, then build and run:</p>
+<pre class="cmd">cd engines
+git clone --depth 1 https://github.com/intel/x86-simd-sort
+git clone --depth 1 https://github.com/ips4o/ips4o
+git clone --depth 1 --branch 1.4.0 https://github.com/google/highway
+sudo apt install libtbb-dev          # the IPS4o build links TBB
+cd c && make scale-full              # about ten minutes; writes scale-report.html</pre>
+<p>The run prints every time as it goes and stops with an error if any sort's output differs from std::sort's. Absolute times depend on the machine; the comparisons within each chart are the result.</p>
+</section>
 </div>
 <script>__UPLOT_JS__</script>
 <script>
 const DATA=__DATA__,META=__META__;
-const NAMES1=['std::sort','logos','x86-simd-sort '+META.xssIsa,'IPS\u2074o','LSD radix','timsort','logos in-place'];
-const NAMESP=['__gnu_parallel::sort','logos','x86-simd-sort '+META.xssIsa,'IPS\u2074o','','','logos in-place'];
-const CVAR=['--s-base','--s-logos','--s-xss','--s-ips','--s-radix','--s-tim','--s-inpl'];
+const SHAPES=__SHAPES__;
+const NAMES1=['std::sort','logos','x86-simd-sort '+META.xssIsa,'IPS\u2074o','LSD radix','timsort','logos in-place','VQSort (Google) '+(META.vqIsa||'')];
+const NAMESP=['__gnu_parallel::sort','logos','x86-simd-sort '+META.xssIsa,'IPS\u2074o','','','logos in-place',''];
+const CVAR=['--s-base','--s-logos','--s-xss','--s-ips','--s-radix','--s-tim','--s-inpl','--s-vq'];
+/* legend, table and tooltip order = the palette's slot order, so colours that sit side by side are the validated adjacent pairs */
+const ORDER=[1,2,7,3,4,5,6,0];
 const cssv=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim()||'#888888';
 const fmtN=n=>n==null?'':n>=1e9?(+(n/1e9).toFixed(2))+'B':n>=1e6?(+(n/1e6).toFixed(2))+'M':n>=1e3?(+(n/1e3).toFixed(1))+'k':String(+n.toFixed(2));
 /* one formatter per quantity, each walking down the units: five elements sort in nanoseconds, ten million in seconds */
@@ -501,15 +950,49 @@ const RANGES={all:Infinity,k10:1e4,t10:10};
 const MEMPX=30;
 const MEMMAX=(function(){let m=0;DATA.forEach(function(s){s.rows.forEach(function(r){if(r.m)r.m.forEach(function(v){if(v>0&&v>m)m=v;});});});return m;})();
 const NS=DATA.length?DATA[0].rows.map(r=>r.n):[];
-document.getElementById('sub').textContent=`${META.threads} threads (${META.ncpus} online) · ${NS.length} sizes, ${NS.length?fmtN(NS[0]):'?'} .. ${NS.length?fmtN(NS[NS.length-1]):'?'} · ${DATA.length/2} shapes`;
-document.getElementById('cal').innerHTML=`<div class="warn">Calibration (1T): memcpy 64 MB ${META.memcpyMs.toFixed(2)} ms, std::sort 1M ${META.std1mMs.toFixed(1)} ms. Quiet 20-core reference \u2248 2.5 ms / \u2248 50 ms; beyond 15% the machine was loaded and ratios within one chart are more trustworthy than absolute times.</div>`;
-document.getElementById('legend').innerHTML=[1,6,0,2,3,4,5].filter(k=>k<2||(k==2&&META.xss)||(k==3&&META.ips4o)||k>=4).map(k=>`<span><i class="sw" style="background:${cssv(CVAR[k])}"></i>${k==0?'std::sort (1T) / __gnu_parallel::sort (P)':NAMES1[k]+((k==4||k==5)?' (1 thread only)':'')}</span>`).join('')+`<span><i class="sw ref"></i>O(n) and O(n log n), anchored at logos's largest n</span>`+(MEMMAX>0?`<span><i class="sw" style="background:transparent;border:1.5px solid var(--muted);border-radius:50%"></i>circle = peak heap of one cold call, bytes per element (largest in this report ${+MEMMAX.toFixed(1)} B/elem = ${MEMPX} px across)</span>`:'');
+/* HOW OLD these measurements are, from the moment stored with them (META.measuredAt, ms since the epoch), against the
+   reader's clock, refreshed while the page stays open. Past a week it says so: a scaling curve describes the engine
+   that was measured, not the one in the tree. */
+function agoText(ms){const s=Math.max(0,Math.round(ms/1000));const u=[[31536000,'year'],[2592000,'month'],[86400,'day'],[3600,'hour'],[60,'minute']];
+ for(const [k,nm] of u){if(s>=k){const v=Math.floor(s/k);return v+' '+nm+(v==1?'':'s')+' ago';}}return s<10?'just now':s+' seconds ago';}
+function paintAge(){const el=document.getElementById('age');if(!el)return;const at=META&&META.measuredAt;
+ if(!(at>0)){el.textContent='measured: time not recorded';return;}
+ const d=new Date(at),age=Date.now()-at,p=n=>String(n).padStart(2,'0');
+ const abs=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+ el.innerHTML='<b>measured '+agoText(age)+'</b> ('+abs+', your local time)'+(age>7*86400000?' <b>&mdash; older than a week: re-run make scale-full before trusting it</b>':'');}
+paintAge();
+/* refreshed every 30 s. Under node (tools/check_report.js) a live interval keeps the process from ever exiting -- the first cut
+   hung the checker for ten minutes -- so the timer is unref'd where that exists; a browser's timer id has no such method */
+if(typeof setInterval==='function'){const h=setInterval(paintAge,30000);if(h&&typeof h.unref==='function')h.unref();}
+document.getElementById('sub').textContent=[META.cpu||'',`${META.threads} threads for the parallel runs (${META.ncpus} logical CPUs)`,META.compiler||'',`${NS.length} sizes from ${NS.length?fmtN(NS[0]):'?'} to ${NS.length?fmtN(NS[NS.length-1]):'?'}`,`${DATA.length/2} inputs`].filter(Boolean).join(' · ');
+document.getElementById('cal').innerHTML=`<div class="warn">How busy the machine was, measured before the run on one thread: copying 64 MB took ${META.memcpyMs.toFixed(2)} ms and std::sort of a million doubles ${META.std1mMs.toFixed(1)} ms. At rest this machine reads about 3 ms and 60 ms. Well above that, every absolute time in the report is inflated, while the comparisons between sorts in one chart still hold.</div>`;
+/* the contenders, in the charts' colours; the versions and instruction sets come from META where the run recorded them */
+document.getElementById('who').innerHTML=[
+ ['--s-logos','logos-sort','The engine being measured: C, with AVX2 kernels and its own parallel partition. Also shown, in violet: its in-place entry, which allocates no scratch memory at all.',''],
+ ['--s-xss','x86-simd-sort','Intel\u2019s vectorized quicksort library, here built for '+(META.xssIsa||'this CPU')+'; at P threads its OpenMP version.','https://github.com/intel/x86-simd-sort'],
+ ['--s-vq','VQSort','Google\u2019s vectorized quicksort from the Highway library'+(META.vqVersion?' (version '+META.vqVersion+')':'')+'. It picks its instruction set when it runs'+(META.vqIsa?' ('+META.vqIsa+' on this machine)':'')+' and has no parallel form, so it appears at one thread only.','https://github.com/google/highway/tree/master/hwy/contrib/sort'],
+ ['--s-ips','IPS\u2074o','In-place Parallel Super Scalar Samplesort from KIT, a state-of-the-art comparison sort, sequential at one thread and parallel at P.','https://github.com/ips4o/ips4o'],
+ ['--s-base','std::sort','GCC\u2019s standard library sort (introsort); at P threads __gnu_parallel::sort, its OpenMP mode. Every other output is checked against it.',''],
+ ['--s-radix','LSD radix, timsort','Two reference implementations written for this benchmark (timsort in green), one thread only.',''],
+].filter(w=>w[1]!=='VQSort'||META.vqsort).map(w=>`<dt><i class="sw" style="background:var(${w[0]})"></i>${w[1]}</dt><dd>${w[2]}${w[3]?` <a href="${w[3]}" rel="noopener" target="_blank">Source</a>`:''}</dd>`).join('')+
+ `<dt>On strings</dt><dd>The vector sorts sort numbers, not text. On the four string inputs they sort the same 8-byte prefix keys logos uses, so those lines compare the kernels under one method. VQSort sorts 16-byte records, so its line also pays to pack and unpack them.</dd>`;
+document.getElementById('method').innerHTML=[
+ '<b>Every output is checked</b> against std::sort\u2019s on the same input before its time counts. A mismatch would mark the row with \u2717; there are none unless one is shown.',
+ '<b>Same input, best of several runs.</b> Each size is sorted by every contender in turn, from an identical copy. The fastest of 5 runs is kept up to a million elements, of 3 up to ten million.',
+ '<b>One thread against one thread, '+META.threads+' against '+META.threads+'.</b> '+META.threads+' is the physical core count; every parallel sort is given that many threads.',
+ '<b>Small sizes are timed in batches.</b> Below '+fmtN(META.smallBelow||10000)+' elements one sort is shorter than the clock can resolve, so each size is a batch of different inputs sorted back to back. The detailed notes under the charts explain the step this makes in some curves.',
+ '<b>The machine is a laptop, not a lab.</b> It ran under WSL2 with ordinary background programs, so absolute times move by tens of percent from run to run. The sorts at one size run one after another, seconds apart, so the drift between them is small but not zero; that is why differences under 5% count as level here.',
+].map(t=>'<li>'+t+'</li>').join('');
+document.getElementById('legend').innerHTML=ORDER.filter(k=>k<2||(k==2&&META.xss)||(k==3&&META.ips4o)||(k==7&&META.vqsort)||(k>=4&&k<=6)).map(k=>`<span><i class="sw" style="background:${cssv(CVAR[k])}"></i>${k==0?'std::sort (1T) / __gnu_parallel::sort (P)':NAMES1[k]+((k==4||k==5||k==7)?' (1 thread only)':'')}</span>`).join('')+`<span><i class="sw ref"></i>O(n) and O(n log n), anchored at logos's largest n</span>`+(MEMMAX>0?`<span><i class="sw" style="background:transparent;border:1.5px solid var(--muted);border-radius:50%"></i>circle radius = peak heap of one cold call in bytes per element (the report's largest, ${+MEMMAX.toFixed(1)} B/elem, is ${MEMPX/2} px); the values are in the tooltip and in each panel's tables</span>`:'');
 
 /* empirical exponent: least-squares slope of log10 t vs log10 n over n >= 1e5 (fixed costs dominate below) */
 function exponent(rows,k){const pts=rows.filter(r=>r.t[k]>0&&r.n>=1e5).map(r=>[Math.log10(r.n),Math.log10(r.t[k])]);if(pts.length<3)return null;
  const mx=pts.reduce((a,p)=>a+p[0],0)/pts.length,my=pts.reduce((a,p)=>a+p[1],0)/pts.length;let sxx=0,sxy=0;pts.forEach(p=>{sxx+=(p[0]-mx)**2;sxy+=(p[0]-mx)*(p[1]-my);});return sxx>0?sxy/sxx:null;}
 
-function table(s){const names=s.threads==1?NAMES1:NAMESP;const cols=[1,6,0,2,3,4,5].filter(k=>s.rows.some(r=>r.t[k]>0));
+/* memory as text: bytes per element with the total it means at that n (the circle is the same number as a radius) */
+function fmtBytes(b){return b>=1073741824?(b/1073741824).toFixed(2)+' GB':b>=1048576?(b/1048576).toFixed(1)+' MB':b>=1024?(b/1024).toFixed(0)+' KB':b.toFixed(0)+' B';}
+function fmtMem(v,n){return (+v.toFixed(v>=10?1:2))+' B/elem ('+fmtBytes(v*n)+')';}
+function table(s){const names=s.names||(s.threads==1?NAMES1:NAMESP);const cols=ORDER.filter(k=>s.rows.some(r=>r.t[k]>0));
  const exps=cols.map(k=>{const e=exponent(s.rows,k);return e===null?'–':'n^'+e.toFixed(2);});
  const head=last=>`<thead><tr><th>n</th>${cols.map(k=>`<th>${names[k]}</th>`).join('')}${last?`<th>${last}</th>`:''}</tr></thead>`;
  const tRows=s.rows.map(r=>{const others=cols.filter(k=>k!=1&&k!=6&&r.t[k]>0).map(k=>r.t[k]);const best=others.length?Math.min(...others):0;
@@ -519,6 +1002,10 @@ function table(s){const names=s.threads==1?NAMES1:NAMESP;const cols=[1,6,0,2,3,4
  const slope=k=>{const rs=s.rows.filter(r=>r.t[k]>0&&r.n>=1e6);if(rs.length<2)return '-';const a=rs[0],b=rs[rs.length-1],g=(b.t[k]/b.n)/(a.t[k]/a.n);
   return (g>=1?'+':'')+((g-1)*100).toFixed(1)+'% (p = '+(1+Math.log(g)/Math.log(b.n/a.n)).toFixed(3)+')';};
  const pRows=s.rows.map(r=>`<tr><td>${fmtN(r.n)}</td>${cols.map(k=>`<td>${r.t[k]>0&&r.n>0?fmtNs(r.t[k]*1e6/r.n):'–'}</td>`).join('')}</tr>`).join('');
+ /* MEMORY, as numbers: the peak heap of one cold call per point, the value each circle's radius stands for. Rows below
+    the seam have none (a size there is a batch); a dash on a measured row is a sort that allocated nothing. */
+ const mRows=s.rows.filter(r=>r.m&&r.m.some(v=>v>0)).map(r=>`<tr><td>${fmtN(r.n)}</td>${cols.map(k=>`<td>${r.m[k]>0?fmtMem(r.m[k],r.n):(r.t[k]>0?'0':'–')}</td>`).join('')}</tr>`).join('');
+ const mTable=mRows?`<h3 class="cap2">peak heap of one cold call: bytes per element (total at that n). The circle drawn at each point has this value as its radius, ${MEMPX/2} px for the report's largest (${+MEMMAX.toFixed(1)} B/elem); 0 = the sort allocated nothing; sizes below ${fmtN(META.smallBelow||10000)} are batches and have no per-sort peak</h3><div class="tw"><table>${head('')}<tbody>${mRows}</tbody></table></div>`:'';
  /* THE SEAM, measured: n = smallBelow timed the SMALL way (a batch of distinct instances) over the same n timed the
     BIG way (one array, min of reps). Everything left of that n is on the batch side, so DIVIDE those points by this
     to bring them onto the right-hand scale -- or multiply the right-hand points by it to go the other way. Without
@@ -526,7 +1013,7 @@ function table(s){const names=s.threads==1?NAMES1:NAMESP;const cols=[1,6,0,2,3,4
  const seamRow=(()=>{const sm=s.seam;if(!sm||!s.seamN)return '';const at=s.rows.find(r=>r.n==s.seamN);if(!at)return '';
   if(!cols.some(k=>sm[k]>0&&at.t[k]>0))return '';
   return `<tr><td>batch ÷ single at n = ${fmtN(s.seamN)}</td>${cols.map(k=>`<td>${sm[k]>0&&at.t[k]>0?(sm[k]/at.t[k]).toFixed(2)+'×':'–'}</td>`).join('')}</tr>`;})();
- return `<details><summary>tables: time per sort, ns per element, empirical exponents</summary><h3>time per sort</h3><div class="tw"><table>${head('logos vs best other')}<tbody>${tRows}<tr><td>t ∝ (n ≥ 100k)</td>${exps.map(e=>`<td>${e}</td>`).join('')}<td></td></tr></tbody></table></div><h3 class="cap2">nanoseconds per element (n = 0 has no elements: its row above is the cost of one call)</h3><div class="tw"><table>${head('')}<tbody>${pRows}${seamRow}<tr><td>per element, 1M to the largest n</td>${cols.map(k=>`<td>${slope(k)}</td>`).join('')}</tr></tbody></table></div></details>`;}
+ return `<details><summary>tables: time per sort, ns per element, empirical exponents, peak heap per element</summary><h3>time per sort</h3><div class="tw"><table>${head('logos vs best other')}<tbody>${tRows}<tr><td>t ∝ (n ≥ 100k)</td>${exps.map(e=>`<td>${e}</td>`).join('')}<td></td></tr></tbody></table></div><h3 class="cap2">nanoseconds per element (n = 0 has no elements: its row above is the cost of one call)</h3><div class="tw"><table>${head('')}<tbody>${pRows}${seamRow}<tr><td>per element, 1M to the largest n</td>${cols.map(k=>`<td>${slope(k)}</td>`).join('')}</tr></tbody></table></div>${mTable}</details>`;}
 
 /* Two uPlots per panel: time per sort against n, and the same measurements as nanoseconds per element. Series are
    built in draw order with logos LAST so it sits on top, and the two big-O references are appended as dashed series
@@ -587,12 +1074,12 @@ function logLabels(u,sp,isX){
 const logAxis=isX=>({splits:(u,ai,mn,mx)=>logSplits(mn,mx),filter:(u,sp)=>logLabels(u,sp,isX)});
 
 function build(s,holder,kind,capEl,syncKey,height){
- const names=s.threads==1?NAMES1:NAMESP,lg=MODE==='log',per=kind==='nsel',ylog=lg&&!per;
+ const names=s.names||(s.threads==1?NAMES1:NAMESP),lg=MODE==='log',per=kind==='nsel',ylog=lg&&!per;
  const rows=visible(s);if(!rows.length)return null;
  const xs=rows.map(r=>r.n),fv=per?fmtNs:fmtMs;
  const yv=(r,k)=>{const t=r.t[k];if(!(t>0))return null;if(!per)return t;return r.n>0?t*1e6/r.n:null;};
  const data=[xs],series=[{label:'n',value:(u,v)=>v==null?'–':fmtN(v)}],meta=[null],mems=[null];
- [0,2,3,4,5,6,1].forEach(k=>{
+ ORDER.slice().reverse().forEach(k=>{
   if(!rows.some(r=>yv(r,k)!==null))return;
   data.push(rows.map(r=>yv(r,k)));
   const nm=names[k]||('series '+k),ex=exponent(s.rows,k),bad=s.rows.some(r=>r.t[k]>0&&!r.ok);
@@ -690,7 +1177,7 @@ function build(s,holder,kind,capEl,syncKey,height){
          }]},
  };
  const u=new uPlot(opts,data,holder);
- u._ix={per,ylog,fv,meta,capEl,capBase,capHome:capEl?capEl.textContent:''};
+ u._ix={per,ylog,fv,meta,mems,capEl,capBase,capHome:capEl?capEl.textContent:''};
  IX.wire(u,(per?'nanoseconds per element':'time per sort')+', '+s.shape+', '+(s.threads==1?'1 thread':s.threads+' threads'));
  return u;
 }
@@ -853,11 +1340,13 @@ const IX=(()=>{
   const c=u.cursor,i=c.idx;
   if(!u._in||i==null||!(c.left>=0)){t.style.display='none';return;}
   const rows=[];let L=null;
-  for(let si=1;si<u.data.length;si++){const m=ix.meta[si],v=u.data[si][i];if(m.ref||!u.series[si].show||v==null)continue;rows.push([v,m]);if(m.logos)L=v;}
+  const nn=u.data[0][i];
+  for(let si=1;si<u.data.length;si++){const m=ix.meta[si],v=u.data[si][i];if(m.ref||!u.series[si].show||v==null)continue;const mv=ix.mems&&ix.mems[si]?ix.mems[si][i]:null;rows.push([v,m,mv]);if(m.logos)L=v;}
   if(!rows.length){t.style.display='none';return;}
   rows.sort((a,b)=>a[0]-b[0]);
-  t.innerHTML='<b>n = '+Number(u.data[0][i]).toLocaleString('en-US')+'</b><table><tr><th></th><th>'+(ix.per?'per element':'per sort')+'</th><th>'+(L?'× logos':'')+'</th></tr>'+
-   rows.map(([v,m])=>'<tr><td><i class="sw" style="background:'+m.color+'"></i>'+esc(m.name)+'</td><td>'+ix.fv(v)+'</td><td>'+(L?(v/L).toFixed(2):'')+'</td></tr>').join('')+'</table>';
+  const anyM=rows.some(r=>r[2]>0);
+  t.innerHTML='<b>n = '+Number(nn).toLocaleString('en-US')+'</b><table><tr><th></th><th>'+(ix.per?'per element':'per sort')+'</th><th>'+(L?'× logos':'')+'</th>'+(anyM?'<th>peak heap</th>':'')+'</tr>'+
+   rows.map(([v,m,mv])=>'<tr><td><i class="sw" style="background:'+m.color+'"></i>'+esc(m.name)+'</td><td>'+ix.fv(v)+'</td><td>'+(L?(v/L).toFixed(2):'')+'</td>'+(anyM?'<td>'+(mv>0?fmtMem(mv,nn):'–')+'</td>':'')+'</tr>').join('')+'</table>';
   t.style.display='block';
   const W=u.over.clientWidth||0,H=u.over.clientHeight||0,tw=t.offsetWidth||0,th=t.offsetHeight||0;
   let x=c.left+16;if(x+tw>W)x=c.left-16-tw;if(x<0)x=Math.max(0,W-tw);
@@ -896,6 +1385,108 @@ const IX=(()=>{
  return{lim,win,fitY,setView,zoomX,zoomY,panX,reset,refit,zoomed,selected,down,wheel,key,tip,wire};
 })();
 
+/* THE SHAPES. SHAPES is written by scalebench when it writes the page (shape_demos_json), from the bench's own generators,
+   so each demo is the data that was sorted. Only the shapes this report measured are listed, in its order; a panel's
+   heading links to its entry. Plots are inline SVG coloured by the page's tokens, so a theme change needs no redraw. */
+const escH=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const slug=s=>'about-'+String(s).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const SHAPEDOC={};SHAPES.forEach(d=>{SHAPEDOC[d.shape]=d;});
+/* a pair of labels (an axis's ends, a range's ends) takes as many significant digits as it needs to differ: 295,070 and
+   295,081 both read 295,100 at four */
+const cfmt=(v,p)=>{p=p||4;const a=Math.abs(v);return a>=1e6?(+v.toExponential(p-1)).toExponential().replace('e+','e'):(+v.toPrecision(p)).toLocaleString('en-US',{maximumFractionDigits:12});};
+const cpair=(lo,hi)=>{for(let p=3;p<12;p++){const a=cfmt(lo,p),b=cfmt(hi,p);if(a!==b)return [a,b];}return [cfmt(lo,12),cfmt(hi,12)];};
+const efmt=v=>{const s=String(v);return s.length>14?String(+v.toPrecision(10)):s;};
+const pfmt=p=>{const q=p*100;return (q>=99||q<=1?+q.toFixed(3):+q.toFixed(1))+'%';};
+function openShape(name){const o=document.getElementById('shapes'),d=document.getElementById(slug(name));if(!d)return;o.open=true;d.open=true;if(d.scrollIntoView)d.scrollIntoView({behavior:'smooth',block:'start'});}
+function demoPlot(vals,x0,step,ylog,hl,join,label){
+ const W=330,H=132,L=56,R=10,T=8,B=22,pw=W-L-R,ph=H-T-B,n=vals.length,f=ylog?(v=>Math.log10(v>0?v:1e-300)):(v=>v);
+ let lo=Infinity,hi=-Infinity,ilo=0,ihi=0;
+ vals.forEach((v,i)=>{const y=f(v);if(y<lo){lo=y;ilo=i;}if(y>hi){hi=y;ihi=i;}});
+ const span=hi>lo?hi-lo:1,b0=hi>lo?lo:lo-0.5,lab=cpair(vals[ilo],vals[ihi]);
+ const X=i=>(L+(n>1?i*pw/(n-1):pw/2)).toFixed(1),Y=v=>(T+ph-(f(v)-b0)/span*ph).toFixed(1);
+ let s='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+escH(label)+'">';
+ s+='<path class="ax" d="M'+L+' '+T+'V'+(T+ph)+'H'+(L+pw)+'"/>';
+ s+='<text class="lbl" x="'+(L-5)+'" y="'+(T+7)+'" text-anchor="end">'+escH(lab[1])+'</text>';
+ if(hi>lo)s+='<text class="lbl" x="'+(L-5)+'" y="'+(T+ph)+'" text-anchor="end">'+escH(lab[0])+'</text>';
+ s+='<text class="lbl" x="'+L+'" y="'+(H-6)+'">'+(x0).toLocaleString('en-US')+'</text>';
+ s+='<text class="lbl" x="'+(L+pw)+'" y="'+(H-6)+'" text-anchor="end">'+(x0+(n-1)*step).toLocaleString('en-US')+'</text>';
+ if(join)s+='<polyline class="ln" points="'+vals.map((v,i)=>X(i)+','+Y(v)).join(' ')+'"/>';
+ const mk=i=>!!hl&&hl.indexOf(x0+i*step)>=0;
+ vals.forEach((v,i)=>{if(!mk(i))s+='<circle class="d" cx="'+X(i)+'" cy="'+Y(v)+'" r="'+(join?2.2:1.3)+'"/>';});
+ vals.forEach((v,i)=>{if(mk(i))s+='<circle class="mk" cx="'+X(i)+'" cy="'+Y(v)+'" r="3.4"/>';});
+ return s+'</svg>';
+}
+function shapeEntry(d){
+ const st=d.stats,str=d.kind==='str',n=d.n,wl=d.win.length;
+ const prof=['n = '+n.toLocaleString('en-US'),st.distinct.toLocaleString('en-US')+(str?' distinct strings':' distinct values')];
+ if(str)prof.push(st.minLen+' to '+st.maxLen+' bytes, mean '+st.meanLen);
+ else{const r=cpair(st.min,st.max);prof.push('from '+r[0]+' to '+r[1]);}
+ prof.push(pfmt(st.inorder)+' of adjacent pairs in order',st.runs.toLocaleString('en-US')+' ascending runs');
+ if(!str&&st.ints)prof.push('every value an integer');
+ const what=str?'rank in sorted order':'value';
+ let h='<p>'+escH(d.desc)+'</p><p class="prof">'+escH(prof.join(' · '))+'</p><div class="plots">';
+ h+='<figure><figcaption>the whole array, every '+d.step.toLocaleString('en-US')+'th element ('+what+(d.ylog?', log axis':'')+' against position)</figcaption>'+demoPlot(d.ov,0,d.step,d.ylog,null,false,d.shape+': the whole array')+'</figure>';
+ h+='<figure><figcaption>elements '+d.w0.toLocaleString('en-US')+' to '+(d.w0+wl-1).toLocaleString('en-US')+(d.hl.length?', the feature in orange':'')+'</figcaption>'+demoPlot(d.win,d.w0,1,d.ylog,d.hl,true,d.shape+': '+wl+' consecutive elements')+'</figure></div>';
+ h+='<p class="cap">'+(str?'Those strings, as the sort receives them:':'The values, as the sort receives them:')+'</p>';
+ if(str)h+='<ol class="lines">'+d.lines.map((t,k)=>{const i=d.t0+k;return '<li'+(d.hl.indexOf(i)>=0?' class="h"':'')+'><span>'+i+'</span>'+escH(t)+'</li>';}).join('')+'</ol>';
+ else{h+='<div class="vals">';for(let i=d.t0;i<d.t0+d.tn;i++)h+='<div'+(d.hl.indexOf(i)>=0?' class="h"':'')+'><span>a['+i+']</span> '+escH(efmt(d.win[i-d.w0]))+'</div>';h+='</div>';}
+ return '<details class="shp" id="'+slug(d.shape)+'"><summary><b>'+escH(d.shape)+'</b><span>'+escH(d.brief)+'</span></summary><div class="body">'+h+'</div></details>';
+}
+(function(){
+ const host=document.getElementById('shapelist');if(!host)return;
+ const seen=DATA.filter((s,i)=>i%2===0).map(s=>SHAPEDOC[s.shape]).filter(Boolean);
+ host.innerHTML=seen.map(shapeEntry).join('');
+ const c=document.getElementById('shapecount');if(c)c.textContent=String(seen.length);
+ if(!seen.length){const o=document.getElementById('shapes');if(o)o.style.display='none';}
+ if(typeof location!=='undefined'&&/^#about-/.test(location.hash||'')){const t=document.getElementById(location.hash.slice(1)),o=document.getElementById('shapes');if(t&&o){o.open=true;t.open=true;if(t.scrollIntoView)t.scrollIntoView({block:'start'});}}
+})();
+
+/* AT THE LARGEST SIZE. For each input and thread count: logos against the fastest OTHER sort at the largest n logos measured.
+   "Other" is every contender whose name does not contain "logos" (its in-place entry and its pre-2026-10 string sort are logos).
+   A contender that ran out of time budget before that n has no time there and drops out of that row: it was the slowest.
+   Bars run from parity on a log scale, so 2x faster and 2x slower are the same length; within 5% is "level". */
+const LEVEL=0.05;
+const SHORT=nm=>String(nm||'').replace(/ \(.*$/,'').replace(/ key-value.*$/,'').replace(/ (AVX2|AVX-512|AVX3\w*|AVX10\w*|SSE\w*|NEON|SVE\w*)$/,'');
+function glance(which){const out=[];
+ for(let i=0;i<DATA.length;i+=2){const s=DATA[i+which];if(!s)continue;
+  const names=s.names||(s.threads==1?NAMES1:NAMESP),rs=s.rows.filter(r=>r.n>0&&r.t[1]>0);if(!rs.length)continue;
+  const r=rs[rs.length-1];let bk=-1;
+  r.t.forEach((v,k)=>{if(k===1||!(v>0)||/logos/.test(names[k]||''))return;if(bk<0||v<r.t[bk])bk=k;});
+  if(bk<0)continue;
+  out.push({shape:s.shape,threads:s.threads,n:r.n,lg:r.t[1],ot:r.t[bk],who:SHORT(names[bk]),x:r.t[bk]/r.t[1],ok:r.ok});}
+ return out;}
+(function(){
+ const host=document.getElementById('glance');if(!host)return;
+ const G=[glance(0),glance(1)],all=G[0].concat(G[1]);
+ if(!all.length){const sec=document.getElementById('glance-sec');if(sec)sec.hidden=true;return;}
+ const TK=[0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100,200,500];
+ let lo=Math.min(1,...all.map(g=>g.x))/1.08,hi=Math.max(1,...all.map(g=>g.x))*1.08;
+ lo=TK.filter(t=>t<=lo).pop()||TK[0];hi=TK.find(t=>t>=hi)||TK[TK.length-1];
+ const X=v=>Math.max(0,Math.min(100,(Math.log(v)-Math.log(lo))/(Math.log(hi)-Math.log(lo))*100));
+ const vd=g=>g.x>1+LEVEL?'faster':g.x<1/(1+LEVEL)?'slower':'level';
+ const fx=f=>(f>=10?f.toFixed(1):f.toFixed(2))+'\u00d7';
+ const thr=t=>t==1?'one thread':t+' threads';
+ const tip=g=>g.shape+', '+Number(g.n).toLocaleString('en-US')+' elements, '+thr(g.threads)+': logos '+fmtMs(g.lg)+', '+g.who+' '+fmtMs(g.ot)+(g.ok?'':' (an output differed from std::sort\u2019s)');
+ const row=g=>{const v=vd(g),a=X(1),b=X(g.x),l=Math.min(a,b),w=Math.max(Math.abs(b-a),0.6);
+  const val=v==='faster'?'<b>'+fx(g.x)+'</b> faster':v==='slower'?'<b>'+fx(1/g.x)+'</b> slower':'<b>level</b> ('+g.x.toFixed(2)+')';
+  return '<div class="glr" title="'+escH(tip(g))+'"><span class="nm">'+escH(g.shape)+'</span><span class="trk"><i class="mid" style="left:'+a.toFixed(2)+'%"></i><i class="b '+(v==='faster'?'pos':v==='slower'?'neg':'eq')+'" style="left:'+l.toFixed(2)+'%;width:'+w.toFixed(2)+'%"></i></span><span class="v">'+val+'<small>vs '+escH(g.who)+(g.ok?'':' \u2717')+'</small></span></div>';};
+ const ticks=TK.filter(t=>t>=lo&&t<=hi);
+ const axis='<div class="glr ax" aria-hidden="true"><span></span><span class="trk">'+ticks.map((t,i)=>{const x=X(t),c=i===0?' l':i===ticks.length-1?' r':'';return '<i class="tk'+c+'" style="left:'+x.toFixed(2)+'%">'+(t>=1?t:+(1/t).toFixed(0))+'\u00d7</i>';}).join('')+
+  '<i class="tk cap l" style="left:0%">\u2190 other faster</i><i class="tk cap r" style="left:100%">logos faster \u2192</i></span><span></span></div>';
+ const panel=(rows,title)=>rows.length?'<div class="glc" role="group" aria-label="'+escH(title)+'"><h3>'+escH(title)+'</h3>'+rows.map(row).join('')+axis+'</div>':'';
+ host.innerHTML=panel(G[0],'1 thread each')+panel(G[1],META.threads+' threads each');
+ {const nw=document.getElementById('nmaxw');if(nw&&NS.length)nw.textContent=Number(NS[NS.length-1]).toLocaleString('en-US');}
+ const cnt=a=>{const c={faster:0,level:0,slower:0};a.forEach(g=>c[vd(g)]++);return c;},c1=cnt(G[0]),cp=cnt(G[1]);
+ const nmax=Math.max(...all.map(g=>g.n)),same=all.every(g=>g.n===nmax);
+ const sc=document.getElementById('score');
+ const part=(c,n,t)=>'<b>'+c.faster+' of '+n+'</b> inputs '+t+(c.level||c.slower?' (level on '+c.level+', slower on '+c.slower+')':'');
+ if(sc)sc.innerHTML='At '+(same?'':'up to ')+'<b>'+Number(nmax).toLocaleString('en-US')+' elements</b>, logos is the fastest sort measured on '+
+  [G[0].length?part(c1,G[0].length,'at one thread'):'',G[1].length?part(cp,G[1].length,'at '+META.threads+' threads'):''].filter(Boolean).join(' and on ')+'.';
+ const tb=document.getElementById('glance-table');
+ if(tb)tb.innerHTML='<table class="glance-t"><thead><tr><th>input</th><th>threads</th><th>n</th><th>logos</th><th>fastest other</th><th>its time</th><th>other \u00f7 logos</th></tr></thead><tbody>'+
+  all.map(g=>'<tr><td>'+escH(g.shape)+'</td><td>'+g.threads+'</td><td>'+fmtN(g.n)+'</td><td>'+fmtMs(g.lg)+'</td><td>'+escH(g.who)+'</td><td>'+fmtMs(g.ot)+'</td><td>'+g.x.toFixed(2)+'\u00d7'+(g.ok?'':' \u2717')+'</td></tr>').join('')+'</tbody></table>';
+})();
+
 const CH=[],WIDE=new Set();
 const hgt=(kind,wide)=>kind==='nsel'?(wide?320:240):(wide?440:300);
 function render(){
@@ -905,6 +1496,11 @@ function render(){
  for(let i=0;i<DATA.length;i+=2){
   const s1=DATA[i],sp=DATA[i+1];
   const h2=document.createElement('h2');h2.id='shape-'+(i/2);h2.textContent=s1.shape;host.appendChild(h2);
+  const doc=SHAPEDOC[s1.shape];
+  if(doc){const br=document.createElement('p');br.className='sub';br.textContent=doc.brief.charAt(0).toUpperCase()+doc.brief.slice(1)+'. ';
+   const a=document.createElement('a');a.href='#'+slug(s1.shape);a.textContent='What this shape is, with demo data';
+   a.onclick=e=>{if(e&&e.preventDefault)e.preventDefault();openShape(s1.shape);};br.appendChild(a);host.appendChild(br);}
+  if(s1.note){const nt=document.createElement('p');nt.className='sub';nt.textContent=s1.note;host.appendChild(nt);}   /* a series that names its own contenders says what they are */
   const g=document.createElement('div');g.className='grid2';host.appendChild(g);
   [s1,sp].forEach(s=>{
    const key=s.shape+'|'+s.threads,wide=WIDE.has(key);
@@ -945,7 +1541,7 @@ sep();
  b.onclick=()=>{RANGE=v;fl.querySelectorAll('button[data-rg]').forEach(x=>x.setAttribute('aria-pressed',x===b));render();};b.dataset.rg=v;fl.appendChild(b);});
 /* the memory toggle: only offered when the report actually carries a memory pass (older ones do not) */
 if(MEMMAX>0){const b=document.createElement('button');b.className='f';b.textContent='memory circles';
- b.title='circle diameter = peak heap of one cold call, bytes per element; the largest reading in this report ('+(+MEMMAX.toFixed(1))+' B/elem) is '+MEMPX+' px across';
+ b.title='circle radius = peak heap of one cold call, bytes per element; the largest reading in this report ('+(+MEMMAX.toFixed(1))+' B/elem) is '+(MEMPX/2)+' px; the values are in the tooltip and each panel\'s tables';
  b.setAttribute('aria-pressed',SHOWMEM);b.dataset.mem='1';
  b.onclick=()=>{SHOWMEM=!SHOWMEM;b.setAttribute('aria-pressed',SHOWMEM);render();};fl.appendChild(b);}
 sep();
@@ -962,6 +1558,9 @@ render();
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>CH.forEach(c=>c.u.setSize({width:Math.max(260,c.holder.clientWidth||520),height:c.h})),120);});
 const mq=matchMedia('(prefers-color-scheme: dark)');
 (mq.addEventListener?mq.addEventListener.bind(mq,'change'):mq.addListener.bind(mq))(()=>render());
+/* a viewer that switches theme by attribute (data-theme on the root) changes the tokens without changing the media query:
+   the canvases resolve their colours when drawn, so redraw then too */
+if(typeof MutationObserver==='function')new MutationObserver(()=>render()).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
 /* for tools/check_report.js and tools/browser_check.py, which drive the charts through these */
 globalThis.__SCALE={CH,IX};
 </script></body></html>
@@ -969,6 +1568,9 @@ globalThis.__SCALE={CH,IX};
     std::string html(TMPL);
     size_t p = html.find("__DATA__"); if (p != std::string::npos) html.replace(p, 8, j);
     p = html.find("__META__"); if (p != std::string::npos) html.replace(p, 8, meta_s);
+    { double t_demo = nowms(); std::string sd = shape_demos_json();       /* the shapes accordion: generated, never measured */
+      p = html.find("__SHAPES__"); if (p != std::string::npos) html.replace(p, 10, sd);
+      printf("shape demos: %zu shapes at n = %zu, %.1f s\n", sizeof SHAPE_DOCS / sizeof SHAPE_DOCS[0], DEMO_N, (nowms() - t_demo) / 1e3); }
     /* uPlot is inlined, not fetched: these reports are opened from disk and passed around, so the
        page must not depend on a CDN. See engines/c/vendor/README.md and tools/embed_uplot.py. */
     p = html.find("__UPLOT_CSS__"); if (p != std::string::npos) html.replace(p, 13, UPLOT_CSS);

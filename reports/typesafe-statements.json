@@ -1,0 +1,850 @@
+{
+  "about": "Claims about logos-sort with their verdict and evidence. A corpus, not a request body.",
+  "verdict_field": "for A/B/D/E/F rows the recorded grade; for C rows (the negative ledger) the measured RESULT",
+  "grades": {
+    "MEASURED": "measured end to end under the paired-A/B method",
+    "INFERRED": "argued from a measurement, not isolated",
+    "UNTESTED": "no measurement exists",
+    "FALSE": "measured and contradicted"
+  },
+  "section_columns": {
+    "A. Competitive position": {
+      "verdict": "status",
+      "evidence": "evidence"
+    },
+    "B. Cost model": {
+      "verdict": "status",
+      "evidence": "evidence"
+    },
+    "C. Negative ledger": {
+      "verdict": "the measured RESULT (every C row was implemented, measured and REJECTED)",
+      "evidence": "why it failed"
+    },
+    "D. Positive results": {
+      "verdict": "the measured effect",
+      "evidence": "where in the code"
+    },
+    "E. The thesis itself": {
+      "verdict": "grade",
+      "evidence": "note"
+    },
+    "F. Correctness envelope": {
+      "verdict": "status",
+      "evidence": "evidence"
+    },
+    "Measured after the truth table was last written": {
+      "verdict": "MEASURED or FALSE",
+      "evidence": "the numbers and the mechanism"
+    }
+  },
+  "method_note": {
+    "paired_ab": "two variants run adjacently on the two halves of one array, order alternated; median of the ratio with p10/p90. Drift cancels inside a pair, ordering bias across pairs.",
+    "resolving_floor": "the same engine on both sides reads 1.000; 40 pairs resolve ~3.7% at 8M and ~6.1% at 1M. An effect below that is not a result.",
+    "layout_bias": "engine copies differing only in renamed symbols differ up to 1.24x from code alignment, so any claim under 1.25x needs the copy assignment permuted or the mechanism traced.",
+    "verification": "every benchmark checks output against a reference; ~45,899 harness property checks.",
+    "calibration_line": "memcpy 64MB and std::sort 1M are printed per run; quiet is ~2.9ms/~65ms. A loaded box flatters logos, because barrier-heavy opponents lose more to preemption."
+  },
+  "count": 100,
+  "statements": [
+    {
+      "id": "A1",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos 1T beats std::sort on every shape",
+      "verdict": "MEASURED",
+      "evidence": "2.8–10.1× (3.6.0 quiet run)"
+    },
+    {
+      "id": "A2",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos PT beats __gnu_parallel::sort at equal threads on every shape",
+      "verdict": "MEASURED, quiet 14T (§1d)",
+      "evidence": "9/0, every row ≥2.7× (near_sorted) up to 7.7× (quantized); the loaded 20T run's ≥3.4× / 8.1× were inflated by load"
+    },
+    {
+      "id": "A3",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos 20T beats IPS⁴o (SOTA parallel comparison sort) on every shape",
+      "verdict": "FALSE on a quiet box; was MEASURED loaded",
+      "evidence": "loaded: IPS⁴o 116–140 ms vs logos 7–72 ms. Quiet, 14T (FINDINGS §1d): logos wins 7 of 9 (1.5× random, 2–2.5× structured), IPS⁴o wins near_sorted 1.06× and few_distinct 1.2×. IPS⁴o sped up 3.5× between the loaded and quiet runs, logos 1.4×"
+    },
+    {
+      "id": "A4",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "Intel x86-simd-sort (AVX-512) 1T beats logos 1T on every shape",
+      "verdict": "MEASURED (AVX-512 box, old)",
+      "evidence": "logos at 0.26–0.90× of it there; on the AVX2 box with the AVX2 sequential leaf logos wins near_sorted, quantized and the block shapes and is at 0.76–0.93× on the random shapes (§1e)"
+    },
+    {
+      "id": "A5",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "x86-simd-sort MT beats logos 20T on every unstructured shape",
+      "verdict": "FALSE on AVX2 hardware after H0b + D16 (re-measured 2026-09-10)",
+      "evidence": "AVX-512 box, old engine: uniform 34 vs 60 ms, heavy_tail 24 vs 72, bimodal 24 vs 69, int_wide 23 vs 59. AVX2 box, new engine: logos wins uniform 26.4 vs 30.7, int_wide 25.1 vs 31.0, quantized, near_sorted, few_distinct, both block shapes; ties heavy_tail 36.7 vs 35.3; loses bimodal 41.3 vs 24.4. AVX-512 kernels are ~1.5–2× the AVX2 ones, so on AVX-512 hardware parity is plausible and unmeasured"
+    },
+    {
+      "id": "A5b",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos + x86-simd-sort leaf per bucket beats plain logos",
+      "verdict": "MEASURED on AVX2: true on the 3 random shapes (24.2 vs 26.4, 28.1 vs 36.7, 26.4 vs 41.3), false on near_sorted/int_wide",
+      "evidence": "reverses A9's AVX-512-era finding; not the default; needs AVX-512 re-run"
+    },
+    {
+      "id": "A6",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos beats x86-simd-sort MT on few_distinct and quantized",
+      "verdict": "MEASURED, stable across runs",
+      "evidence": "7.2 vs 9.5 ms; 9.2 vs 23.3 ms (2.5×)"
+    },
+    {
+      "id": "A7",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "near_sorted is a tie at 20T",
+      "verdict": "MEASURED, loaded",
+      "evidence": "26.2 vs 24.8 ms"
+    },
+    {
+      "id": "A8",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos + SIMD leaf reaches parity with x86-simd-sort 1T, never exceeds it",
+      "verdict": "MEASURED",
+      "evidence": "0.72–0.98×"
+    },
+    {
+      "id": "A9",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "logos + SIMD leaf is *worse* than plain logos multi-threaded",
+      "verdict": "MEASURED twice",
+      "evidence": "worse on 5 of 7 shapes"
+    },
+    {
+      "id": "A10",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "The 1T gap on unstructured data can be closed within \"produce a sorted array\" on a single socket",
+      "verdict": "FALSE",
+      "evidence": "three restructurings (merge, cache-K, parallel-SIMD) all lost; see C"
+    },
+    {
+      "id": "A11",
+      "source": "TRUTH_TABLE.md",
+      "section": "A. Competitive position (8M f64, 20-thread single-socket box, WSL2)",
+      "statement": "Behaviour on AVX2-only hardware (most consumer CPUs)",
+      "verdict": "MEASURED 2026-09-11 (i9-13900H, quiet, 14T; FINDINGS §1e)",
+      "evidence": "1T the SIMD sort wins random shapes 1.23–1.31× (1.7× before the AVX2 sequential leaf) and few_distinct 2.6×, logos wins near_sorted and blocks, ties quantized/int_wide; 14T parity on random shapes (0.86–1.08×), logos 1.4× few_distinct, 1.76× quantized, 2.2–2.5× blocks. The loaded run (§1c) showed 7 of 9; that was load, and 20T on the quiet box reproduces the 14T numbers"
+    },
+    {
+      "id": "B1",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The random-data 20T floor (~40 ms) is per-core scatter *latency* plus fixed cost, not bandwidth",
+      "verdict": "MEASURED",
+      "evidence": "ping-pong removed 37% of traffic, time moved ~12%; write-combining is ~10%; hyperthreading gave 1.3–1.5×"
+    },
+    {
+      "id": "B2",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The fine K=2048 scatter dominates; the top-level P-way scatter is near-free",
+      "verdict": "MEASURED (2025; by 2026-09-11 the top-level histogram had become the largest parallel phase and is now gone, D32)",
+      "evidence": "top scatter 17–19 ms 1T (≈2 ns/elem); a direct 2048-way scatter 72 ms"
+    },
+    {
+      "id": "B3",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A comparison merge costs 15–26× a P-way scatter",
+      "verdict": "MEASURED",
+      "evidence": "loser-tree merge 286–434 ms vs scatter 17–19 ms"
+    },
+    {
+      "id": "B4",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The engine is pass-overhead-bound: a change that adds a pass never pays",
+      "verdict": "MEASURED ×3",
+      "evidence": "COARSE_K sweep, SIMD bucket-index, winner tree: each won in isolation, lost integrated"
+    },
+    {
+      "id": "B5",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Page faults are ~13% of a sequential sort (first call; the pool amortises)",
+      "verdict": "MEASURED",
+      "evidence": "26 ms per 8M seq; 15 ms at t=4; likely higher under WSL2"
+    },
+    {
+      "id": "B6",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Destination prefetch on/off is 15–25%; distance 16–64 is within 3%",
+      "verdict": "MEASURED, interleaved",
+      "evidence": "pfbench"
+    },
+    {
+      "id": "B7",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The scatter and the histogram do not vectorize on a CPU",
+      "verdict": "MEASURED",
+      "evidence": "vpscatter 1.05×, vpconflictd 0.65×"
+    },
+    {
+      "id": "B8",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Vectorizing the arithmetic of logos's memory-bound passes is noise",
+      "verdict": "MEASURED",
+      "evidence": "1.22× byte-skip kernel = 0.1% end-to-end; 1.47× bucket-index = −3 to −5.5%"
+    },
+    {
+      "id": "B9",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Sampling cost should scale with the decision's resolution, never with n",
+      "verdict": "MEASURED principle",
+      "evidence": "3.3.0: 2048-sample proportions, O(cap) probes"
+    },
+    {
+      "id": "B10",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The ≤64-element insertion-sort leaf is compute-bound, not memory-bound",
+      "verdict": "INFERRED",
+      "evidence": "it runs in L1; never isolated"
+    },
+    {
+      "id": "B11",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Where time goes by phase (probes, histogram, scatter, leaf, copy, stalls)",
+      "verdict": "MEASURED 2026-09-10",
+      "evidence": "make profile → profile-report.html; per thread, CPU vs preempted vs barrier-stalled vs idle"
+    },
+    {
+      "id": "B12",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "1T stream bandwidth on the box",
+      "verdict": "MEASURED",
+      "evidence": "memcpy 64 MB ≈ 2.5 ms (calibration line)"
+    },
+    {
+      "id": "B13",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "At 20T the top-level histogram was the dominant cost, ~9× the scatter in CPU time, and it was compute (the bucket_of binary search), not memory",
+      "verdict": "MEASURED, then FIXED (H0b)",
+      "evidence": "uniform: histogram 836 thread-ms CPU vs scatter 88, leaf 313; ≤4% preempted; 49–70% of wall. After H0b the whole sort is 1.6–3× faster on those shapes"
+    },
+    {
+      "id": "B14",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The 1T sequential route never runs the top-level partition (100% leaf); the 20T route pays a histogram that costs more per element than the whole 1T sort",
+      "verdict": "MEASURED",
+      "evidence": "~100 vs ~29 ns/element; explains the ~3× 20-thread speedup"
+    },
+    {
+      "id": "B15",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "The parallel route has a fixed cost of ~5–10 ms on this box (thread creation, barriers, P×12 buckets), so all-threads-for-any-n loses to one thread below ~5e5 elements",
+      "verdict": "MEASURED (scaling benchmark)",
+      "evidence": "fixed by D18; the crossover where 20 threads beat 1 is ~1M elements here"
+    },
+    {
+      "id": "B16",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Noise anatomy of the reference box (make noiseprobe, 12 reps): a 1T sort is never preempted (cpu = wall) yet varies 7% median / 56% worst from sibling-hyperthread and cache contention; parallel runs lose time slices in proportion to thread count (utilisation 0.99 at 2T → 0.62 at 20T, max/min 1.4 → 2.7); best minimum at 14 threads = physical cores",
+      "verdict": "MEASURED",
+      "evidence": "two hogs outside the project (VS Code software-WebGL ~44%, OneDrive ~20%) explain the session's ±12–25% bands; min-of-≥12 and interleaving are the mitigations, LOGOS_THREADS=14 for quiet numbers"
+    },
+    {
+      "id": "B28",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "\"Bimodal\" says nothing about what is inside a mode. Splitting at the gulfs is cheap and general; assuming the pieces are then uniform is not. Measured worst-mode distance from uniform: two uniform bands 0.023 (certifies), three uniform bands 0.02, two gaussians 0.30, three uneven clusters 0.32, a wide gaussian mixture does not separate into modes at all",
+      "verdict": "MEASURED (D39)",
+      "evidence": "certify each piece rather than assume it; the same argument killed the exponent map, whose binades are not uniform inside either (C25)"
+    },
+    {
+      "id": "B29",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Adjacency beats quiet. A machine whose speed wanders 5-10x over tens of seconds cannot be stilled, but two measurements taken back to back share its state, so the wander divides out. Pairing the variants and taking the median of 40 ratios resolves ~3.7% at 8M where best-of-N across separately compiled copies resolved ~1.25x",
+      "verdict": "MEASURED (make pairprobe, FINDINGS 3u)",
+      "evidence": "bench_paired() in bench_common.h; alternate which half goes first, or the destination-page bias adds 2-4%"
+    },
+    {
+      "id": "B30",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "You cannot pin a core inside a VM. taskset in WSL2 constrains a virtual CPU number; the Windows hypervisor still places it wherever it likes. The giveaway is that a thread pinned to CPUs 12-19 ran FASTER than unpinned, when on a 6P+8E part those should be the efficiency cores",
+      "verdict": "MEASURED and REJECTED (FINDINGS 3u); cgroup cpuset would need root and hits the same boundary",
+      "evidence": "one run showed spread 1.40 -> 1.13 and the next 1.32: a single non-reproduced improvement is not a result"
+    },
+    {
+      "id": "B31",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A quantile splitter is a load balancer. Choosing splitters at sample quantiles equalises the buckets by construction, so the leaf phase has almost no scheduling slack left to win: traced largest-leaf-over-mean is 1.10x on uniform and 1.48x on Pareto, and the greedy makespan bound turns that into 8-11% of one phase",
+      "verdict": "MEASURED (make lptbench; largest-first dispatch 0.95-1.05 on seven shapes, opt-in LOGOS_LPT=1)",
+      "evidence": "before optimising a schedule, measure the imbalance: the bound is W/P + L(1 - 1/P), and with 12 leaves per thread a 1.1x L is worth nothing"
+    },
+    {
+      "id": "B32",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A runtime toggle beats a second compiled copy for an A/B. Switching a feature with getenv once per call lets one binary measure both variants, which removes the up-to-1.24x code-layout bias (B26/rule 3) instead of controlling for it",
+      "verdict": "MEASURED (used for lptbench; cost is one getenv against ~1 ms of serial setup per parallel sort)",
+      "evidence": "only works for features that are a branch, not a different code path; pair it with bench_paired"
+    },
+    {
+      "id": "B39",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "\"Could not resolve\" is not \"neutral\", and the difference is worth paying for. Five features carried \"mixed\" or \"noise\" verdicts reached against a ~1.25x floor. Re-run at the ~4% floor with the code-layout bias cancelled by a copy swap, all five are neutral within 0.95-1.04 across five shapes at two thread counts",
+      "verdict": "MEASURED (tools/ledger_rerun.py, 24 pairs x 2 orientations, 8M; the one borderline row re-checked at 80 pairs)",
+      "evidence": "improving the instrument tenfold IS a new angle on a closed question, and it is cheaper than another idea"
+    },
+    {
+      "id": "B40",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Pairing cancels drift; only a copy swap cancels alignment. Timing two variants back to back removes the machine's thermal wander, but each variant still sits in a fixed compiled copy. Building twice with the assignment swapped gives A = E(L0/L1) and B = (1/E)(L0/L1), so sqrt(A/B) is the true effect and sqrt(A*B) is the layout bias itself",
+      "verdict": "MEASURED (the layout term read 0.96-1.04 over fifty cells, 0.999 on the 80-pair check)",
+      "evidence": "the two corrections are independent; applying only one leaves the other in the number"
+    },
+    {
+      "id": "B45",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A multiscale occupancy profile over (index, value) sees arrangement, and its misses fall where they cannot cost anything. With the rule fixed from six other shapes, a held-out twenty-shape zoo scored 4 of 8 arrangement shapes classified and 9 of 10 value-set shapes abstained; on the 3 cases where the engine left 1.2x or more against a sort told the structure it was blind on 0, and every miss was on a shape the engine already beats its ceiling on",
+      "verdict": "MEASURED (make zroute; make ztrain confirms the rule as coded matches its fitting)",
+      "evidence": "thin evidence, 3 opportunities; the profile names structure, it does not supply the route that uses it"
+    },
+    {
+      "id": "B46",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A sample cannot see order finer than its own spacing. Window-shuffled data with disorder of 2048 and latency-displaced data with disorder of 4096 read sorted or unknown to a 4096-point sample of 8M, whose spacing is 2048",
+      "verdict": "MEASURED (make zroute)",
+      "evidence": "fine-scale order needs a linear scan; do not ask a sample for it"
+    },
+    {
+      "id": "B47",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A classifier's rule can be too loose while its measurement is right. The tail rule, \"low early and peaks late\", fired on Gray-code order, which the probe correctly saw as arranged, because consecutive codes differ by one bit",
+      "verdict": "MEASURED (make zroute)",
+      "evidence": "fix rules on fresh shapes, never on the test set that exposed them"
+    },
+    {
+      "id": "B48",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "Tighten a rule on its failures, validate it on strangers. The probe's tail rule was redesigned from the two false tails a held-out zoo exposed, then scored on fifteen shapes it had never seen: false tails fell from 5 of 7 to 1 of 7 with recall unchanged at 4 of 5",
+      "verdict": "MEASURED (make ztail)",
+      "evidence": "the survivor, a random walk, shows the limit of occupancy alone: coarse order with fine disorder looks the same whether it came from a tail or a walk"
+    },
+    {
+      "id": "B49",
+      "source": "TRUTH_TABLE.md",
+      "section": "B. Cost model (what the floor is made of)",
+      "statement": "A sequential route offered to a parallel sort loses, and it took two routes to make that stick. The dense-integer bitmap and then the sorted-prefix-plus-tail merge each won several times over at one thread and regressed at fourteen, the tail route to 0.34-0.87, because single-threaded passes displaced parallel routes that were already fast",
+      "verdict": "MEASURED (make mcbench, make prefixbench)",
+      "evidence": "gate a sequential route on the sort actually running sequentially; win at P only with a parallel form of the route"
+    },
+    {
+      "id": "D1",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Lattice (direct-index) counting",
+      "verdict": "quantized 109 → 52 ms seq; 30k-distinct 105 → 53",
+      "evidence": "lattice_try_f64"
+    },
+    {
+      "id": "D2",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Low-cardinality parallel counting (≤1024 distinct)",
+      "verdict": "few_distinct 130 → 49 ms seq",
+      "evidence": "lowcard_try_f64"
+    },
+    {
+      "id": "D3",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Moderate-cardinality hash counting (≤65 536 distinct)",
+      "verdict": "2.5× at 256 distinct, 1.2–1.4× to 32k",
+      "evidence": "modcard_try_f64"
+    },
+    {
+      "id": "D4",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Near-sorted index-partition + one-pass P-way band merge",
+      "verdict": "28 → 22.5 ms at 20T",
+      "evidence": "nearsorted_parallel_f64"
+    },
+    {
+      "id": "D5",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Bucket-index cache + destination prefetch",
+      "verdict": "20T floor 65 → 41–49 ms",
+      "evidence": "3.4.0"
+    },
+    {
+      "id": "D6",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Dynamic chunking + spin-then-block barrier",
+      "verdict": "load degradation 2–5× → 1.3–2×",
+      "evidence": "3.3.x"
+    },
+    {
+      "id": "D7",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Native int32 engine (no widening)",
+      "verdict": "int32 loss 0.71× → win 2.5×",
+      "evidence": "3.2.0"
+    },
+    {
+      "id": "D8",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Persistent scratch pool",
+      "verdict": "measured the page-fault floor; ~13%",
+      "evidence": "3.6.0"
+    },
+    {
+      "id": "D9",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "argSort (stable, index-carrying) + apply / inverse permutation",
+      "verdict": "makes records-by-key possible",
+      "evidence": "logos_extra.c"
+    },
+    {
+      "id": "D10",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Order model (rank/select) without materialising",
+      "verdict": "1.57× at 64 distinct; loses ≥4096",
+      "evidence": "paradigm #2"
+    },
+    {
+      "id": "D11",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "One-pass analytics instead of sort-first",
+      "verdict": "quantiles 87× (approx), top-k 7× (exact), range-count 42× (exact)",
+      "evidence": "paradigm #3"
+    },
+    {
+      "id": "D12",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Strict in-place (~1n) variants",
+      "verdict": "1.6–6× slower; raises the RAM ceiling, not speed",
+      "evidence": "3.6.0+"
+    },
+    {
+      "id": "D13",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Disjoint-run relocation (J5): memcpy shuffled sorted blocks into place from sorted run descriptors",
+      "verdict": "2.3–3.4× 1T, 1.9–2.2× 20T on block-permuted 8M; guards ±5%; parbench 20T 6.1× vs gnu_par",
+      "evidence": "relocate_try_f64, make j5bench"
+    },
+    {
+      "id": "D14",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Per-phase profiler: CPU vs preempted vs stalled vs idle per thread, leaf path per bucket, HTML treemaps",
+      "verdict": "found B13 on its first run",
+      "evidence": "-DLOGOS_PROFILE, make profile"
+    },
+    {
+      "id": "D15",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Direct-index splitter tables with per-thread trial (H0b + J15): O(1) bucket lookup in the histogram",
+      "verdict": "1.6–3.0× at 20T on every shape that partitions; guards noise",
+      "evidence": "bt_init, do_hist, make stbench"
+    },
+    {
+      "id": "D16",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "12 buckets/thread (J16) + table leaf with the root style chosen per thread from the trial's root-resolution fraction",
+      "verdict": "12/t alone 1.08–1.44× on 9 of 12 partitioning rows across three runs; vs the old engine the adaptive leaf reads 1.13–1.37× at 20T on the partitioning shapes. Unresolved: adaptive vs always-branch-free, because that run hit a ±25% load burst; adaptive ships as the better of the two by construction. Interleaved counters and line repair mixed across three runs, opt-in",
+      "evidence": "BUCKETS_PER_THREAD, BT_LEAF, do_hist, make theorybench"
+    },
+    {
+      "id": "D17",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Profiler and parbench carry x86-simd-sort (AVX-512 or AVX2 per build) and IPS⁴o at equal thread counts; single-thread SIMD column now really single-threaded",
+      "verdict": "first AVX2 fair fight, FINDINGS §1c",
+      "evidence": "make profile-full, make parbench-full"
+    },
+    {
+      "id": "D18",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Thread-count policy: at most one thread per 100k elements (found by the scaling benchmark, A13)",
+      "verdict": "20T rows at 1e5 3–20× faster (uniform 8.8 → 1.6 ms, block_perm 9.9 → 0.5), 1e6 14.0 → 4.3 with ten threads beating twenty; ≥2M unchanged",
+      "evidence": "effective_threads, make scale-full"
+    },
+    {
+      "id": "D19",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Scaling benchmark: time vs n for every contender and shape, 1T and P, linear axes with O(n) / O(n log n) references and fitted exponents",
+      "verdict": "reports/scale-report.html",
+      "evidence": "make scale-full, scalebench.cpp"
+    },
+    {
+      "id": "D23",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Weyl sample positions (floor(frac(i·φ)·n) in every sampler; three-gap theorem)",
+      "verdict": "MEASURED (make chaosbench): sawtooth whose period equals the old stride, 14T 546 → 38 ms; van der Corput 14T 177 → 19 ms (bit-reversal aliased the stride too, unpredicted); no shape outside its noise band. The collatz 1.18–1.25× first credited here was NOT the sampler (both samples saw ~280 distinct): see D27",
+      "evidence": "SAMPLE_POS, weyl_pos"
+    },
+    {
+      "id": "D39",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Per-mode certificate and linear map: each mode's slice of the sample is tested for uniformity on its own, and if every mode certifies the partition buckets with branch-free mode selection plus one multiply-add instead of a table per mode",
+      "verdict": "MEASURED with the copy-swap control in both directions (make tailbench, FINDINGS §3s): bimodal 14T 1.25–1.38×, three uniform bands 1.23–1.33×, gaussian mixture 1.01–1.03× (declines at mode KS 0.164), all other shapes and every 1-thread row inside the band",
+      "evidence": "hf_lookup_md, md_ok, -DLOGOS_NO_MODEKS"
+    },
+    {
+      "id": "D40",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "The knot route: runs as strands, a sweep over the 2R run endpoints, pieces that lie alone are copied and only what crosses is merged; staircases of overlapping sorted blocks, which relocation declines because one chain covers everything, no longer pay for a full sort",
+      "verdict": "MEASURED (make knotbench, FINDINGS §3ac): 1 thread 2.6–4.4× from 10% to 100% of elements crossing, three live strands 2.6×, eight 1.4×; 14 threads 1.2–1.5× against the shipped engine, a TIE (0.96–1.11) against the pure partition; guards 1.00; 401 harness checks, clean under ASan/UBSan",
+      "evidence": "knot_plan, knot_worker in relocate_try_f64 / runs_relocate_f64; LOGOS_NO_KNOT=1, -DLOGOS_NO_KNOT"
+    },
+    {
+      "id": "D41",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "Resource exhaustion costs speed, never correctness: every allocation and every thread creation of a cold call can fail, singly or from some point on, and the array still comes back sorted",
+      "verdict": "MEASURED (make faultprobe: on the same 19 cases 7,008 injected failures, 0 bad, where 2,369 of 8,502 had been; the final engine's 23 cases, with the in-place entries and a 70-run chain, 7,894 and 0 bad; with the targeted sweeps all 19 worker functions and the spill path are reached; about 2,150 harness checks repeat a sample in-process, and the thread-creation half also runs under ThreadSanitizer: 186 failed creations, 0 races)",
+      "evidence": "par_run, par_spawn, barrier_drop, TILE_IS_MINE, all-or-nothing ctx_alloc, merge_all_runs on stack lists"
+    },
+    {
+      "id": "D42",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "make memprobe: what one cold sort weighs, what it still holds, what is left after release; f64 and int32, 1 thread and P, the in-place entries beside them",
+      "verdict": "MEASURED, and it is the only bench in the tree that does not time",
+      "evidence": "memprobe.c; MEMPROBE_LOG=<bytes> prints each large allocation with its call site, which is how the double allocation was found"
+    },
+    {
+      "id": "D43",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "make slopebench: the scaling exponent measured in adjacent pairs, one large sort against K small ones of the same shape moving the same number of elements, so the drift between two rows of the scale report cancels",
+      "verdict": "MEASURED: null ±2%, std::sort p = 1.063–1.066 against a floor of 1.062",
+      "evidence": "slopebench.cpp; ./slopebench 8 50000000 50000000 uniform is the null test"
+    },
+    {
+      "id": "D44",
+      "source": "TRUTH_TABLE.md",
+      "section": "D. Positive results (build on these)",
+      "statement": "NaN with a defined order, as a separate entry: logos_sort_f64_nan_last moves NaNs to the tail with their bit patterns intact, then sorts the prefix. The default entry keeps its unspecified order and gains a tested floor: no crash, no out-of-bounds access, output a permutation of the input's bits",
+      "verdict": "MEASURED (432 harness checks, ASan clean)",
+      "evidence": "logos_nan_to_end_f64, sample_sort swaps instead of rewriting"
+    },
+    {
+      "id": "C1",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "SIMD scatter (vpscatter)",
+      "verdict": "1.05×",
+      "evidence": "decomposes to serial stores"
+    },
+    {
+      "id": "C2",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "SIMD histogram (vpconflictd)",
+      "verdict": "0.65×",
+      "evidence": "needs gather+scatter per step"
+    },
+    {
+      "id": "C3",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "SIMD bucket-index in coarse",
+      "verdict": "−3 to −5.5%",
+      "evidence": "store-then-reload beats nothing"
+    },
+    {
+      "id": "C4",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "SIMD OR/AND byte-skip",
+      "verdict": "0.1%",
+      "evidence": "correct kernel, irrelevant share"
+    },
+    {
+      "id": "C5",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Winner/loser tree merge, near-sorted",
+      "verdict": "1.4–1.9× slower",
+      "evidence": "one live run most of the time; heap pops O(1)"
+    },
+    {
+      "id": "C6",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Shared per-thread context pool",
+      "verdict": "regressed, then segfaulted",
+      "evidence": "call sites need different sizes"
+    },
+    {
+      "id": "C7",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Parallel merge sort (chunk-sort + k-way merge)",
+      "verdict": "merge 15–26× costlier than scatter",
+      "evidence": "replaces the cheap op, leaves the expensive one"
+    },
+    {
+      "id": "C8",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Cache-conscious COARSE_K (64–512)",
+      "verdict": "0.58–0.90×",
+      "evidence": "per-level overhead exceeds cache gain; 2048 optimal"
+    },
+    {
+      "id": "C9",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "logos partition + SIMD leaf, parallel",
+      "verdict": "worse than plain logos, twice",
+      "evidence": "pays scatter plus SIMD sort"
+    },
+    {
+      "id": "C10",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Golden-ratio pivot",
+      "verdict": "−6% vs random",
+      "evidence": "—"
+    },
+    {
+      "id": "C11",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Ping-pong (remove copyback)",
+      "verdict": "neutral 1T, ~12% at 20T",
+      "evidence": "kept; taught B1"
+    },
+    {
+      "id": "C12",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Private per-thread buckets (NUMA)",
+      "verdict": "unmeasurable",
+      "evidence": "single socket"
+    },
+    {
+      "id": "C13",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "JS-era: flips/descent counter, cardinality probe, gap-statistic gallop, wider radix digits (whole-array, 1T), greedy ascending subsequence",
+      "verdict": "rejected",
+      "evidence": "engines/js/CHANGELOG.md"
+    },
+    {
+      "id": "C14",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "4.0.0 camelCase revision",
+      "verdict": "withdrawn",
+      "evidence": "convention only"
+    },
+    {
+      "id": "C15",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "J5 first cut: interval-overlap gate on raw runs",
+      "verdict": "never fired, 0.99×",
+      "evidence": "ascending block boundaries fuse runs around holes; gap-split first"
+    },
+    {
+      "id": "C16",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "J5 second cut: sequential probe + spawn-then-bail",
+      "verdict": "−16% segmented 20T",
+      "evidence": "scan chunk 0 on the caller, sample pre-gate"
+    },
+    {
+      "id": "C17",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "Leaf knobs: flash m = n/4, m = n/16, coarse on ~100k buckets (make leafbench)",
+      "verdict": "mixed: one shape each up 12–25%, others down 10–45%",
+      "evidence": "the leaf cost is the insertion fix-up (Devroye's n·∫f²) and the per-bucket probes, not the counters or the level count; lever is equi-depth classes gated by an ∫f² estimate, branchless fix-up, fewer probes"
+    },
+    {
+      "id": "C19",
+      "source": "TRUTH_TABLE.md",
+      "section": "C. Negative ledger (implemented, measured, rejected — do not re-run without a new angle)",
+      "statement": "AVX2 quicksort in the PARALLEL leaf (33k-element L2-resident buckets, make simdbench -DLOGOS_AVX2_PARALLEL)",
+      "verdict": "−5 to −28% at 14T, −10 to −16% at 6T on every random shape",
+      "evidence": "the scalar flash/coarse leaf on an L2-resident bucket is already ~9 ns/elem; the vectorized quicksort is 8.5 at 1 thread and slower under 14, on a hybrid P+E CPU (E-cores run 256-bit AVX2 double-pumped). The same code wins 1.2–1.6× sequentially, so it ships sequential-only"
+    },
+    {
+      "id": "E1",
+      "source": "TRUTH_TABLE.md",
+      "section": "E. The thesis itself, graded",
+      "statement": "\"Addressing beats comparing\" vs scalar comparison sorts",
+      "verdict": "MEASURED true",
+      "evidence": "A1–A3"
+    },
+    {
+      "id": "E2",
+      "source": "TRUTH_TABLE.md",
+      "section": "E. The thesis itself, graded",
+      "statement": "\"Addressing beats comparing\" vs *vectorized* comparison on unstructured CPU data",
+      "verdict": "MEASURED false",
+      "evidence": "A4–A5, B7: the scatter is the op SIMD avoids and it does not vectorize"
+    },
+    {
+      "id": "E3",
+      "source": "TRUTH_TABLE.md",
+      "section": "E. The thesis itself, graded",
+      "statement": "\"Addressing beats comparing\" when it avoids both comparing *and* scattering",
+      "verdict": "MEASURED true",
+      "evidence": "A6: counting / lattice paths, the defensible niche"
+    },
+    {
+      "id": "E4",
+      "source": "TRUTH_TABLE.md",
+      "section": "E. The thesis itself, graded",
+      "statement": "Structure detection is cheap enough to always run",
+      "verdict": "MEASURED",
+      "evidence": "probes are O(sample) or O(cap) with abort budgets; no shape regressed"
+    },
+    {
+      "id": "S01",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "Branchless Batcher networks for 4-16 elements in the leaf, generated and proved by the 0-1 principle before being written",
+      "verdict": "MEASURED",
+      "evidence": "random calls 1.03-1.06x at n=4 rising monotonically to 1.57-1.58x at n=16, two runs and both copy orientations; n=18 and 24 read 0.99 as the control; sorted rows 0.97-1.04. A small-end result, not a result at scale. SHIPPED"
+    },
+    {
+      "id": "S02",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The lattice MAP phase claims chunks from an atomic counter instead of taking equal slices",
+      "verdict": "MEASURED",
+      "evidence": "quantized and mod_card_30k 0.90-0.97 on 12 of 12 cells at 4M+, two runs of 60 pairs, against a null switch on the same rows at 0.97-1.04. ~1.05x. SHIPPED"
+    },
+    {
+      "id": "S03",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The same work queue applied to relocation's output tiles",
+      "verdict": "FALSE",
+      "evidence": "0.96-1.04 on every cell of two runs against a prediction of 0.88-0.97. A work queue buys balance only where the CORES are the bottleneck; those phases are memcpy over disjoint ranges, bound by one memory controller. REVERTED"
+    },
+    {
+      "id": "S04",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "Each lattice worker allocates its own count table rather than the caller allocating all P before the spawn",
+      "verdict": "MEASURED",
+      "evidence": "~1.03x, 20 of 20 cells on the winning side against a measured null. SHIPPED"
+    },
+    {
+      "id": "S05",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The lattice route's idle threads are its serial merge",
+      "verdict": "FALSE",
+      "evidence": "split into four profiler phases at 14 threads: map 68% at concurrency 10.72/14, merge 1.0%, emit 28% at concurrency 3.17/14, teardown 0.14%. The merge is not the problem"
+    },
+    {
+      "id": "S06",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The lattice route's 2ms of table teardown is worth attacking",
+      "verdict": "FALSE",
+      "evidence": "9-14 MICROseconds, 0.14% of the route. The 2ms came from a TRACE build; a trace build gives shares, never a price against a normal build"
+    },
+    {
+      "id": "S07",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The lattice emit phase's low concurrency is thread imbalance",
+      "verdict": "FALSE",
+      "evidence": "every thread gets exactly n/P output positions, so it cannot be. A standalone replica splits it: create+join of 13 workers is 0.564ms of 1.597ms (35%), and the remaining fill gets only 2.7x from 14 threads because 67MB of stores at 65 GB/s is the DDR5 ceiling"
+    },
+    {
+      "id": "S08",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "Knowing the data FORMAT (that values are dates) beats certifying the distribution, for NUMERIC timestamps",
+      "verdict": "FALSE",
+      "evidence": "a sort TOLD the origin and step is 0.24-0.77 of the engine (1.3-4.2x slower) across six date shapes, and returns WRONG OUTPUT on day-plus-fraction, which has no exact integer form. Predicted 2-4x available"
+    },
+    {
+      "id": "S09",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "Knowing the date format pays when the dates are TEXT",
+      "verdict": "MEASURED",
+      "evidence": "parse to a numeric key + logos_argsort_f64 + one gather is 8.48x over std::sort on std::string and 4.87x over fixed 24-byte memcmp records, 2M records, one thread. A format is worth what it saves in COMPARISON WIDTH, not in distribution knowledge"
+    },
+    {
+      "id": "S10",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "Projecting each element onto a sphere of radius n (x=value, y=a prime, z=the index) and sorting the projection",
+      "verdict": "FALSE",
+      "evidence": "22.2% of 2.0M pairs at different indices come back order-INVERTED. proj_x = R*x/sqrt(x^2+p^2+z^2), and with z to 8.4M against values to 1e4 the z^2 term dwarfs x^2, so it orders by value/index. Cost alone would NOT have killed it: 2.89 ns/element against the engine's 0.60 ns addressing multiply-add"
+    },
+    {
+      "id": "S11",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The scale report's memory column reproduces make memprobe from an independent code path",
+      "verdict": "MEASURED",
+      "evidence": "logos 15.7 bytes/element at 10M against memprobe's documented 15.5 (1.3%); the strict in-place entry and std::sort both exactly 0.0. Agreement between two independent instruments"
+    },
+    {
+      "id": "S12",
+      "source": "FINDINGS.md / CHANGELOG.md (2026-09-22/23)",
+      "section": "Measured after the truth table was last written",
+      "statement": "The dispatcher's frame grew across one session and that is the untraced small-call drift",
+      "verdict": "MEASURED",
+      "evidence": "psort_f64 is 36,640 bytes in the committed engine and 42,576 in the working tree; stack-clash protection probes every 4096-byte page on every call, so 9 probes against 11 -- two extra on a ~17ns sorted call, which matches the recorded 1.08-1.14 drift"
+    }
+  ]
+}

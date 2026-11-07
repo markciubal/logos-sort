@@ -449,6 +449,490 @@ static int dense_checks(void) {
  * its comparator has no total order over NaN, so it checks the property that matters for this route instead:
  * with a NaN present the route must decline, so the output must be bit-identical to a run with the route
  * switched off. One thread keeps that comparison deterministic. ---- */
+/* ---- runs of equal values (2026-10-20, make rleprobe): the route collapses each run of bit-equal values to (key, length), sorts
+ * the pairs, writes the runs back. Every row names what must happen (logos_twist_last(28) counts the sorts it finished) and checks
+ * the output ascending under < and the same BIT patterns as the input: runs of -0.0 and +0.0 (equal, but distinct runs), NaN runs
+ * with different payloads (order unspecified, bits kept), infinities, runs already in order but one pair swapped, a run longer than
+ * the gate's windows. It must decline on runs of two, below RLE_MIN_N and in a parallel sort. ---- */
+static int rle_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    if (getenv("LOGOS_NO_RLE")) { printf("  runs of equal values: LOGOS_NO_RLE set, skipped\n"); return 0; }
+    struct { const char *what; size_t n; int L, kind, P, expect; } rows[] = {
+        { "runs of 4", 300001, 4, 0, 1, 1 }, { "runs of 8", 1000003, 8, 0, 1, 1 }, { "runs of 16", 70000, 16, 0, 1, 1 }, { "runs of 64", 300001, 64, 0, 1, 1 },
+        { "geometric runs, mean 10", 300001, 10, 1, 1, 1 }, { "signed zeros in runs", 300001, 8, 2, 1, 1 }, { "NaN runs, payloads", 300001, 8, 3, 1, 1 },
+        { "infinities in runs", 300001, 8, 4, 1, 1 }, { "runs in order, four pairs swapped: an order route takes it, not this one", 300001, 8, 5, 1, 0 }, { "one run of 200,000", 300001, 8, 6, 1, 1 },
+        { "runs of 2: must decline", 300001, 2, 0, 1, 0 }, { "below RLE_MIN_N: must decline", 65535, 16, 0, 1, 0 }, { "at RLE_MIN_N", 65536, 16, 0, 1, 1 },
+        { "4 threads: must decline", 1000003, 16, 0, 4, 0 } };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n; int L = rows[r].L, kind = rows[r].kind;
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+        seed(28000 + (uint64_t)r * 13);
+        size_t i = 0, run = 0;
+        while (i < n) {
+            size_t len = kind == 1 ? 1 + (size_t)(-log(frand() + 1e-12) * (double)(L - 1)) : (size_t)L;
+            double v = floor(frand() * 1e6) - 5e5;
+            if (kind == 2) v = (run % 3 == 0) ? -0.0 : (run % 3 == 1) ? 0.0 : v;
+            if (kind == 3 && run % 7 == 0) { uint64_t b = 0x7FF8000000000000ULL | (uint64_t)(run & 0xFFFF) | ((run & 1) ? 0x8000000000000000ULL : 0); memcpy(&v, &b, 8); }
+            if (kind == 4 && run % 5 == 0) v = (run & 1) ? INFINITY : -INFINITY;
+            if (kind == 5) v = (double)run * 2.0 + frand();               /* ascending across runs, and not a lattice */
+            if (kind == 6 && run == 3) len = 200000;
+            for (size_t q = 0; q < len && i < n; q++) orig[i++] = v;
+            run++;
+        }
+        if (kind == 5) for (int q = 1; q < 8; q += 2) {                   /* four pairs of runs swapped, at n/8, 3n/8, 5n/8 and 7n/8: one swap at n/4 is an
+                                                                           unsorted head before a sorted suffix, which the head route (2026-10-20) takes */
+            size_t x = n * (size_t)q / 8; x -= x % (size_t)L;
+            for (size_t z = 0; z < (size_t)L && x + L + z < n; z++) { double t = orig[x + z]; orig[x + z] = orig[x + L + z]; orig[x + L + z] = t; } }
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        memcpy(a, orig, n * sizeof(double)); (void)logos_twist_last(28);
+        logos_sort_f64(a, n, rows[r].P);
+        int fired = logos_twist_last(28) != 0;
+        int ok = 1;
+        if (kind != 3) { for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; } }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  runs of equal values, %s (n=%zu): not a sorted permutation of the input's bits\n", rows[r].what, n); }
+        checks++; asserted++; if (fired != rows[r].expect) { fails++; printf("  FAIL  runs of equal values, %s (n=%zu): the route %s\n", rows[r].what, n, fired ? "ran" : "did not run"); }
+        free(orig); free(a); free(bi); free(bo);
+    }
+    printf("  runs of equal values: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+/* ---- cuts (2026-10-20, orderprobe coarse64k): windows in order, unordered inside. The route finds cuts from the sample, block
+ * extremes and, for a window edge inside a block, that block's running extremes; every segment sorted where it lies. Each row
+ * names what must happen (logos_twist_last(29)) and checks the output ascending under < (NaN rows excepted) and the same BIT
+ * patterns as the input. Windows aligned to the 4096 blocks and not, signed zeros at the cuts, infinities in the end windows, an
+ * unseen NaN; random data, too few windows, one far stray and a parallel sort must decline. ---- */
+static int cuts_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    if (getenv("LOGOS_NO_CUTS")) { printf("  cuts: LOGOS_NO_CUTS set, skipped\n"); return 0; }
+    struct { const char *what; size_t n, W; int kind, P, expect; } rows[] = {
+        { "windows of 65536, aligned", 2097152, 65536, 0, 1, 1 }, { "windows of 50000, edges inside blocks", 2000003, 50000, 0, 1, 1 },
+        { "windows of 100000", 1048576, 100000, 0, 1, 1 }, { "signed zeros at every cut", 2000003, 50000, 1, 1, 1 },
+        { "infinities in the end windows", 2000003, 50000, 2, 1, 1 }, { "an unseen NaN", 2000003, 50000, 3, 1, -1 },
+        { "random: must decline", 2000003, 0, 4, 1, 0 }, { "five windows: must decline", 2000003, 400001, 0, 1, 0 },
+        { "one far stray: must decline", 2000003, 50000, 5, 1, 0 }, { "4 threads: must decline", 2000003, 50000, 0, 4, 0 } };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n, W = rows[r].W; int kind = rows[r].kind;
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+        seed(29000 + (uint64_t)r * 17);
+        for (size_t i = 0; i < n; i++) {
+            if (kind == 4) { orig[i] = frand() * 1e6; continue; }
+            size_t w = i / W; double base = (double)w * (double)W;
+            orig[i] = base + frand() * (double)W * 0.98 + 0.01 * (double)W;
+        }
+        if (kind == 1) {                                                   /* windows around zero, zeros of both signs at that cut */
+            for (size_t i = 0; i < n; i++) { size_t w = i / W; double base = ((double)w - (double)(n / W) / 2.0) * (double)W; orig[i] = base + 0.5 + frand() * ((double)W - 1.0); }
+            size_t z = (n / W / 2) * W;                                    /* the window whose base is 0: its edge is a cut at 0 */
+            orig[z] = 0.0; orig[z + 1] = -0.0; if (z >= 1) orig[z - 1] = -0.0;
+        }
+        if (kind == 2) { orig[3] = -INFINITY; orig[n - 4] = INFINITY; }
+        if (kind == 3) orig[n / 2 + 7] = NAN;
+        if (kind == 5) orig[11] = 1e12;
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        memcpy(a, orig, n * sizeof(double)); (void)logos_twist_last(29);
+        logos_sort_f64(a, n, rows[r].P);
+        int fired = logos_twist_last(29) != 0;
+        int ok = 1;
+        if (kind != 3) { for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; } }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  cuts, %s (n=%zu): not a sorted permutation of the input's bits\n", rows[r].what, n); }
+        if (rows[r].expect >= 0) { checks++; asserted++; if (fired != rows[r].expect) { fails++; printf("  FAIL  cuts, %s (n=%zu): the route %s\n", rows[r].what, n, fired ? "ran" : "did not run"); } }
+        free(orig); free(a); free(bi); free(bo);
+    }
+    printf("  cuts: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+/* ---- the other-fields round (2026-10-21, experiments/OTHER_FIELDS.md, make fieldprobe): five decisions it moved. Each row is
+ * checked as a sorted permutation of the input's BITS and names the branch that must have run, then runs again with its switch
+ * set to show the branch follows the switch. (1) The low-discrepancy probe's coverage test, logos_twist_last(30): legs of 512 take
+ * the kernel; a Weyl sequence and legs of 8192 keep the probe. (2) The founder windows (31). (3) The k-way merge in vectors (32).
+ * (4) The stray cap of 1/16 at one thread (10 = strays lifted). (5) The short-reach probe's threshold at 0.20, on two sources
+ * interleaved at random (logos_reach_last(), three seeds). Rows (2) and (3) need AVX2, and say so when skipped. ---- */
+static void of_gen(double *a, size_t n, int kind) {
+    switch (kind) {
+    case 0: case 2: { size_t p = kind == 0 ? 1024 : 8192, h = p / 2; double sh = 1.0 / (double)(n / p + 2);   /* a triangle, legs of 512; a ramp, legs of 8192 */
+        for (size_t i = 0; i < n; i++) { size_t ph = i % p;
+            a[i] = kind == 0 ? (double)(ph < h ? ph : p - ph) + (double)(i / p) * sh + (ph < h ? 0.0 : 0.5 * sh) : (double)ph + (double)(i / p) * sh; } } break;
+    case 1: for (size_t i = 0; i < n; i++) { double v = (double)i * 0.6180339887498949; a[i] = (v - floor(v)) * 1e6; } break;
+    case 3: for (size_t i = 0; i < n; i++) a[i] = i < 64 ? (double)i : frand() * 1e6; break;
+    case 4: { size_t L = n / 4 + 1; for (size_t i = 0; i < n; i++) a[i] = (double)(i % L) * 4.0 + (double)(i / L) + 0.25; } break;
+    case 5: for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.5;                  /* + 0.5: a permutation of 0..n-1 would go to the dense bitmap */
+        for (size_t q = 0; q < n / 100; q++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; } break;
+    case 6: { size_t h = n / 2, i0 = 0, i1 = 0;                                     /* each source ascending over the whole range, a coin per element */
+        for (size_t i = 0; i < n; i++) { int s = i0 >= h ? 1 : i1 >= n - h ? 0 : (int)(nextr() & 1);
+            a[i] = s ? (double)i1++ * 2.0 + 1.25 : (double)i0++ * 2.0 + 0.25; } } break;
+    }
+}
+static size_t of_witness(int w) {
+    if (w >= 0) return logos_twist_last(w);
+    int r = logos_reach_last(); return r == LOGOS_REACH_SORTED || r == LOGOS_REACH_SORTED_STRAYS;
+}
+static int other_fields_checks(void) {
+    int checks = 0, fails = 0, asserted = 0, avx = logos_twist_last(-4) != 0;
+    struct { const char *what; int kind; size_t n; int w; const char *sw, *val; int on, off, needs_avx, seeds; } rows[] = {
+        { "triangle, legs of 512: the kernel, not the low-discrepancy path", 0, 1048576, 30, "LOGOS_LOWDISC_LOCAL", "1", 0, 1, 0, 1 },
+        { "Weyl sequence: the low-discrepancy path, with the coverage test or without", 1, 1048576, 30, "LOGOS_LOWDISC_LOCAL", "1", 1, 1, 0, 1 },
+        { "ramp, legs of 8192: the low-discrepancy path either way (coarse wins on long clean legs)", 2, 1048576, 30, "LOGOS_LOWDISC_LOCAL", "1", 1, 1, 0, 1 },
+        { "64 sorted integers in front of uniform data: the founder windows settle the profile", 3, 1048576, 31, "LOGOS_SF_FRONT_ONLY", "1", 1, 0, 1, 1 },
+        { "four sorted strands laid end to end: the k-way merge in vectors", 4, 1048576, 32, "LOGOS_RUNMERGE_SCALAR", "1", 1, 0, 1, 1 },
+        { "1% random swaps, one thread: strays lifted under the 1/16 cap", 5, 1048576, 10, "LOGOS_STRAY_DIV", "64", 1, 0, 0, 1 },
+        { "two sources interleaved at random (25% descents): the short-reach route", 6, 2097152, -1, "LOGOS_REACH_DENSE", "0.25", 1, -1, 0, 3 } };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        if (rows[r].needs_avx && !avx) { printf("  other fields: %s -- no AVX2 here, skipped\n", rows[r].what); continue; }
+        for (int s = 0; s < rows[r].seeds; s++) {
+            size_t n = rows[r].n;
+            double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+            uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+            if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+            seed(30000 + (uint64_t)r * 17 + (uint64_t)s * 101);
+            of_gen(orig, n, rows[r].kind);
+            memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+            for (int set = 0; set < 2; set++) {
+                if (set) setenv(rows[r].sw, rows[r].val, 1); else unsetenv(rows[r].sw);
+                memcpy(a, orig, n * sizeof(double)); (void)of_witness(rows[r].w >= 0 ? rows[r].w : 30);
+                logos_sort_f64(a, n, 1);
+                int got = of_witness(rows[r].w) != 0, want = set ? rows[r].off : rows[r].on;
+                unsetenv(rows[r].sw);
+                int ok = 1;
+                for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+                memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+                if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+                checks++; if (!ok) { fails++; printf("  FAIL  other fields, %s%s (seed %d): not a sorted permutation of the input's bits\n", rows[r].what, set ? ", switched" : "", s); }
+                if (want >= 0) { checks++; asserted++;
+                    if (got != want) { fails++; printf("  FAIL  other fields, %s%s (seed %d): the branch %s\n", rows[r].what, set ? " with the switch set" : "", s, got ? "ran" : "did not run"); } }
+            }
+            free(orig); free(a); free(bi); free(bo);
+        }
+    }
+    printf("  other fields: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+/* ---- the dominant-value route (2026-10-22, the memory round): one value holding a large share is filled in around the rest, which
+ * is sorted on its own. Every row checks ascending under < (NaN rows excepted) and the same BIT patterns as the input, and names
+ * whether the route must have run (logos_twist_last(33)): the gates at P > 1 (DOM_SHARE_PAR) and at one thread (DOM_SHARE_SEQ), a
+ * dominant +0.0 with -0.0 among the rest and the other way round, a dominant +inf, a NaN the sample cannot see, a failed buffer
+ * (LOGOS_DOM_FAILALLOC=1: the route declines with nothing moved), the switch. ---- */
+static int domroute_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    if (getenv("LOGOS_NO_DOMINANT")) { printf("  dominant-value route: LOGOS_NO_DOMINANT set, skipped\n"); return 0; }
+    struct { const char *what; size_t n; int share100, kind, P, expect; const char *env; } rows[] = {
+        { "share 0.5, 4 threads", 1000003, 50, 0, 4, 1, NULL }, { "share 0.25, 8 threads", 2000003, 25, 0, 8, 1, NULL },
+        { "share 0.9, 4 threads", 1000003, 90, 0, 4, 1, NULL }, { "share 0.9, one thread", 1000003, 90, 0, 1, 1, NULL },
+        { "share 0.5, one thread: the kernel's, not this route", 1000003, 50, 0, 1, 0, NULL },
+        { "share 0.1, 4 threads: below the gate", 1000003, 10, 0, 4, 0, NULL },
+        { "+0.0 dominant, -0.0 among the rest", 1000003, 60, 1, 4, 1, NULL }, { "-0.0 dominant, +0.0 among the rest", 1000003, 60, 2, 4, 1, NULL },
+        { "+inf dominant, -inf and finite values", 1000003, 60, 3, 4, 1, NULL }, { "an unseen NaN", 1000003, 60, 4, 4, -1, NULL },
+        { "the buffer fails: declines, nothing moved", 1000003, 60, 0, 4, 0, "LOGOS_DOM_FAILALLOC" },
+        { "switched off", 1000003, 60, 0, 4, 0, "LOGOS_NO_DOMINANT" } };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n; int kind = rows[r].kind;
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+        seed(33000 + (uint64_t)r * 7);
+        double v = kind == 1 ? 0.0 : kind == 2 ? -0.0 : kind == 3 ? INFINITY : 12345.0;
+        for (size_t i = 0; i < n; i++) {
+            if ((int)(nextr() % 100) < rows[r].share100) { orig[i] = v; continue; }
+            double x = frand() * 2e9 - 1e9;
+            if (kind == 1 && (nextr() & 7) == 0) x = -0.0;
+            if (kind == 2 && (nextr() & 7) == 0) x = 0.0;
+            if (kind == 3 && (nextr() & 15) == 0) x = -INFINITY;
+            orig[i] = x;
+        }
+        if (kind == 4) orig[n / 2 + 1] = NAN;                           /* one NaN: the sample of a million elements will not see it */
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "1", 1);
+        memcpy(a, orig, n * sizeof(double)); (void)logos_twist_last(33);
+        logos_sort_f64(a, n, rows[r].P);
+        int fired = logos_twist_last(33) != 0;
+        if (rows[r].env) unsetenv(rows[r].env);
+        int ok = 1;
+        if (kind != 4) { for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; } }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  dominant-value route, %s (n=%zu): not a sorted permutation of the input's bits\n", rows[r].what, n); }
+        if (rows[r].expect >= 0) { checks++; asserted++; if (fired != rows[r].expect) { fails++; printf("  FAIL  dominant-value route, %s (n=%zu): the route %s\n", rows[r].what, n, fired ? "ran" : "did not run"); } }
+        free(orig); free(a); free(bi); free(bo);
+    }
+    printf("  dominant-value route: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+/* ---- half the scratch (2026-10-24, the second memory round): the knot route at one thread and the tail and head routes' vector
+ * merge place with half an n-element scratch (half_place), and the float32 radix keeps its keys in the input. Every row checks
+ * ascending order and the input's BIT multiset, and names whether a half placement must have run (logos_twist_last(34)): shuffled
+ * blocks, half of them descending, with signed zeros in one; a staircase (two-strand crossings, one split at the midpoint); sorted
+ * data with 1% random swaps (strays, merged back from the top, and crossings of three or more); two sorted halves (the tail route:
+ * one merge split at its merge path); a random head before a sorted suffix, three ways (the head route; the head above every suffix
+ * value and below it put the whole lower or upper half in one piece); sizes on both sides of HALF_MIN_N; LOGOS_PLACE_FULL=1. Then
+ * the float32 radix both ways (LOGOS_F32_TWOBUF), with declines at the second, the middle and the last element: a decline widens
+ * the keys back, and a wrong widening shows as a changed multiset. ---- */
+static int half_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    enum { H_BLOCKS, H_TWIST, H_ZEROS, H_STAIRS, H_NEAR, H_HALVES, H_HEAD, H_HEADHI, H_HEADLO, H_STRANDS, H_STRANDS5, H_STRANDS_TW, H_TIES4, H_SINE };
+    struct { const char *what; int kind; size_t n; int expect; const char *env; } rows[] = {
+        { "64 shuffled blocks", H_BLOCKS, 1000003, 1, NULL }, { "64 blocks, every other descending", H_TWIST, 1000003, 1, NULL },
+        { "blocks, signed zeros in one", H_ZEROS, 300001, 1, NULL }, { "staircase of 20", H_STAIRS, 1000003, 1, NULL },
+        { "1% random swaps: strays", H_NEAR, 1000003, 1, NULL }, { "two sorted halves: the tail route", H_HALVES, 1000003, 1, NULL },
+        { "a random head of 30%: the head route", H_HEAD, 1000003, 1, NULL }, { "head above the suffix: one piece below", H_HEADHI, 300001, 1, NULL },
+        { "head below the suffix: one piece above", H_HEADLO, 300001, 1, NULL }, { "four interleaved strands: one crossing split by value", H_STRANDS, 1000003, 1, NULL },
+        { "five interleaved strands", H_STRANDS5, 1000003, 1, NULL }, { "four strands, two of them descending", H_STRANDS_TW, 1000003, 1, NULL },
+        { "four identical strands: ties at the cut", H_TIES4, 1000003, 1, NULL }, { "a sloped sine: the wave route", H_SINE, 2000003, 1, NULL },
+        { "blocks at HALF_MIN_N", H_BLOCKS, 65536, 1, NULL }, { "blocks one below it", H_BLOCKS, 65535, 0, NULL },
+        { "two halves one below it", H_HALVES, 65535, 0, NULL }, { "blocks, LOGOS_PLACE_FULL=1", H_BLOCKS, 1000003, 0, "LOGOS_PLACE_FULL" },
+        { "1% swaps, LOGOS_PLACE_FULL=1", H_NEAR, 1000003, 0, "LOGOS_PLACE_FULL" },
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n; int kind = rows[r].kind;
+        double *a = malloc(n * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!a || !bi || !bo) { free(a); free(bi); free(bo); printf("  half the scratch: skipped a row (no memory)\n"); continue; }
+        seed(24100 + r);
+        if (kind == H_BLOCKS || kind == H_TWIST || kind == H_ZEROS) {
+            size_t nb = 64, blk = n / nb, perm[64];
+            for (size_t k = 0; k < nb; k++) perm[k] = k;
+            for (size_t k = nb - 1; k > 0; k--) { size_t s = nextr() % (k + 1), x = perm[k]; perm[k] = perm[s]; perm[s] = x; }
+            for (size_t i = 0; i < n; i++) {
+                size_t k = i / blk < nb ? i / blk : nb - 1, o = i - k * blk, L = k == nb - 1 ? n - k * blk : blk;
+                a[i] = (double)(perm[k] * blk) + (kind == H_TWIST && (perm[k] & 1) ? (double)(L - 1 - o) : (double)o) + 0.5;
+                if (kind == H_ZEROS) a[i] = (a[i] - (double)(n / 2) - 0.5) * 0.5;      /* half-integers (no dense-integer route), 0 among them */
+            }
+            if (kind == H_ZEROS) for (size_t i = 0; i + 1 < n; i++) if (a[i] == 0.0 && a[i + 1] == 0.5) {   /* 0, 0.5 become -0.0, +0.0: a tie keeps the run */
+                a[i] = -0.0; a[i + 1] = 0.0; break;
+            }
+        } else if (kind == H_STAIRS) { size_t L = n / 20 + 1; for (size_t i = 0; i < n; i++) { size_t b = i / L; a[i] = (double)b * (double)L * 0.9 + (double)(i - b * L) + 0.25; } }
+        else if (kind == H_NEAR) { for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.5;
+                                   for (size_t k = 0; k < n / 100; k++) { size_t i = nextr() % n, j = nextr() % n; double t = a[i]; a[i] = a[j]; a[j] = t; } }
+        else if (kind == H_HALVES) for (size_t i = 0; i < n; i++) a[i] = i < n / 2 ? (double)i * 2.0 + 0.25 : (double)(i - n / 2) * 2.0 + 1.25;
+        else if (kind == H_HEAD) for (size_t i = 0; i < n; i++) a[i] = i < n * 3 / 10 ? frand() * (double)n : (double)i + 0.5;
+        else if (kind == H_HEADHI) for (size_t i = 0; i < n; i++) a[i] = i < n * 4 / 10 ? 2.0 * (double)n + frand() * (double)n : (double)i + 0.5;
+        else if (kind == H_HEADLO) for (size_t i = 0; i < n; i++) a[i] = i < n * 4 / 10 ? -frand() * (double)n - 1.0 : (double)i + 0.5;
+        else if (kind == H_STRANDS) { size_t L = n / 4 + 1; for (size_t i = 0; i < n; i++) a[i] = (double)(i % L) * 4.0 + (double)(i / L) + 0.25; }
+        else if (kind == H_STRANDS5) { size_t L = n / 5 + 1; for (size_t i = 0; i < n; i++) a[i] = (double)(i % L) * 5.0 + (double)(i / L) + 0.25; }
+        else if (kind == H_STRANDS_TW) { size_t L = n / 4 + 1; for (size_t i = 0; i < n; i++) { size_t r = i / L, o = i % L, Lr = r == 3 ? n - 3 * L : L;
+                                         a[i] = (double)((r & 1) ? Lr - 1 - o : o) * 4.0 + (double)r + 0.25; } }
+        else if (kind == H_TIES4) { size_t L = n / 4 + 1; for (size_t i = 0; i < n; i++) a[i] = (double)(i % L) + 0.5; }
+        else { double T = (double)n / 32.0, A = 0.6 * T / 2.0; for (size_t i = 0; i < n; i++) a[i] = (double)i + A * sin(6.283185307179586 * (double)i / T) + (frand() * 2.0 - 1.0) * 50.0; }
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "1", 1);
+        (void)logos_twist_last(34);
+        logos_sort_f64(a, n, 1);
+        int fired = logos_twist_last(34) != 0;
+        if (rows[r].env) unsetenv(rows[r].env);
+        int ok = 1; for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  half the scratch, %s (n=%zu): not a sorted permutation of the input's bits\n", rows[r].what, n); }
+        if (rows[r].expect >= 0) { checks++; asserted++; if (fired != rows[r].expect) { fails++; printf("  FAIL  half the scratch, %s (n=%zu): the half placement %s\n", rows[r].what, n, fired ? "ran" : "did not run"); } }
+        free(a); free(bi); free(bo);
+    }
+    /* the partition's regions: borrowed from the pool's block (logos_twist_last(35)), or their own with LOGOS_HF_OWN=1 */
+    for (int own = 0; own < 2; own++) {
+        size_t n2 = 2000003; double *x = malloc(n2 * sizeof(double)); uint64_t *xi = malloc(n2 * sizeof(uint64_t)), *xo = malloc(n2 * sizeof(uint64_t));
+        if (!x || !xi || !xo) { free(x); free(xi); free(xo); continue; }
+        seed(24300 + (uint64_t)own); for (size_t i = 0; i < n2; i++) x[i] = frand() * 2e9 - 1e9;
+        memcpy(xi, x, n2 * sizeof(double)); qsort(xi, n2, sizeof(uint64_t), cmp_bits);
+        if (own) setenv("LOGOS_HF_OWN", "1", 1);
+        (void)logos_twist_last(35); logos_sort_f64(x, n2, 8); size_t pooled = logos_twist_last(35);
+        if (own) unsetenv("LOGOS_HF_OWN");
+        int ok = 1; for (size_t q = 1; q < n2; q++) if (x[q] < x[q - 1]) { ok = 0; break; }
+        memcpy(xo, x, n2 * sizeof(double)); qsort(xo, n2, sizeof(uint64_t), cmp_bits); if (memcmp(xi, xo, n2 * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  half the scratch, the partition%s: wrong output\n", own ? " LOGOS_HF_OWN=1" : ""); }
+        checks++; asserted++; if ((pooled > 0) != !own) { fails++; printf("  FAIL  half the scratch, the partition%s: regions in the pool's block %zu times\n", own ? " LOGOS_HF_OWN=1" : "", pooled); }
+        free(x); free(xi); free(xo);
+    }
+    /* LOGOS_LOWMEM=1: the in-place partition (logos_twist_last(24)) and the hard trim, together; the output as always */
+    { size_t n2 = 2000003; double *x = malloc(n2 * sizeof(double)); uint64_t *xi = malloc(n2 * sizeof(uint64_t)), *xo = malloc(n2 * sizeof(uint64_t));
+      if (x && xi && xo) {
+        seed(24400); for (size_t i = 0; i < n2; i++) x[i] = frand() * 2e9 - 1e9;
+        memcpy(xi, x, n2 * sizeof(double)); qsort(xi, n2, sizeof(uint64_t), cmp_bits);
+        setenv("LOGOS_LOWMEM", "1", 1); (void)logos_twist_last(24); logos_sort_f64(x, n2, 8); size_t ip = logos_twist_last(24); unsetenv("LOGOS_LOWMEM");
+        int ok = 1; for (size_t q = 1; q < n2; q++) if (x[q] < x[q - 1]) { ok = 0; break; }
+        memcpy(xo, x, n2 * sizeof(double)); qsort(xo, n2, sizeof(uint64_t), cmp_bits); if (memcmp(xi, xo, n2 * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  half the scratch, LOGOS_LOWMEM=1: wrong output\n"); }
+        checks++; asserted++; if (!ip) { fails++; printf("  FAIL  half the scratch, LOGOS_LOWMEM=1: the in-place partition did not run\n"); }
+      }
+      free(x); free(xi); free(xo); }
+    /* the float32 radix, keys in the input (shipped) and in aux (LOGOS_F32_TWOBUF=1): the same multiset, and the path fires exactly
+       where every value is a float */
+    const size_t n = 300007;
+    double *a = malloc(n * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+    if (a && bi && bo) for (int tb = 0; tb < 2; tb++) for (int mode = 0; mode < 6; mode++) {
+        seed(24200 + (uint64_t)mode);
+        for (size_t i = 0; i < n; i++) a[i] = (double)(float)(frand() * 2e6 - 1e6);
+        a[11] = -0.0; a[12] = 0.0;
+        int expect = 1, nan = 0;
+        if (mode == 1) for (size_t i = 0; i < n; i++) { uint32_t u = 0x3F800000u + (uint32_t)(nextr() % 4000000); float f; memcpy(&f, &u, 4); a[i] = f; }   /* two passes */
+        if (mode == 2) { a[1] = 0.1; expect = 0; }                                    /* declines at the second element */
+        if (mode == 3) { a[n / 2] = 0.1; expect = 0; }
+        if (mode == 4) { a[n - 1] = 0.1; expect = 0; }                                /* at the last: every key widened back */
+        if (mode == 5) { a[n - 1] = NAN; expect = 0; nan = 1; }
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (tb) setenv("LOGOS_F32_TWOBUF", "1", 1);
+        (void)logos_twist_last(22);
+        logos_sort_f64(a, n, 1);
+        size_t fired = logos_twist_last(22);
+        if (tb) unsetenv("LOGOS_F32_TWOBUF");
+        int ok = 1; if (!nan) for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  half the scratch, float32 mode %d%s: wrong output\n", mode, tb ? " LOGOS_F32_TWOBUF=1" : ""); }
+        if (logos_twist_last(-8)) { checks++; asserted++;
+            if ((fired > 0) != expect) { fails++; printf("  FAIL  half the scratch, float32 mode %d%s: the path fired %zu times, expected %s\n", mode, tb ? " LOGOS_F32_TWOBUF=1" : "", fired, expect ? "once" : "never"); } }
+    }
+    free(a); free(bi); free(bo);
+    printf("  half the scratch: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+/* ---- the lattice entry (2026-10-31, the boundary round): a lattice the sample cannot see repeat goes to the lattice route when it
+ * leaves 8 (P + 1) elements per slot (logos_twist_last(36)), and an element off the lattice, outside its window or a second double
+ * on one lattice point is spilled, sorted on its own and merged back, at any thread count (logos_twist_last(37), elements).
+ * Every row checks ascending order (unless a NaN is present) and the input's BIT multiset, and names both witnesses. The HIDDEN rows
+ * are white-box: they plant off-lattice values everywhere except the sampler's Weyl positions (the first 2048, a superset of the 384
+ * a one-thread sort reads), at 2.5% (spilled: under the n/32 budget) and 4% (past it: the route declines). If the sampler changes,
+ * those rows fail by name. ---- */
+static size_t harness_weyl(size_t i, size_t n) { double f = (double)i * 0.6180339887498949; f -= (double)(uint64_t)f; size_t q = (size_t)(f * (double)n); return q < n ? q : n - 1; }
+static int lat1_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    enum { L_LAT, L_LATEOFF, L_SENT, L_ZEROS, L_PRICE, L_HIDDEN, L_NANLATE, L_UNI, L_ONEOFF };
+    struct { const char *what; int kind; size_t k, n; int P; const char *env; int e36, e37; } rows[] = {
+        { "30,000 lattice values", L_LAT, 30000, 1000003, 1, NULL, 1, 0 },
+        { "50,000 lattice values (the step's divisors)", L_LAT, 50000, 1000003, 1, NULL, 1, 0 },
+        { "131,072 values: 7.6 a slot, declined", L_LAT, 131072, 1000003, 1, NULL, 0, 0 },
+        { "the last 0.05% off the lattice: spilled", L_LATEOFF, 30000, 1000003, 1, NULL, 1, 1 },
+        { "integers with 16 far sentinels at the end", L_SENT, 20000, 1000003, 1, NULL, 1, 1 },
+        { "integers, one -0.0 among the zeros", L_ZEROS, 20000, 1000003, 1, NULL, 1, 1 },
+        { "cents", L_PRICE, 100000, 2000003, 1, NULL, 1, -1 },
+        { "2.5% off the lattice, hidden from the sample: spilled", L_HIDDEN, 25, 1000003, 1, NULL, 1, 1 },
+        { "the same, LOGOS_NO_LATVEC=1 (the scalar map spills)", L_HIDDEN, 25, 1000003, 1, "LOGOS_NO_LATVEC", 1, 1 },
+        { "4% off, hidden: past the spill budget, declined", L_HIDDEN, 40, 1000003, 1, NULL, 0, 0 },
+        { "a NaN at the end: declined", L_NANLATE, 30000, 1000003, 1, NULL, 0, 0 },
+        { "LOGOS_NO_LAT1=1", L_LAT, 30000, 1000003, 1, "LOGOS_NO_LAT1", 0, 0 },
+        { "LOGOS_LAT_NO_SPILL=1, the last 0.05% off: declined", L_LATEOFF, 30000, 1000003, 1, "LOGOS_LAT_NO_SPILL", 0, 0 },
+        { "LOGOS_LAT_DIV1=1, 50,000 values", L_LAT, 50000, 1000003, 1, "LOGOS_LAT_DIV1", -1, 0 },
+        { "four threads, integers with far sentinels: the counting block's lattice, spilled", L_SENT, 20000, 1000003, 4, NULL, 0, 1 },
+        { "four threads, 30,000 values: the counting block's", L_LAT, 30000, 1000003, 4, NULL, 0, 0 },
+        { "two threads, 60,000 values at 2M: 33 a slot", L_LAT, 60000, 2000003, 2, NULL, 1, 0 },
+        { "two threads, the last 0.05% off: spilled", L_LATEOFF, 60000, 2000003, 2, NULL, 1, 1 },
+        { "two threads, 65,536 values at 1M: 15 a slot, declined", L_LAT, 65536, 1000003, 2, NULL, 0, 0 },
+        { "eight threads, integers with far sentinels: spilled", L_SENT, 20000, 2000003, 8, NULL, 0, 1 },
+        { "eight threads, the same, LOGOS_LAT_NO_SPILL=1: declined", L_SENT, 20000, 2000003, 8, "LOGOS_LAT_NO_SPILL", 0, 0 },
+        { "uniform doubles", L_UNI, 0, 1000003, 1, NULL, 0, 0 },
+        { "one SAMPLED value off the lattice: a step of 0.05 would be 5x too fine, declined", L_ONEOFF, 30000, 1000003, 1, NULL, 0, 0 },
+        { "the same at four threads (the counting block's lattice)", L_ONEOFF, 30000, 1000003, 4, NULL, 0, 0 },
+        { "n = 600,000, 30,000 values: 20 a slot", L_LAT, 30000, 600000, 1, NULL, 1, 0 },
+        { "n = 300,000, 30,000 values: 10 a slot, declined", L_LAT, 30000, 300000, 1, NULL, 0, 0 },
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n, k = rows[r].k; int kind = rows[r].kind, nan = 0;
+        double *a = malloc(n * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        unsigned char *hold = kind == L_HIDDEN ? calloc(n, 1) : NULL;
+        if (!a || !bi || !bo || (kind == L_HIDDEN && !hold)) { free(a); free(bi); free(bo); free(hold); printf("  lattice entry: skipped a row (no memory)\n"); continue; }
+        seed(24500 + r);
+        if (kind == L_LAT || kind == L_LATEOFF || kind == L_HIDDEN || kind == L_NANLATE || kind == L_ONEOFF) for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % (kind == L_HIDDEN ? 30000 : k)) * 0.25 + 3.0;
+        if (kind == L_LATEOFF) for (size_t i = n - n / 2000; i < n; i++) a[i] += 0.1;
+        if (kind == L_HIDDEN) { for (size_t i = 0; i < 2048; i++) hold[harness_weyl(i, n)] = 1;
+                                for (size_t i = 0; i < n; i++) if (!hold[i] && nextr() % 1000 < k) a[i] += 0.1; }
+        if (kind == L_NANLATE) { a[n - 1] = NAN; nan = 1; }
+        if (kind == L_ONEOFF) a[harness_weyl(1, n)] += 0.1;                        /* read by every sampler: the first Weyl point after a[0] */
+        if (kind == L_SENT) { for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % k); for (size_t q = 0; q < 16; q++) a[n - 1 - q] = q & 1 ? 1e9 : -1e9; }
+        if (kind == L_ZEROS) { for (size_t i = 0; i < n; i++) a[i] = (double)((long long)(nextr() % k) - (long long)(k / 2)); a[5] = -0.0; }
+        if (kind == L_PRICE) for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % k) / 100.0;
+        if (kind == L_UNI) for (size_t i = 0; i < n; i++) a[i] = frand() * 2e9 - 1e9;
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "1", 1);
+        (void)logos_twist_last(36); (void)logos_twist_last(37); (void)logos_twist_last(23);
+        logos_sort_f64(a, n, rows[r].P);
+        size_t fired = logos_twist_last(36), spilled = logos_twist_last(37), mapped = logos_twist_last(23);   /* 23: the vector lattice map ran */
+        if (rows[r].env) unsetenv(rows[r].env);
+        int ok = 1; if (!nan) for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  lattice entry, %s (n=%zu): not a sorted permutation of the input's bits\n", rows[r].what, n); }
+#if !defined(LOGOS_NO_LATTICE) && !defined(LOGOS_NO_MODCARD) && !defined(LOGOS_NO_SODO)
+        if (rows[r].e36 >= 0) { checks++; asserted++; if ((fired > 0) != rows[r].e36) { fails++; printf("  FAIL  lattice entry, %s (n=%zu): the entry %s\n", rows[r].what, n, fired ? "ran" : "did not run"); } }
+        if (rows[r].e37 >= 0) { checks++; asserted++; if ((spilled > 0) != rows[r].e37) { fails++; printf("  FAIL  lattice entry, %s (n=%zu): %zu elements spilled\n", rows[r].what, n, spilled); } }
+        if ((kind == L_ONEOFF || r == 0) && logos_twist_last(-5)) { checks++; asserted++;       /* a too-fine step declines BEFORE the map */
+            if ((mapped > 0) != (r == 0)) { fails++; printf("  FAIL  lattice entry, %s (n=%zu): the lattice map %s\n", rows[r].what, n, mapped ? "ran" : "did not run"); } }
+#else
+        (void)fired; (void)spilled; (void)mapped;
+#endif
+        free(a); free(bi); free(bo); free(hold);
+    }
+    printf("  lattice entry: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+/* ---- the near-sorted route's strand gate (2026-11-06, FINDINGS 3bw): at P > 1 sorted runs lying IN ORDER and overlapping their
+ * neighbours must NOT be taken by the near-sorted route (the pre-gate's windows see no descent, the position-ordered sample sees
+ * one per strand boundary: logos_twist_last(38) counts the decline), and sorted data with scattered swaps must still be taken (the
+ * windows see the swaps: 38 reads 0). Every row checks ascending order and the input's BIT multiset; the shapes are shuffled or
+ * overlapping so that the prescan cannot return them first. ---- */
+enum { S_STAIRS, S_LATE, S_SWAPPED, S_NEAR, S_NEARFEW, S_SHORTSWAPS, S_STAIRS_NAN, S_STAIRS_NANSAMP };
+/* noinline, in its own function: with the generation inline in nsstrand_checks GCC 13.3 died with an internal compiler error
+   (patch_jump_insn, cfgrtl.cc:1295, during the cprop pass), 2026-11-06. Returns 1 when the row holds a NaN. */
+static __attribute__((noinline)) int nsstrand_gen(int kind, double *a, size_t n) {
+    size_t nb = 64, blk = (n + nb - 1) / nb; int nan = 0;
+    if (kind == S_STAIRS || kind == S_LATE || kind == S_STAIRS_NAN || kind == S_STAIRS_NANSAMP) for (size_t i = 0; i < n; i++) a[i] = (double)(i / blk) * (double)blk + (double)(i % blk) * 1.2 + frand() * 0.5;
+    else for (size_t i = 0; i < n; i++) a[i] = (double)i + frand() * 0.5;
+    if (kind == S_LATE) for (size_t b = 8; b + 4 <= nb && (b + 4) * blk <= n; b += 16) {           /* rotate blocks b..b+3 left by one block */
+        size_t lo = b * blk, mid = lo + blk, hi = lo + 4 * blk; double *t = malloc((hi - lo) * sizeof(double));
+        if (t) { memcpy(t, a + mid, (hi - mid) * sizeof(double)); memcpy(t + (hi - mid), a + lo, blk * sizeof(double)); memcpy(a + lo, t, (hi - lo) * sizeof(double)); free(t); } }
+    if (kind == S_SWAPPED) for (size_t b = 4; b < 4 + 6 * 8 && (b + 2) * blk <= n; b += 8) for (size_t i = 0; i < blk; i++) { double t = a[b * blk + i]; a[b * blk + i] = a[(b + 1) * blk + i]; a[(b + 1) * blk + i] = t; }
+    if (kind == S_NEAR || kind == S_NEARFEW) { size_t k = kind == S_NEAR ? n / 100 : n / 1000; for (size_t q = 0; q < k; q++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; } }
+    if (kind == S_SHORTSWAPS) for (size_t q = 0; q < n / 50; q++) { size_t x = nextr() % n, y = x + 1 + nextr() % 2048; if (y < n) { double t = a[x]; a[x] = a[y]; a[y] = t; } }
+    if (kind == S_STAIRS_NAN) { a[n - 1] = NAN; nan = 1; }
+    if (kind == S_STAIRS_NANSAMP) { a[harness_weyl(1, n)] = NAN; nan = 1; }               /* the first Weyl point after a[0]: every sampler reads it */
+    return nan;
+}
+static int nsstrand_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    struct { const char *what; int kind; size_t n; int P; const char *env; int e38; } rows[] = {
+        { "64 sorted runs in order, overlapping 20%: strands, declined", S_STAIRS, 1000003, 8, NULL, 1 },
+        { "the same at two threads", S_STAIRS, 1000003, 2, NULL, 1 },
+        { "the same, LOGOS_NO_NSSTRAND=1: the route is not turned away by this gate", S_STAIRS, 1000003, 8, "LOGOS_NO_NSSTRAND", 0 },
+        { "the same, LOGOS_NS_GATE_OLD=1: the old pre-gate has no strand gate", S_STAIRS, 1000003, 8, "LOGOS_NS_GATE_OLD", 0 },
+        { "the same with a NaN at the END, which no Weyl position reads: the gate fires, the output is a permutation", S_STAIRS_NAN, 1000003, 8, NULL, 1 },
+        { "the same with a NaN at a SAMPLED position: no verdict (sample_by_pos declines a NaN), the route declines on its own", S_STAIRS_NANSAMP, 1000003, 8, NULL, 0 },
+        { "four batches three places late", S_LATE, 1000003, 8, NULL, 1 },
+        /* six pairs, not eight: eight put the sample's lag-144 inversion rate at 0.025, which is the route's own gate below 6M elements
+           (it declines before this gate is reached, and the row would not be testing the gate) */
+        { "six neighbouring block pairs swapped", S_SWAPPED, 1000003, 8, NULL, 1 },
+        { "sorted + 1% random swaps: strays, taken", S_NEAR, 1000003, 8, NULL, 0 },
+        { "sorted + 0.1% random swaps: taken", S_NEARFEW, 1000003, 8, NULL, 0 },
+        { "sorted + 2% swaps within 2048 places: taken", S_SHORTSWAPS, 1000003, 8, NULL, 0 },
+        { "one thread, 64 runs in order (the gate is a parallel decision)", S_STAIRS, 1000003, 1, NULL, 0 },
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n;
+        double *a = malloc(n * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!a || !bi || !bo) { free(a); free(bi); free(bo); printf("  strand gate: skipped a row (no memory)\n"); continue; }
+        seed(26100 + r);
+        int nan = nsstrand_gen(rows[r].kind, a, n);
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "1", 1);
+        (void)logos_twist_last(38);
+        logos_sort_f64(a, n, rows[r].P);
+        size_t declined = logos_twist_last(38);
+        if (rows[r].env) unsetenv(rows[r].env);
+        int ok = 1; if (!nan) for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  strand gate, %s (n=%zu, P=%d): not a sorted permutation of the input's bits\n", rows[r].what, n, rows[r].P); }
+#if !defined(LOGOS_NO_NEARSORTED) && !defined(LOGOS_NO_NSSTRAND) && !defined(LOGOS_NS_OLD)
+        checks++; asserted++;
+        if ((declined > 0) != rows[r].e38) { fails++; printf("  FAIL  strand gate, %s (n=%zu, P=%d): the gate %s\n", rows[r].what, n, rows[r].P, declined ? "declined the route" : "did not fire"); }
+#else
+        (void)declined;
+#endif
+        free(a); free(bi); free(bo);
+    }
+    printf("  strand gate: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
 static int tail_checks(void) {
     int checks = 0, fails = 0;
     const int threads[] = { 1, 4, 4 };              /* the third runs with LOGOS_TAIL_SEQ=1: parallel sorts decline the route */
@@ -521,6 +1005,72 @@ static int tail_checks(void) {
             }
             free(orig); free(ref);
         }
+    }
+    /* The sequential merge's three forms (2026-10-20, make tailladder): a half -> the vector merge where the build and CPU have it
+       (logos_twist_last(-4)), else the loop; a tail of n/1000 -> the gallop; 5% -> the loop; LOGOS_TAIL_BRANCHY=1 -> the loop at any
+       size. Each row names the form it expects (logos_twist_last(-11)) and checks the output ascending under < and the same BIT
+       patterns as the input: the prefix and tail carry both signed zeros, which compare equal and must both survive the merge. */
+    {
+        int vec = logos_twist_last(-4) != 0, named = 0;
+        const size_t ns[] = { 70000, 300001 };
+        struct { double tf; int branchy, expect; const char *what; } rows[] = {
+            { 0.5, 0, 3, "half" }, { 0.001, 0, 2, "n/1000 tail" }, { 0.05, 0, 1, "5% tail" }, { 0.5, 1, 1, "half, LOGOS_TAIL_BRANCHY" } };
+        for (size_t ni = 0; ni < 2; ni++) for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+            size_t n = ns[ni], tl = (size_t)(rows[r].tf * (double)n), d = n - tl;
+            double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+            uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+            if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+            seed(5150 + (uint64_t)r * 7 + ni);
+            for (size_t i = 0; i < n; i++) { double v = floor(frand() * 2000.0) - 1000.0; orig[i] = v == 0.0 ? ((i & 1) ? -0.0 : 0.0) : v; }
+            qsort(orig, d, sizeof(double), cmp_d);
+            if (d && orig[d - 1] > orig[d]) {}                                  /* the tail is random: the prescan stops at d or later */
+            memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+            memcpy(a, orig, n * sizeof(double));
+            if (rows[r].branchy) setenv("LOGOS_TAIL_BRANCHY", "1", 1);
+            logos_sort_f64(a, n, 1);
+            unsetenv("LOGOS_TAIL_BRANCHY");
+            int kind = (int)logos_twist_last(-11), expect = rows[r].expect == 3 && !vec ? 1 : rows[r].expect;
+            int ok = 1; for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  tail merge %s n=%zu: not a sorted permutation of the input's bits\n", rows[r].what, n); }
+            checks++; named++; if (kind != expect) { fails++; printf("  FAIL  tail merge %s n=%zu: form %d, expected %d\n", rows[r].what, n, kind, expect); }
+            free(orig); free(a); free(bi); free(bo);
+        }
+        printf("  tail route: the merge's form named in %d rows (vector merge %s)\n", named, vec ? "available" : "NOT in this build or CPU: the loop expected");
+    }
+    /* The HEAD route (2026-10-20, symprobe): an unsorted head before a sorted suffix, the tail's mirror. Each row is a tail row's
+       array negated and reversed; it names the form (logos_twist_last(-12), 0 = the route did not run) and checks the output against
+       the input's bits. Signed zeros in both pieces; a NaN in the head must decline; a parallel sort must not take it. */
+    {
+        int vec = logos_twist_last(-4) != 0, named = 0;
+        struct { double hf; size_t n; int P, nan, expect; const char *what; } rows[] = {
+            { 0.5, 300001, 1, 0, 3, "half" }, { 0.001, 300001, 1, 0, 2, "n/1000 head" }, { 0.05, 300001, 1, 0, 1, "5% head" },
+            { 0.05, 70000, 1, 0, 1, "5% head, 70000" }, { 0.05, 300001, 1, 1, 0, "NaN in the head: must decline" },
+            { 0.05, 1000003, 4, 0, 0, "4 threads: must not take it" } };
+        for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+            size_t n = rows[r].n, hl = (size_t)(rows[r].hf * (double)n), d = n - hl;
+            double *x = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+            uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+            if (!x || !a || !bi || !bo) { free(x); free(a); free(bi); free(bo); continue; }
+            seed(5250 + (uint64_t)r * 11);
+            for (size_t i = 0; i < n; i++) { double v = floor(frand() * 2000.0) - 1000.0; x[i] = v == 0.0 ? ((i & 1) ? -0.0 : 0.0) : v + frand() * 0.5; }
+            qsort(x, d, sizeof(double), cmp_d);
+            for (size_t i = 0; i < n; i++) a[i] = -x[n - 1 - i];
+            if (rows[r].nan) a[hl / 2] = NAN;
+            memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+            (void)logos_twist_last(-12);
+            logos_sort_f64(a, n, rows[r].P);
+            int kind = (int)logos_twist_last(-12), expect = rows[r].expect == 3 && !vec ? 1 : rows[r].expect;
+            int ok = 1;
+            if (!rows[r].nan) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  head route %s n=%zu: not a sorted permutation of the input's bits\n", rows[r].what, n); }
+            checks++; named++; if (kind != expect) { fails++; printf("  FAIL  head route %s n=%zu: form %d, expected %d\n", rows[r].what, n, kind, expect); }
+            free(x); free(a); free(bi); free(bo);
+        }
+        printf("  tail route: the head route's form named in %d rows\n", named);
     }
     printf("  tail route: %d checks, %d failures\n", checks, fails);
     return fails;
@@ -723,7 +1273,9 @@ static void knot_gen(double *a, size_t n, int mode) {
     } break;
     case KM_TINY:    knot_stairs(a, n, n / 64 ? n / 64 : 1, 0.2, 1, 0); break;  /* strands of 64: the run-length bail must fire */
     case KM_TWO: {                                                        /* two strands over one range, every element crosses; 40/60 so that the
-                                                                             sorted-prefix-plus-tail route (prefix >= n/2) does not take it first */
+                                                                             sorted-prefix-plus-tail route (prefix >= n/2) does not take it first.
+                                                                             At one thread the HEAD route (suffix >= n/2, 2026-10-20) takes it, with
+                                                                             the same vector kernel, and counts it in logos_twist_last(13) */
         size_t h = (2 * n) / 5;
         for (size_t i = 0; i < h; i++) a[i] = (double)i * 2.5 + 0.3;
         for (size_t i = h; i < n; i++) a[i] = (double)(i - h) * (5.0 / 3.0) + 1.1;
@@ -951,6 +1503,54 @@ static void gallop_gen(double *a, size_t n, int mode, size_t every) {
         for (size_t i = 0; i < n; i++) { a[i] = floor(a[i]) - floor(mid); if (a[i] == 0.0) a[i] = (flip ^= 1) ? -0.0 : 0.0; }
     }
 }
+/* ---- the vector two-strand merge (2026-09-26): the knot route's balanced crossings through the AVX2 bitonic kernel. Every knot
+ * shape that merges, at one thread and four, sizes that reach the parallel placement; the output must be ascending under < and
+ * the same bit patterns as the input (signed zeros and infinities included), the kernel must have been taken at one thread
+ * (logos_twist_last(13)) and never with LOGOS_NO_SIMD_MERGE=1, and both settings must agree as multisets. Skipped, and said so,
+ * on a build or CPU without it (logos_twist_last(-4)). ---- */
+static int vmerge_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    if (!logos_twist_last(-4)) { printf("  vector merge: not in this build or CPU, skipped\n"); return 0; }
+    const int threads[] = { 1, 4 };
+    const size_t sizes[] = { 70000, 300001, 1000003 };
+    const int modes[] = { KM_SHUF, KM_ZIG, KM_ZIGSHUF, KM_TIES, KM_ZEROS, KM_INF, KM_TRIPLE, KM_TWO, KM_DUPS };
+    for (size_t mi = 0; mi < sizeof modes / sizeof *modes; mi++) for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+        int mode = modes[mi]; size_t n = sizes[si];
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double)), *b = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !b || !bi || !bo) { free(orig); free(a); free(b); free(bi); free(bo); continue; }
+        seed(13100 + (uint64_t)mode * 23 + si);
+        knot_gen(orig, n, mode);
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+            unsetenv("LOGOS_NO_SIMD_MERGE"); unsetenv("LOGOS_NO_KNOT");
+            memcpy(a, orig, n * sizeof(double)); (void)logos_twist_last(13);
+            logos_sort_f64(a, n, threads[ti]);
+            size_t von = logos_twist_last(13);
+            setenv("LOGOS_NO_SIMD_MERGE", "1", 1);
+            memcpy(b, orig, n * sizeof(double));
+            logos_sort_f64(b, n, threads[ti]);
+            size_t voff = logos_twist_last(13);
+            unsetenv("LOGOS_NO_SIMD_MERGE");
+            int ok = 1;
+            for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  vector merge, knot mode %d, n=%zu threads=%d: wrong output\n", mode, n, threads[ti]); }
+            ok = 1; for (size_t i = 1; i < n; i++) if (b[i] < b[i - 1]) { ok = 0; break; }
+            memcpy(bo, b, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  vector merge, knot mode %d, n=%zu threads=%d: wrong output with the kernel off\n", mode, n, threads[ti]); }
+            checks++; asserted++; if (voff) { fails++; printf("  FAIL  vector merge, knot mode %d, n=%zu threads=%d: %zu vector merges with LOGOS_NO_SIMD_MERGE=1\n", mode, n, threads[ti], voff); }
+            if (threads[ti] == 1) { checks++; asserted++;
+                if (!von) { fails++; printf("  FAIL  vector merge, knot mode %d, n=%zu threads=1: the kernel was never taken\n", mode, n); } }
+        }
+        free(orig); free(a); free(b); free(bi); free(bo);
+    }
+    printf("  vector merge: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
 static int gallop_checks(void) {
     int checks = 0, fails = 0, asserted = 0;
     const int threads[] = { 1, 4, 8 };
@@ -968,6 +1568,9 @@ static int gallop_checks(void) {
         if (bits) { memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits); }
         else { memcpy(ref, orig, n * sizeof(double)); qsort(ref, n, sizeof(double), cmp_d); }
         for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+            /* the byte comparison below is the gallop against the SCALAR branch-free merge, whose tie order it reproduces; the
+               vector merge (2026-09-26) orders -0.0 against +0.0 its own way, so it is held off on both sides of this row */
+            setenv("LOGOS_NO_SIMD_MERGE", "1", 1);
             unsetenv("LOGOS_NO_KNOT_GALLOP");
             memcpy(a, orig, n * sizeof(double)); (void)logos_twist_last(5);
             logos_sort_f64(a, n, threads[ti]);
@@ -976,7 +1579,7 @@ static int gallop_checks(void) {
             memcpy(b, orig, n * sizeof(double));
             logos_sort_f64(b, n, threads[ti]);
             size_t goff = logos_twist_last(5);
-            unsetenv("LOGOS_NO_KNOT_GALLOP");
+            unsetenv("LOGOS_NO_KNOT_GALLOP"); unsetenv("LOGOS_NO_SIMD_MERGE");
             int ok = 1;
             if (bits) {
                 for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
@@ -1243,12 +1846,12 @@ static int loop_checks(void) {
  * never run: a wave's pieces sorted where they lie and placed by the knot sweep; a rotation found in the reach route's fences before
  * a block is sorted; strays lifted out of runs in four forms, the holes closed in one pass and the strays merged back in place of
  * the copy-back; and every way of NOT firing (parallel
- * sorts, the switches, strays past the n/64 cap, clean shapes). Every row that can names its path through logos_twist_last:
+ * sorts, the switches, strays past the cap -- n/16 since 2026-10-21, n/64 before, when this row held 3% --, clean shapes). Every row that can names its path through logos_twist_last:
  * 8 = the wave placed it, 9 = the seam rotated it, 10 = strays lifted. Oracle: qsort and a byte
  * compare; the NaN row as the bitwise multiset. ---- */
-enum { R6_WAVE, R6_WAVE2, R6_WAVEWIDE, R6_SINE_CLEAN, R6_SEAM, R6_REACH, R6_STRAY01, R6_STRAY1, R6_STRAY3, R6_STRAYNAN, R6_BLOCKS, R6_UNIFORM, R6_ONEKINK, R6_ONEKINKDESC, R6_ONESTRAY, R6_N };
+enum { R6_WAVE, R6_WAVE2, R6_WAVEWIDE, R6_SINE_CLEAN, R6_SEAM, R6_REACH, R6_STRAY01, R6_STRAY1, R6_STRAY9, R6_STRAYNAN, R6_BLOCKS, R6_UNIFORM, R6_ONEKINK, R6_ONEKINKDESC, R6_ONESTRAY, R6_N };
 static const char *R6_NAME[R6_N] = { "sine 32 cycles, noise 50", "sine 8 cycles, noise 50", "sine 32 cycles, swing 2 (the cost gate declines it)", "sine 32 cycles, no noise", "short reach, rotated (a noisy ring buffer)",
-    "short reach as it lies", "blocks + 0.1% strays", "blocks + 1% strays", "blocks + 3% strays (past the cap)", "blocks + 0.1% strays + a NaN",
+    "short reach as it lies", "blocks + 0.1% strays", "blocks + 1% strays", "blocks + 9% strays (past the cap)", "blocks + 0.1% strays + a NaN",
     "block_perm", "uniform", "one strand, 1% adjacent swaps", "one DESCENDING strand, 1% adjacent swaps", "one strand, 0.1% strays" };
 static void r6_gen(double *a, size_t n, int mode) {
     switch (mode) {
@@ -1264,9 +1867,9 @@ static void r6_gen(double *a, size_t n, int mode) {
         for (size_t i = 0; i < n; i++) a[i] = mode == R6_SEAM ? s[(i + r) % n] : s[i];
         free(s);
     } break;
-    case R6_STRAY01: case R6_STRAY1: case R6_STRAY3: case R6_STRAYNAN: case R6_BLOCKS: {
+    case R6_STRAY01: case R6_STRAY1: case R6_STRAY9: case R6_STRAYNAN: case R6_BLOCKS: {
         knot_stairs(a, n, 64, 0.0, 1, 0);
-        double f = mode == R6_STRAY01 || mode == R6_STRAYNAN ? 0.001 : mode == R6_STRAY1 ? 0.01 : mode == R6_STRAY3 ? 0.03 : 0.0;
+        double f = mode == R6_STRAY01 || mode == R6_STRAYNAN ? 0.001 : mode == R6_STRAY1 ? 0.01 : mode == R6_STRAY9 ? 0.09 : 0.0;
         for (size_t q = 0; q < (size_t)(f * (double)n); q++) a[nextr() % n] = frand() * (double)n;
         if (mode == R6_STRAYNAN && n > 10) a[n / 3] = NAN;
     } break;
@@ -1290,14 +1893,15 @@ static int r6_expect(int mode, size_t n, int threads, int off) {
     switch (mode) {
     case R6_WAVE: case R6_WAVE2: return (!par && n >= (1u << 20)) ? 1 : 0;   /* sequential sorts of a million and up */
     case R6_SEAM: return !par ? 1 : 0;
-    case R6_STRAY01: case R6_STRAY1: return !par ? 1 : 0;
+    case R6_STRAY01: case R6_STRAY1: return 1;                          /* every detector worker lifts strays since 2026-09-26 (it was w[0] at P == 1) */
     case R6_STRAYNAN: return -1;
-    case R6_ONEKINK: return !par ? 1 : -1;                             /* one thread: one run. P threads: a kink across a detection chunk's end is
-                                                                           never repaired, so the strand may come as two runs and take the plan */
+    case R6_ONEKINK: return 1;                                          /* one run at every P since 2026-09-26: the join repairs a kink across a chunk's
+                                                                           end, at either end of the array, and a swapped pair that begins a chunk */
     case R6_ONEKINKDESC: return -1;                                     /* strays are lifted from ASCENDING runs only: a descending strand's unrepaired
                                                                            kinks leave ~100 twisted runs, which the knot route unties (crossing cost 312) */
-    case R6_ONESTRAY: return !par ? 1 : -1;                             /* strays lifted (witness 10), whether one run is left or two */
-    default: return 0;                                                  /* the clean sine (the knot route first), reach as it lies, 3% strays, blocks, noise */
+    case R6_ONESTRAY: return !par ? 1 : -1;                             /* strays lifted (witness 10), whether one run is left or two. At P the reach
+                                                                           probe reads FAR strays as sparse but not kink-shaped, so near-sorted takes it first */
+    default: return 0;                                                  /* the clean sine (the knot route first), reach as it lies, 9% strays, blocks, noise */
     }
 }
 static const char *r6_switch(int mode) {
@@ -1577,6 +2181,872 @@ static void ieee_mix(double *a, size_t n, int mix) {
                  a[i] = ieee_bits(k == 0 ? 0x7FF0000000000001ULL : k == 1 ? 0x7FF8000000000000ULL : k == 2 ? 0xFFF8000000000123ULL : 0xFFF0000000000001ULL); } break;
     }
 }
+/* ---- the persistent worker pool (2026-10-08): parallel phases run on threads kept between calls. Rows: every route that spawns
+ * (partition, lattice, few distinct, sorted input through the parallel prescan, shuffled blocks, near-sorted), at thread counts
+ * that make the pool GROW (2, then 8, then 16) and after a release that STOPS it; a fork after the pool exists, whose child must
+ * sort in parallel and exit (a child inherits the bookkeeping and none of the threads, so without the atfork reset it hangs); and
+ * every row once with LOGOS_NO_POOL=1. Output: ascending under < and the input's bitwise multiset; the pool must have served
+ * groups where it is on (logos_twist_last(19)) and none where it is off. ---- */
+#include <sys/wait.h>
+enum { WP_UNIFORM, WP_QUANT, WP_FEW, WP_SORTED, WP_BLOCKS, WP_NEAR, WP_N };
+static const char *WP_NAME[WP_N] = { "uniform", "quantized", "few distinct", "sorted", "shuffled blocks", "near-sorted" };
+static void wp_gen(double *a, size_t n, int mode) {
+    for (size_t i = 0; i < n; i++) {
+        if (mode == WP_UNIFORM) a[i] = frand() * 2e9 - 1e9;
+        else if (mode == WP_QUANT) a[i] = (double)(nextr() % 4096) / 64.0;
+        else if (mode == WP_FEW) a[i] = (double)(nextr() % 5) * 1e6;
+        else a[i] = (double)i + 0.5;
+    }
+    if (mode == WP_NEAR) for (size_t k = 0; k < n / 100; k++) { size_t i = nextr() % n, j = nextr() % n; double t = a[i]; a[i] = a[j]; a[j] = t; }
+    if (mode == WP_BLOCKS) { size_t nb = 64, blk = n / nb; double *t = malloc(n * sizeof(double)); if (!t) return;
+        size_t perm[64]; for (size_t k = 0; k < nb; k++) perm[k] = k;
+        for (size_t k = nb - 1; k > 0; k--) { size_t r = nextr() % (k + 1); size_t x = perm[k]; perm[k] = perm[r]; perm[r] = x; }
+        size_t o = 0; for (size_t k = 0; k < nb; k++) for (size_t i = perm[k] * blk; i < (perm[k] + 1) * blk; i++) t[o++] = a[i];
+        for (; o < n; o++) t[o] = a[o];
+        memcpy(a, t, n * sizeof(double)); free(t); }
+}
+static int wp_check(const double *a, const uint64_t *bi, uint64_t *bo, size_t n) {
+    for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) return 0;
+    memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+    return memcmp(bi, bo, n * sizeof(uint64_t)) == 0;
+}
+static int pool_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    const size_t n = 1100003;                               /* past PRESCAN_PAR_MIN, so sorted input spawns too */
+    const int threads[] = { 2, 8, 16, 4 };
+    double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+    uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+    if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); printf("  worker pool: skipped (no memory)\n"); return 0; }
+    for (int off = 0; off < 2; off++) for (int mode = 0; mode < WP_N; mode++) {
+        seed(19100 + (uint64_t)mode * 43);
+        wp_gen(orig, n, mode);
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (off) setenv("LOGOS_NO_POOL", "1", 1);
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+            if (ti == 3) logos_release_buffers();                 /* the pool stopped: the next call must build it again */
+            (void)logos_twist_last(19);
+            memcpy(a, orig, n * sizeof(double));
+            logos_sort_f64(a, n, threads[ti]);
+            size_t served = logos_twist_last(19);
+            checks++; if (!wp_check(a, bi, bo, n)) { fails++; printf("  FAIL  worker pool, %s, threads=%d%s: wrong output\n", WP_NAME[mode], threads[ti], off ? ", LOGOS_NO_POOL=1" : ""); }
+            checks++; asserted++;
+            if (off && served) { fails++; printf("  FAIL  worker pool, %s, threads=%d: %zu groups served with LOGOS_NO_POOL=1\n", WP_NAME[mode], threads[ti], served); }
+            if (!off && !served) { fails++; printf("  FAIL  worker pool, %s, threads=%d: the pool served no group\n", WP_NAME[mode], threads[ti]); }
+        }
+        if (off) unsetenv("LOGOS_NO_POOL");
+    }
+    /* fork with the pool alive: the child sorts in parallel and must finish (a watchdog turns a hang into a failure). Not under
+       ThreadSanitizer, whose runtime refuses to start threads in a child forked from a multi-threaded parent ("starting new
+       threads after multi-threaded fork is not supported. Dying"): the child exits and the row would read as wrong output. */
+#ifdef __SANITIZE_THREAD__
+    printf("  worker pool: the fork row is skipped under ThreadSanitizer (its runtime forbids threads after a multi-threaded fork)\n");
+    free(orig); free(a); free(bi); free(bo);
+    printf("  worker pool: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+#endif
+    seed(19900); wp_gen(orig, n, WP_UNIFORM);
+    memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+    memcpy(a, orig, n * sizeof(double)); logos_sort_f64(a, n, 8);           /* the pool exists now */
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        memcpy(a, orig, n * sizeof(double)); logos_sort_f64(a, n, 8);
+        int ok = wp_check(a, bi, bo, n);
+        memcpy(a, orig, n * sizeof(double)); logos_sort_f64(a, n, 4);
+        ok = ok && wp_check(a, bi, bo, n);
+        _exit(ok ? 0 : 3);
+    }
+    int st = 0;
+    checks++; asserted++;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fails++; printf("  FAIL  worker pool: a child forked with the pool alive %s\n", pid < 0 ? "could not be forked" : WIFSIGNALED(st) ? "hung or crashed" : "sorted wrongly");
+    }
+    free(orig); free(a); free(bi); free(bo);
+    printf("  worker pool: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the pool trim (2026-10-08, trim_note / trim_idle): after a large sort, enough small ones hand the large one's pooled pages back
+ * (MADV_DONTNEED), and the next large sort reuses those pages, which now read as zeros. Rows: every route whose buffers are pooled
+ * (the one-thread buffer and context, the parallel partition's regions, relocation, near-sorted; the counting routes pool nothing),
+ * each sorted large, then 12 small
+ * sorts, then large again, the output checked every time; the trim must have handed something back where it is on
+ * (logos_twist_last(21)) and nothing without LOGOS_TRIM (it is opt-in: LOGOS_TRIM=1 or hard, both run). ---- */
+static int trim_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    const size_t n = 1100003, n2 = 20011;
+    struct { int mode, P; } rows[] = { { WP_UNIFORM, 1 }, { WP_UNIFORM, 8 }, { WP_NEAR, 1 }, { WP_NEAR, 8 }, { WP_BLOCKS, 1 }, { WP_BLOCKS, 8 } };
+    double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double)), *s = malloc(n2 * sizeof(double));
+    uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+    if (!orig || !a || !s || !bi || !bo) { free(orig); free(a); free(s); free(bi); free(bo); printf("  pool trim: skipped (no memory)\n"); return 0; }
+    for (int off = 0; off < 2; off++) for (size_t r = 0; r < sizeof rows / sizeof *rows; r++) {
+        int mode = rows[r].mode, P = rows[r].P;
+        logos_release_buffers();
+        if (off) unsetenv("LOGOS_TRIM"); else setenv("LOGOS_TRIM", (r & 1) ? "hard" : "1", 1);   /* opt-in: both forms */
+        seed(19500 + (uint64_t)r * 17);
+        wp_gen(orig, n, mode);
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        (void)logos_twist_last(21);
+        for (int round = 0; round < 2; round++) {
+            memcpy(a, orig, n * sizeof(double)); logos_sort_f64(a, n, P);          /* the second round reuses trimmed pages */
+            checks++; if (!wp_check(a, bi, bo, n)) { fails++; printf("  FAIL  pool trim, %s, threads=%d, round %d%s: wrong output\n", WP_NAME[mode], P, round, off ? ", trim off" : ""); }
+            for (int k = 0; k < 12; k++) {
+                for (size_t i = 0; i < n2; i++) s[i] = frand();
+                logos_sort_f64(s, n2, P);
+                int ok = 1; for (size_t i = 1; i < n2; i++) if (s[i] < s[i - 1]) ok = 0;
+                checks++; if (!ok) { fails++; printf("  FAIL  pool trim, small sort after %s\n", WP_NAME[mode]); }
+            }
+        }
+        size_t back = logos_twist_last(21);
+        checks++; asserted++;
+        if (off && back) { fails++; printf("  FAIL  pool trim, %s, threads=%d: %zu bytes handed back with the trim off\n", WP_NAME[mode], P, back); }
+        if (!off && !back) { fails++; printf("  FAIL  pool trim, %s, threads=%d: nothing handed back after 12 small sorts\n", WP_NAME[mode], P); }
+    }
+    unsetenv("LOGOS_TRIM");
+    free(orig); free(a); free(s); free(bi); free(bo);
+    printf("  pool trim: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the mode grid (2026-10-07, mdx_t / md_certify): clustered data with more than three modes, each uniform inside, is scattered
+ * through a value grid that names the mode with one cell lookup and at most one compare. Rows aim at what a cell table could get
+ * wrong: values in the GULFS that the sample never saw (a monotone bucket order is all that keeps the output sorted), a cluster
+ * straddling zero with zeros of both signs, infinities and a NaN, clusters so close that two boundaries share a cell (the grid must
+ * decline), and 4 to 48 modes. Every row at 4 and 14 threads, shipped and LOGOS_NO_MDGRID=1: ascending under < (rows without a
+ * NaN) and the input's bitwise multiset; where the row says the grid must carry the scatter, logos_twist_last(18) must say it did
+ * at 14 threads, and never with the switch set. ---- */
+enum { MG_C4, MG_C16, MG_C32, MG_GULF, MG_ZERO, MG_SPECIAL, MG_CLOSE, MG_UNEVEN, MG_BINAN, MG_N };
+static const char *MG_NAME[MG_N] = { "4 clusters", "16 clusters", "32 clusters", "16 clusters + values in the gulfs", "16 clusters, one straddling zero",
+                                     "16 clusters + infinities and a NaN", "16 clusters, two nearly touching", "12 clusters of uneven weight",
+                                     "bimodal + one NaN (the per-mode map's compares: the committed engine segfaulted here)" };
+static const int MG_EXPECT[MG_N] = { 0, 1, 1, 1, 1, 0, 0, 1, 0 };   /* 4 clusters: the compares (MD_LIN_MAX) */   /* 1: the grid must carry the scatter at 14 threads */
+static void mg_gen(double *a, size_t n, int mode) {
+    int k = mode == MG_C4 ? 4 : mode == MG_C32 ? 32 : mode == MG_UNEVEN ? 12 : mode == MG_BINAN ? 2 : 16;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t r = nextr(); int c = (int)(r % (uint64_t)k);
+        if (mode == MG_UNEVEN) { uint64_t u = nextr() % 100; c = u < 40 ? 0 : u < 60 ? 1 : (int)(2 + u % 10); }
+        double base = (double)c * 1e8;
+        if (mode == MG_ZERO) base -= 5e4 + 3e8;                     /* cluster 3 spans [-5e4, 5e4) */
+        if (mode == MG_CLOSE && c == 9) base = 8e8 + 1.02e5;         /* cluster 9 starts just past cluster 8's end */
+        a[i] = base + frand() * 1e5;
+    }
+    if (mode == MG_GULF) for (size_t i = 0; i < n; i += 997) a[i] = (double)(nextr() % 16) * 1e8 + 5e7 + frand() * 1e6;   /* mid-gulf */
+    if (mode == MG_ZERO) for (size_t i = 11; i < n; i += 4099) a[i] = (i & 1) ? -0.0 : 0.0;
+    if (mode == MG_SPECIAL) { a[n / 3] = INFINITY; a[n / 2] = -INFINITY; a[n - 9] = NAN; }
+    if (mode == MG_BINAN) { for (size_t i = 0; i < n; i++) a[i] = (a[i] >= 1e8 ? 1e9 : -1e9) + frand() * 1e6; a[n / 2 + 3] = NAN; }
+}
+static int mdgrid_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    const size_t sizes[] = { 1000003, 3000017 };
+    const int threads[] = { 4, 14 };
+    for (int mode = 0; mode < MG_N; mode++) for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+        size_t n = sizes[si];
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+        seed(18100 + (uint64_t)mode * 41 + si);
+        mg_gen(orig, n, mode);
+        int has_nan = 0; for (size_t i = 0; i < n; i++) if (orig[i] != orig[i]) has_nan = 1;
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) for (int off = 0; off < 2; off++) {
+            if (off) setenv("LOGOS_NO_MDGRID", "1", 1);
+            (void)logos_twist_last(18);
+            memcpy(a, orig, n * sizeof(double));
+            logos_sort_f64(a, n, threads[ti]);
+            size_t used = logos_twist_last(18);
+            if (off) unsetenv("LOGOS_NO_MDGRID");
+            int ok = 1;
+            if (!has_nan) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  mode grid, %s, n=%zu threads=%d%s: wrong output\n", MG_NAME[mode], n, threads[ti], off ? ", LOGOS_NO_MDGRID=1" : ""); }
+            if (off) { checks++; asserted++; if (used) { fails++; printf("  FAIL  mode grid, %s, n=%zu threads=%d: the grid ran with LOGOS_NO_MDGRID=1\n", MG_NAME[mode], n, threads[ti]); } }
+            else if (MG_EXPECT[mode] && threads[ti] == 14) { checks++; asserted++; if (!used) { fails++; printf("  FAIL  mode grid, %s, n=%zu threads=14: the scatter did not use the grid\n", MG_NAME[mode], n); } }
+        }
+        free(orig); free(a); free(bi); free(bo);
+    }
+    printf("  mode grid: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the prescan in parallel (2026-10-07, prescan_par): from 1,048,576 elements a sort with threads scans a 64K head and then
+ * the rest in up to eight chunks. Every row: logos_prescan_agree (the scalar line against every block kind AND the parallel scan
+ * at 2, 4, 8 and 16 threads, first_desc included), then a 4-thread sort checked ascending (rows without a NaN) and for the
+ * bitwise multiset. The swap or NaN goes where a chunked scan could miss it: the first elements, both sides of the head's end,
+ * both sides of every chunk boundary for 2 to 8 chunks, the last elements. ---- */
+static int parprescan_checks(void) {
+    int checks = 0, fails = 0;
+    const size_t sizes[] = { 1048579, 2000003 };
+    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+        size_t n = sizes[si];
+        double *b = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!b || !a || !bi || !bo) { free(b); free(a); free(bi); free(bo); continue; }
+        size_t pos[200]; int np = 0;
+        for (size_t p = 1; p <= 3; p++) pos[np++] = p;
+        for (size_t p = 65534; p <= 65538; p++) pos[np++] = p;
+        for (int T = 2; T <= 8; T++) { size_t per = (n - 65536 + (size_t)T - 1) / (size_t)T;
+            for (int t = 1; t < T; t++) for (int dlt = -1; dlt <= 1; dlt++) pos[np++] = 65536 + (size_t)t * per + (size_t)(long)dlt; }
+        for (size_t p = n - 3; p < n; p++) pos[np++] = p;
+        for (int base = 0; base < 4; base++) for (int pi = -1; pi < np; pi++) for (int kind = 0; kind < 2; kind++) {
+            if (pi < 0 && kind) continue;
+            for (size_t i = 0; i < n; i++) b[i] = base == 0 ? (double)i * 0.5 - 7.0 : base == 1 ? (double)(n - i) : base == 2 ? (double)(i / 3) : 3.0;
+            if (pi >= 0) { size_t p = pos[pi];
+                if (kind == 0) { double x = b[p - 1]; b[p - 1] = b[p]; b[p] = x; if (base == 3) b[p] = 4.0; } else b[p] = NAN; }
+            checks++; if (!logos_prescan_agree(b, n)) { fails++; printf("  FAIL  parallel prescan, n=%zu base %d %s at %zu: disagrees with the scalar line\n", n, base, kind ? "NaN" : "swap", pi >= 0 ? pos[pi] : 0); }
+            if (pi >= 0 && (pi % 5)) continue;                         /* every fifth row also sorted, at four threads */
+            memcpy(a, b, n * sizeof(double));
+            memcpy(bi, b, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+            logos_sort_f64(a, n, 4);
+            int ok = 1;
+            if (!(pi >= 0 && kind)) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  parallel prescan, n=%zu base %d %s at %zu: wrong output at 4 threads\n", n, base, kind ? "NaN" : "swap", pi >= 0 ? pos[pi] : 0); }
+        }
+        free(b); free(a); free(bi); free(bo);
+    }
+    printf("  parallel prescan: %d checks, %d failures\n", checks, fails);
+    return fails;
+}
+
+/* ---- a handful of values counted in registers (2026-10-07, lc_vec_count): the low-cardinality route compares each vector with the
+ * sample's distinct BIT PATTERNS and stops at the first vector holding anything else, where the scalar hash loop takes over. Rows aim at
+ * what an integer compare could get wrong or a hand-off could drop: -0.0 and +0.0 as two of the values, a value the sample cannot have
+ * seen (three copies, late), a NaN after a long clean stretch, values on a block boundary of eight, and plain 2/5/8 distinct. Every row
+ * at 1 and 4 threads, shipped and LOGOS_NO_LCVEC=1: ascending under < (rows without a NaN), the input's bitwise multiset, and the
+ * vector count must have settled elements where the row says it can (logos_twist_last(17)), never with the switch set. ---- */
+enum { LV_TWO, LV_FIVE, LV_EIGHT, LV_ZEROS, LV_LATE, LV_NAN, LV_INF, LV_N };
+static const char *LV_NAME[LV_N] = { "2 values", "5 values", "8 values", "-0.0, +0.0 and 1.5", "5 values + one the sample missed, late", "5 values + a NaN, late", "+-inf and 3 values" };
+static void lv_gen(double *a, size_t n, int mode) {
+    static const double V5[5] = { -3.25, 0.5, 7.0, 1e6, 2.5e-3 }, V8[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    for (size_t i = 0; i < n; i++) {
+        uint64_t r = nextr();
+        if (mode == LV_TWO) a[i] = (r & 1) ? 1e6 + 0.5 : -0.25;
+        else if (mode == LV_EIGHT) a[i] = V8[r % 8];
+        else if (mode == LV_ZEROS) { int k = (int)(r % 3); a[i] = k == 0 ? -0.0 : k == 1 ? 0.0 : 1.5; }
+        else if (mode == LV_INF) { int k = (int)(r % 5); a[i] = k == 0 ? INFINITY : k == 1 ? -INFINITY : (double)k; }
+        else a[i] = V5[r % 5];
+    }
+    if (mode == LV_LATE) { a[n - 3] = 42.0; a[n - 100] = 42.0; a[n / 2 + 1] = 42.0; }
+    if (mode == LV_NAN) a[n - 7] = NAN;
+}
+static int lcvec_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    if (!logos_twist_last(-5)) { printf("  low-cardinality vector count: not in this build or CPU, skipped\n"); return 0; }
+    const size_t sizes[] = { 100003, 1000003 };
+    const int threads[] = { 1, 4 };
+    for (int mode = 0; mode < LV_N; mode++) for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+        size_t n = sizes[si];
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+        seed(17100 + (uint64_t)mode * 37 + si);
+        lv_gen(orig, n, mode);
+        int has_nan = 0; for (size_t i = 0; i < n; i++) if (orig[i] != orig[i]) has_nan = 1;
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) for (int off = 0; off < 2; off++) {
+            if (off) setenv("LOGOS_NO_LCVEC", "1", 1);
+            (void)logos_twist_last(17);
+            memcpy(a, orig, n * sizeof(double));
+            logos_sort_f64(a, n, threads[ti]);
+            size_t settled = logos_twist_last(17);
+            if (off) unsetenv("LOGOS_NO_LCVEC");
+            int ok = 1;
+            if (!has_nan) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  lc vector count, %s, n=%zu threads=%d%s: wrong output\n", LV_NAME[mode], n, threads[ti], off ? ", LOGOS_NO_LCVEC=1" : ""); }
+            checks++; asserted++;
+            if (off && settled) { fails++; printf("  FAIL  lc vector count, %s, n=%zu threads=%d: %zu elements counted with LOGOS_NO_LCVEC=1\n", LV_NAME[mode], n, threads[ti], settled); }
+            if (!off && settled < n / 4) { fails++; printf("  FAIL  lc vector count, %s, n=%zu threads=%d: only %zu elements counted by vector\n", LV_NAME[mode], n, threads[ti], settled); }
+        }
+        free(orig); free(a); free(bi); free(bo);
+    }
+    printf("  low-cardinality vector count: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the profile pass on the kernel's first partition (2026-10-05, lever C; frontprobe.cpp): a sequential sort that ends in the
+ * AVX2 kernel reads the NaN / -0.0 scan off its first partition instead of a pass of its own, so a NaN is found AFTER one
+ * partition has moved data and the decline hands a PERMUTED array to the scalar leaf. Rows reach the fused path through sort_fn
+ * (uniform) and through leaf_f64's skewed branch (heavy tail); the NaN rows decline there; the zero rows take the signed-zero
+ * repair; the dominant rows reach the pivot-is-the-minimum and right-part-all-equal exits. Every row at the three switch
+ * settings: shipped (the fused path must have run where the row says so, and a NaN row must have declined), LOGOS_NO_PARTFUSE=1
+ * and LOGOS_NO_FRONTFUSE=1 (it must never run). Output: ascending under < (rows without a NaN) and the input's bitwise multiset
+ * (every row). Skipped, and said so, on a build or CPU without the AVX2 leaf (logos_twist_last(-5)). ---- */
+enum { FU_UNIFORM, FU_HEAVY, FU_NAN_MID, FU_NAN_HEAVY, FU_NAN_FIRST, FU_ZEROS, FU_HEAVY_ZEROS, FU_ALL_ZERO, FU_MIN_DUP, FU_MAX_DUP, FU_INF, FU_N };
+static const char *FU_NAME[FU_N] = { "uniform", "heavy tail", "uniform + one NaN", "heavy tail + one NaN", "NaN at a[0]", "uniform + zeros of both signs",
+                                     "heavy tail + zeros of both signs", "all zeros, both signs", "90% equal to the minimum", "90% equal to the maximum", "uniform + infinities" };
+/* 1 = the fused path must run (shipped); 2 = it must run AND decline on the NaN; 0 = not asserted */
+static const int FU_EXPECT[FU_N] = { 1, 1, 2, 2, 0, 1, 1, 0, 0, 0, 1 };
+static void fuse_gen(double *a, size_t n, int mode) {
+    for (size_t i = 0; i < n; i++) {
+        double u = frand();
+        if (mode == FU_HEAVY || mode == FU_NAN_HEAVY || mode == FU_HEAVY_ZEROS) { if (u < 1e-12) u = 1e-12; a[i] = pow(u, -1.0 / 1.2); }
+        else a[i] = u * 2e9 - 1e9;
+    }
+    if (mode == FU_NAN_MID || mode == FU_NAN_HEAVY) a[n / 3 + 17] = NAN;
+    if (mode == FU_NAN_FIRST) a[0] = NAN;
+    if (mode == FU_ZEROS || mode == FU_HEAVY_ZEROS) for (size_t i = 5; i < n; i += 61) a[i] = (i & 1) ? -0.0 : 0.0;
+    if (mode == FU_ALL_ZERO) for (size_t i = 0; i < n; i++) a[i] = (nextr() & 1) ? -0.0 : 0.0;
+    if (mode == FU_MIN_DUP) for (size_t i = 0; i < n; i++) if (nextr() % 10) a[i] = -2e9;
+    if (mode == FU_MAX_DUP) for (size_t i = 0; i < n; i++) if (nextr() % 10) a[i] = 2e9;
+    if (mode == FU_INF) for (size_t i = 3; i < n; i += 1001) a[i] = (i & 1) ? INFINITY : -INFINITY;
+}
+static int fuse_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    if (!logos_twist_last(-5)) { printf("  first-partition scan: not in this build or CPU, skipped\n"); return 0; }
+    const size_t sizes[] = { 70001, 300001, 1000003 };
+    const int threads[] = { 1, 4 };
+    static const char *SW[] = { NULL, "LOGOS_NO_PARTFUSE", "LOGOS_NO_FRONTFUSE" };
+    for (int mode = 0; mode < FU_N; mode++) for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
+        size_t n = sizes[si];
+        double *orig = malloc(n * sizeof(double)), *a = malloc(n * sizeof(double));
+        uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); continue; }
+        seed(15100 + (uint64_t)mode * 31 + si);
+        fuse_gen(orig, n, mode);
+        int has_nan = 0; for (size_t i = 0; i < n; i++) if (orig[i] != orig[i]) has_nan = 1;
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) for (int sw = 0; sw < 3; sw++) {
+            if (SW[sw]) setenv(SW[sw], "1", 1);
+            (void)logos_twist_last(15); (void)logos_twist_last(16);
+            memcpy(a, orig, n * sizeof(double));
+            logos_sort_f64(a, n, threads[ti]);
+            size_t fused = logos_twist_last(15), declined = logos_twist_last(16);
+            if (SW[sw]) unsetenv(SW[sw]);
+            const char *setting = SW[sw] ? SW[sw] : "shipped";
+            int ok = 1;
+            if (!has_nan) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+            checks++; if (!ok) { fails++; printf("  FAIL  first-partition scan, %s, n=%zu threads=%d, %s: wrong output\n", FU_NAME[mode], n, threads[ti], setting); }
+            if (threads[ti] != 1) continue;
+            if (SW[sw]) { checks++; asserted++; if (fused) { fails++; printf("  FAIL  first-partition scan, %s, n=%zu, %s: the fused path ran %zu times\n", FU_NAME[mode], n, setting, fused); } }
+            else if (FU_EXPECT[mode]) {
+                checks++; asserted++;
+                if (!fused) { fails++; printf("  FAIL  first-partition scan, %s, n=%zu: the fused path never ran\n", FU_NAME[mode], n); }
+                checks++; asserted++;
+                if ((FU_EXPECT[mode] == 2) != (declined > 0)) { fails++; printf("  FAIL  first-partition scan, %s, n=%zu: %zu NaN declines (expected %s)\n", FU_NAME[mode], n, declined, FU_EXPECT[mode] == 2 ? "one" : "none"); }
+            }
+        }
+        free(orig); free(a); free(bi); free(bo);
+    }
+    printf("  first-partition scan: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the thin front (2026-10-08, thin_sort_f64): a call of at most THIN_MAX_N elements (128, then 2047 from 2026-10-20) is answered before the dispatcher. Sizes run from 2
+ * to 160, past the gate on both sides, through all four of its exits (ascending, descending, network, insertion sort, and the AVX2
+ * quicksort with its NaN decline). Every input is a permutation of the input BITS on the way out, ascending when NaN-free; and every
+ * row says which side of the gate it took (logos_twist_last(20) counts the calls the thin front answered). ---- */
+static int thin_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    const int threads[] = { 1, 8 };
+    const int built = logos_twist_last(-6) != 0;     /* -DLOGOS_NO_THINFRONT: every call must reach the dispatcher instead */
+    const size_t tmax = (size_t)logos_twist_last(-13);   /* the thin front's ceiling as compiled (2047 since 2026-10-20; 0 without it) */
+    enum { TM = 15 };
+    size_t sizes[96]; int nsz = 0;
+    for (size_t n = 2; n <= 40; n++) sizes[nsz++] = n;
+    for (size_t n = 47; n <= 160; n += 7) sizes[nsz++] = n;
+    { const size_t more[] = { 255, 256, 257, 511, 1024, 1500 }; for (int k = 0; k < 6; k++) sizes[nsz++] = more[k]; }
+    if (tmax > 2) { sizes[nsz++] = tmax - 1; sizes[nsz++] = tmax; sizes[nsz++] = tmax + 1; sizes[nsz++] = tmax + 40; }
+    size_t cap = 0; for (int k = 0; k < nsz; k++) if (sizes[k] > cap) cap = sizes[k];
+    double *orig = malloc(cap * sizeof(double)), *a = malloc(cap * sizeof(double));
+    uint64_t *bi = malloc(cap * sizeof(uint64_t)), *bo = malloc(cap * sizeof(uint64_t));
+    if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); printf("  thin front: no memory, skipped\n"); return 0; }
+    for (int si = 0; si < nsz; si++) for (int mix = 0; mix < TM; mix++) for (size_t ti = 0; ti < 2; ti++) {
+        size_t n = sizes[si];
+        seed(9700 + (uint64_t)n * 37 + (uint64_t)mix);
+        for (size_t i = 0; i < n; i++) orig[i] = frand() * 2e9 - 1e9;
+        switch (mix) {
+        case 0: break;                                                                       /* random */
+        case 1: for (size_t i = 0; i < n; i++) orig[i] = (double)i + 0.5; break;              /* sorted */
+        case 2: for (size_t i = 0; i < n; i++) orig[i] = (double)(n - i) + 0.5; break;        /* reversed */
+        case 3: for (size_t i = 0; i < n; i++) orig[i] = (double)(i % 3); break;              /* three values */
+        case 4: for (size_t i = 0; i < n; i++) orig[i] = (double)((n - i) / 4); break;        /* descending with ties */
+        case 5: orig[0] = NAN; break;                                                        /* a NaN first */
+        case 6: orig[n / 2] = NAN; orig[n - 1] = NAN; break;                                  /* two NaNs, one last */
+        case 7: for (size_t i = 0; i < n; i++) orig[i] = (double)i; orig[n / 2] = NAN; break;  /* sorted around a NaN */
+        case 8: for (size_t i = 0; i < n; i++) orig[i] = (i & 1) ? 0.0 : -0.0; break;          /* signed zeros only */
+        case 9: for (size_t i = 0; i < n; i += 3) orig[i] = (i & 2) ? 0.0 : -0.0; break;       /* signed zeros among values */
+        case 10: orig[0] = INFINITY; orig[n - 1] = -INFINITY; if (n > 2) orig[1] = 4.9e-324; break;
+        case 11: for (size_t i = 0; i < n; i++) orig[i] = 7.0; if (n > 3) orig[n - 2] = 6.0; break;   /* all equal but one */
+        case 12: for (size_t i = 0; i < n; i++) orig[i] = (double)i + 0.5;                    /* KINKS: the thin front's insertion path */
+                 for (size_t i = 1; i + 1 < n; i += 17) { double t = orig[i]; orig[i] = orig[i + 1]; orig[i + 1] = t; } break;
+        case 13: for (size_t i = 0; i < n; i++) orig[i] = (double)i + 0.5;                    /* one FAR swap: must not look like kinks */
+                 if (n > 4) { double t = orig[1]; orig[1] = orig[n - 2]; orig[n - 2] = t; } break;
+        case 14: for (size_t i = 0; i < n; i++) orig[i] = (double)(i / 3);                    /* kinks among ties, signed zeros at the front */
+                 for (size_t i = 2; i + 1 < n; i += 11) { double t = orig[i]; orig[i] = orig[i + 1]; orig[i + 1] = t; }
+                 if (n > 3) { orig[0] = -0.0; orig[1] = 0.0; orig[2] = -0.0; } break;
+        }
+        size_t nnan = 0; for (size_t i = 0; i < n; i++) nnan += orig[i] != orig[i];
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        memcpy(a, orig, n * sizeof(double));
+        (void)logos_twist_last(20);
+        logos_sort_f64(a, n, threads[ti]);
+        size_t thin = logos_twist_last(20);
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        int ok = memcmp(bi, bo, n * sizeof(uint64_t)) == 0;
+        if (!nnan) for (size_t i = 1; ok && i < n; i++) if (a[i] < a[i - 1]) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  thin front n=%zu mix=%d threads=%d: wrong output\n", n, mix, threads[ti]); }
+        checks++; asserted++;
+        if ((built && n <= tmax) != (thin == 1)) { fails++; printf("  FAIL  thin front n=%zu mix=%d: %zu thin calls (expected %d)\n", n, mix, thin, built && n <= tmax); }
+    }
+    free(orig); free(a); free(bi); free(bo);
+    printf("  thin front: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the batch entry (2026-10-08, logos_sort_f64_batch): many arrays end to end. Layouts: empty and one-element segments among
+ * others, every length on both sides of the thin front (128) and of the leaf's limit (65,536), segments that are sorted, reversed,
+ * five-valued, holding NaNs, signed zeros and infinities; at 1, 2 and 8 threads. Every segment must be a permutation of its own
+ * input BITS (nothing crosses a boundary) and ascending when it holds no NaN. ---- */
+static int batch_checks(void) {
+    int checks = 0, fails = 0;
+    const size_t cap = 1500000;
+    double *orig = malloc(cap * sizeof(double)), *a = malloc(cap * sizeof(double));
+    uint64_t *bi = malloc(cap * sizeof(uint64_t)), *bo = malloc(cap * sizeof(uint64_t));
+    size_t *off = malloc(20001 * sizeof(size_t));
+    if (!orig || !a || !bi || !bo || !off) { free(orig); free(a); free(bi); free(bo); free(off); printf("  batch: skipped (no memory)\n"); return 0; }
+    static const size_t edges[] = { 0, 1, 2, 3, 16, 17, 24, 25, 127, 128, 129, 2047, 2048, 65535, 65536, 65537, 300000 };
+    const int threads[] = { 1, 2, 8 };
+    for (int lay = 0; lay < 4; lay++) {
+        seed(19700 + (uint64_t)lay);
+        size_t nseg = 0, o = 0; off[0] = 0;
+        while (nseg < 20000) {
+            size_t L;
+            if (lay == 0) L = edges[nseg % (sizeof edges / sizeof *edges)];        /* every edge, in turn */
+            else if (lay == 1) L = nextr() % 40;                                    /* many tiny ones, empty ones among them */
+            else if (lay == 2) L = (size_t)exp(frand() * log(150000.0));            /* log-uniform to 150,000 */
+            else L = 100 + nextr() % 3000;                                         /* the leaf's range */
+            if (o + L > cap) break;
+            o += L; off[++nseg] = o;
+        }
+        for (size_t k = 0; k < nseg; k++) {
+            double *s = orig + off[k]; size_t L = off[k + 1] - off[k];
+            int mix = (int)(nextr() % 8);
+            for (size_t i = 0; i < L; i++) {
+                switch (mix) {
+                case 1: s[i] = (double)i; break;
+                case 2: s[i] = (double)(L - i); break;
+                case 3: s[i] = (double)(nextr() % 5); break;
+                case 4: s[i] = (i & 1) ? 0.0 : -0.0; break;
+                default: s[i] = frand() * 2e6 - 1e6; break;
+                }
+            }
+            if (mix == 5 && L) s[nextr() % L] = NAN;
+            if (mix == 6 && L > 2) { s[0] = INFINITY; s[L - 1] = -INFINITY; s[L / 2] = 4.9e-324; }
+            if (mix == 7 && L > 1) s[nextr() % L] = -0.0;
+        }
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads; ti++) {
+            memcpy(a, orig, o * sizeof(double));
+            logos_sort_f64_batch(a, off, nseg, threads[ti]);
+            int bad = 0;
+            for (size_t k = 0; k < nseg && !bad; k++) {
+                size_t s0 = off[k], L = off[k + 1] - off[k];
+                if (!L) continue;
+                memcpy(bi, orig + s0, L * sizeof(double)); qsort(bi, L, sizeof(uint64_t), cmp_bits);
+                memcpy(bo, a + s0, L * sizeof(double)); qsort(bo, L, sizeof(uint64_t), cmp_bits);
+                if (memcmp(bi, bo, L * sizeof(uint64_t))) bad = 1;
+                size_t nn = 0; for (size_t i = 0; i < L; i++) nn += orig[s0 + i] != orig[s0 + i];
+                if (!nn) for (size_t i = 1; i < L; i++) if (a[s0 + i] < a[s0 + i - 1]) { bad = 2; break; }
+                if (bad) printf("  FAIL  batch, layout %d, threads=%d, segment %zu (%zu elements): %s\n", lay, threads[ti], k, L, bad == 1 ? "not a permutation of its input" : "not ascending");
+            }
+            checks++; if (bad) fails++;
+        }
+    }
+    /* degenerate calls: no segments, a NULL array with no segments, one segment holding everything */
+    logos_sort_f64_batch(NULL, off, 0, 4); checks++;
+    seed(19790); for (size_t i = 0; i < 300000; i++) orig[i] = frand();
+    memcpy(a, orig, 300000 * sizeof(double)); off[0] = 0; off[1] = 300000;
+    logos_sort_f64_batch(a, off, 1, 4);
+    { int ok = 1; for (size_t i = 1; i < 300000; i++) if (a[i] < a[i - 1]) ok = 0; checks++; if (!ok) { fails++; printf("  FAIL  batch, one segment of 300000\n"); } }
+    free(orig); free(a); free(bi); free(bo); free(off);
+    printf("  batch: %d checks, %d failures\n", checks, fails);
+    return fails;
+}
+
+/* ---- the float32 path, the vector lattice map and int32 values through the AVX2 kernel (2026-10-08). Float32: doubles that are all
+ * exactly floats (with signed zeros, infinities, float subnormals, ties), and the inputs that must DECLINE it after its pass has
+ * begun (a NaN, one double that is not a float, both placed late); logos_twist_last(22) must count exactly the rows that are all
+ * floats, at one thread. Lattice: lattices with negative values, a value the sample misses, an off-lattice value and a NaN placed
+ * late, at 1 and 8 threads, with the vector map on and off: the same bytes both ways, and logos_twist_last(23) > 0 where the map
+ * ran in vectors. Int32: int32-valued doubles at one thread (the radix; the AVX2 kernel for them measured slower and stays behind
+ * -DLOGOS_AVX2_INT32, so the LOGOS_NO_AVX2_INT32 setting these rows toggle is now inert: both settings must still be right). Every output a permutation of the
+ * input bits and ascending when NaN-free. ---- */
+static int f32lat_check(const double *a, const uint64_t *bi, uint64_t *bo, size_t n, int nan_free) {
+    memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+    if (memcmp(bi, bo, n * sizeof(uint64_t))) return 0;
+    if (nan_free) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) return 0;
+    return 1;
+}
+static int f32lat_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    const size_t NMAX = 300007;
+    double *orig = malloc(NMAX * sizeof(double)), *a = malloc(NMAX * sizeof(double)), *b = malloc(NMAX * sizeof(double));
+    uint64_t *bi = malloc(NMAX * sizeof(uint64_t)), *bo = malloc(NMAX * sizeof(uint64_t));
+    if (!orig || !a || !b || !bi || !bo) { free(orig); free(a); free(b); free(bi); free(bo); printf("  float32 / lattice: skipped (no memory)\n"); return 0; }
+    /* float32 */
+    static const size_t fns[] = { 65536, 100003, 300007 };
+    for (size_t ni = 0; ni < 3; ni++) for (int mode = 0; mode < 9; mode++) {
+        size_t n = fns[ni];
+        seed(19800 + (uint64_t)mode * 7 + ni);
+        for (size_t i = 0; i < n; i++) orig[i] = (double)(float)(frand() * 2e6 - 1e6);
+        int expect = 1, nan = 0;
+        switch (mode) {
+        case 1: for (size_t i = 0; i < n; i += 5) orig[i] = (i & 1) ? 0.0 : -0.0; break;                 /* signed zeros */
+        case 2: orig[3] = INFINITY; orig[n - 2] = -INFINITY; orig[n / 2] = (double)1.4e-45f; orig[7] = (double)-1.17549435e-38f; break;
+        case 3: for (size_t i = 0; i < n; i++) orig[i] = (double)(float)(nextr() % 3) - 1.0; break;      /* ties: three values */
+        case 4: orig[n - 3] = NAN; expect = 0; nan = 1; break;                                           /* declines late, a NaN */
+        case 5: orig[n - 3] = 0.1; expect = 0; break;                                                    /* declines late: 0.1 is no float */
+        case 6: for (size_t i = 0; i < n; i++) orig[i] = (double)(float)(1.0 + (double)i * 1e-7); break; /* already sorted: the prescan */
+        case 7: for (size_t i = 0; i < n; i++) orig[i] = (double)(float)ldexp(frand(), (int)(nextr() % 200) - 100); break;   /* wide exponents */
+        case 8: for (size_t i = 0; i < n; i++) orig[i] = 3.5; orig[n / 3] = 3.25; break;                  /* two values */
+        }
+        if (mode == 3 || mode == 6 || mode == 8) expect = -1;                       /* other routes may take these first: path not asserted */
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (int T = 1; T <= 8; T += 7) {
+            memcpy(a, orig, n * sizeof(double));
+            (void)logos_twist_last(22);
+            logos_sort_f64(a, n, T);
+            size_t fired = logos_twist_last(22);
+            checks++; if (!f32lat_check(a, bi, bo, n, !nan)) { fails++; printf("  FAIL  float32 mode %d n=%zu threads=%d: wrong output\n", mode, n, T); }
+            if (T == 1 && expect >= 0) {
+                checks++; asserted++;
+                if ((fired > 0) != (expect == 1 && logos_twist_last(-8))) { fails++; printf("  FAIL  float32 mode %d n=%zu: the path fired %zu times, expected %s\n", mode, n, fired, expect ? "once" : "never"); }
+            }
+        }
+    }
+    /* the lattice map, vectors on and off */
+    for (int mode = 0; mode < 6; mode++) for (int T = 1; T <= 8; T += 7) {
+        size_t n = 300007;
+        seed(19850 + (uint64_t)mode);
+        for (size_t i = 0; i < n; i++) {
+            switch (mode) {
+            case 0: orig[i] = (double)(nextr() % 4096) / 64.0; break;                    /* quantized */
+            case 1: orig[i] = (double)(nextr() % 256) * 1000.0 + 0.5; break;             /* 256 distinct */
+            case 2: orig[i] = (double)((int64_t)(nextr() % 4000) - 2000) * 0.25; break;   /* negative values */
+            default: orig[i] = (double)(nextr() % 4096) / 64.0; break;
+            }
+        }
+        int nan = 0;
+        if (mode == 3) orig[n - 5] = 4097.0 / 64.0;                 /* on the lattice, outside anything the sample saw */
+        if (mode == 4) orig[n - 5] = 1.0 / 3.0;                     /* off the lattice, late: the map declines */
+        if (mode == 5) { orig[n - 5] = NAN; nan = 1; }              /* a NaN, late */
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (int off = 0; off < 2; off++) {
+            if (off) setenv("LOGOS_NO_LATVEC", "1", 1); else unsetenv("LOGOS_NO_LATVEC");
+            double *out = off ? b : a;
+            memcpy(out, orig, n * sizeof(double));
+            (void)logos_twist_last(23);
+            logos_sort_f64(out, n, T);
+            size_t vecs = logos_twist_last(23);
+            checks++; if (!f32lat_check(out, bi, bo, n, !nan)) { fails++; printf("  FAIL  lattice map mode %d threads=%d%s: wrong output\n", mode, T, off ? " LOGOS_NO_LATVEC=1" : ""); }
+            if (off) { checks++; asserted++; if (vecs) { fails++; printf("  FAIL  lattice map mode %d threads=%d: %zu vectors with LOGOS_NO_LATVEC=1\n", mode, T, vecs); } }
+            else if (mode <= 3 && logos_twist_last(-7)) { checks++; asserted++; if (!vecs) { fails++; printf("  FAIL  lattice map mode %d threads=%d: the vector map never ran\n", mode, T); } }
+        }
+        unsetenv("LOGOS_NO_LATVEC");
+        if (!nan) { checks++; if (memcmp(a, b, n * sizeof(double))) { fails++; printf("  FAIL  lattice map mode %d threads=%d: vectors and scalar disagree\n", mode, T); } }
+    }
+    /* int32-valued doubles at one thread: the AVX2 kernel against the radix */
+    static const size_t ins[] = { 4096, 65536, 300007 };
+    for (size_t ni = 0; ni < 3; ni++) for (int mode = 0; mode < 3; mode++) {
+        size_t n = ins[ni];
+        seed(19870 + (uint64_t)mode + ni * 3);
+        for (size_t i = 0; i < n; i++) orig[i] = mode == 0 ? (double)(int32_t)(uint32_t)nextr() : mode == 1 ? (double)(int32_t)(nextr() % 16777216) - 8388608.0 : (double)(int32_t)(uint32_t)nextr();
+        if (mode == 2) { orig[0] = -2147483648.0; orig[n - 1] = 2147483647.0; orig[n / 2] = -0.0; }
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (int off = 0; off < 2; off++) {
+            if (off) setenv("LOGOS_NO_AVX2_INT32", "1", 1); else unsetenv("LOGOS_NO_AVX2_INT32");
+            double *out = off ? b : a;
+            memcpy(out, orig, n * sizeof(double)); logos_sort_f64(out, n, 1);
+            checks++; if (!f32lat_check(out, bi, bo, n, 1)) { fails++; printf("  FAIL  int32 kernel mode %d n=%zu%s: wrong output\n", mode, n, off ? " LOGOS_NO_AVX2_INT32=1" : ""); }
+        }
+        unsetenv("LOGOS_NO_AVX2_INT32");
+    }
+    free(orig); free(a); free(b); free(bi); free(bo);
+    printf("  float32 / lattice / int32 kernel: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the in-place partition (2026-10-08, ipp_partition, opt-in LOGOS_PART_INPLACE=1): shapes that reach the parallel partition
+ * (uniform, heavy tail, two clusters, sixteen clusters, integers over a wide range, one heavy duplicate, signed zeros, a NaN, an
+ * infinity at each end), sizes that are not a multiple of the 256-element block and a few just past one, at 2, 3, 8 and 14
+ * threads. Every output a permutation of the input bits, ascending when NaN-free; logos_twist_last(24) must count the partitions
+ * done in place where the switch is on and the shape is one the partition takes (NaN-free shapes), and none where it is off. ---- */
+static int ipp_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    static const size_t ns[] = { 300007, 1000003, 2100001, 409600 + 1 };
+    static const int ths[] = { 2, 3, 8, 14 };
+    const size_t NMAX = 2100001;
+    double *orig = malloc(NMAX * sizeof(double)), *a = malloc(NMAX * sizeof(double));
+    uint64_t *bi = malloc(NMAX * sizeof(uint64_t)), *bo = malloc(NMAX * sizeof(uint64_t));
+    if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); printf("  in-place partition: skipped (no memory)\n"); return 0; }
+    enum { IU, IH, IB, IC, II, ID, IZ, IN, IF, IM };
+    static const char *nm[IM] = { "uniform", "heavy_tail", "bimodal", "clusters16", "int_wide", "dup20pct", "negzero", "nan", "infinities" };
+    for (size_t ni = 0; ni < sizeof ns / sizeof *ns; ni++) for (int mode = 0; mode < IM; mode++) {
+        size_t n = ns[ni];
+        seed(19950 + (uint64_t)mode * 31 + ni);
+        for (size_t i = 0; i < n; i++) {
+            double u = frand();
+            switch (mode) {
+            case IH: { double v = u < 1e-12 ? 1e-12 : u; orig[i] = pow(v, -1.0 / 1.2); } break;
+            case IB: orig[i] = ((nextr() & 1) ? 1e9 : -1e9) + frand() * 1e6; break;
+            case IC: orig[i] = (double)(nextr() % 16) * 1e8 + frand() * 1e5; break;
+            case II: orig[i] = (double)(int32_t)(uint32_t)nextr(); break;
+            case ID: orig[i] = (nextr() % 5 == 0) ? 42.0 : u * 2e6 - 1e6; break;
+            case IZ: orig[i] = (nextr() % 50 == 0) ? ((i & 1) ? 0.0 : -0.0) : u * 2e6 - 1e6; break;
+            default: orig[i] = u * 2e9 - 1e9; break;
+            }
+        }
+        if (mode == IN) orig[n / 3] = NAN;
+        if (mode == IF) { orig[n / 5] = INFINITY; orig[n / 2] = -INFINITY; }
+        int nan = mode == IN;
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (size_t ti = 0; ti < sizeof ths / sizeof *ths; ti++) for (int on = 0; on < 2; on++) {
+            if (on) setenv("LOGOS_PART_INPLACE", "1", 1); else unsetenv("LOGOS_PART_INPLACE");
+            memcpy(a, orig, n * sizeof(double));
+            (void)logos_twist_last(24);
+            logos_sort_f64(a, n, ths[ti]);
+            size_t ip = logos_twist_last(24);
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            int ok = memcmp(bi, bo, n * sizeof(uint64_t)) == 0;
+            if (ok && !nan) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            checks++; if (!ok) { fails++; printf("  FAIL  in-place partition, %s, n=%zu, threads=%d%s: wrong output\n", nm[mode], n, ths[ti], on ? ", in place" : ""); }
+            if (!on) { checks++; asserted++; if (ip) { fails++; printf("  FAIL  in-place partition, %s, n=%zu, threads=%d: ran with the switch off\n", nm[mode], n, ths[ti]); } }
+            else if ((mode == IU || mode == IH || mode == IB || mode == IC) && n >= 1000003 && ths[ti] >= 8) {
+                checks++; asserted++;
+                if (!ip) { fails++; printf("  FAIL  in-place partition, %s, n=%zu, threads=%d: the partition did not run in place\n", nm[mode], n, ths[ti]); }
+            }
+        }
+        unsetenv("LOGOS_PART_INPLACE");
+    }
+    free(orig); free(a); free(bi); free(bo);
+    printf("  in-place partition: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- two halves (2026-10-19, halves_try_f64): at two threads, after every structured route has declined, one split around the
+ * sample's median and two sequential leaves. Every output a permutation of the input bits and ascending under < when NaN-free;
+ * rows that must take the route say so (logos_twist_last(26)), and rows that must not -- ordered data, a sawtooth whose period
+ * aliases the sample's lag, repeats, three threads, the switch set -- say that. Sizes on both sides of the thread policy's
+ * two-thread band (n / 100000 decides), threads requested 2, 3 and 14. */
+static int halves_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    static const size_t ns[] = { 200003, 299999, 1000003, 2100001 };
+    static const int ths[] = { 2, 3, 14 };
+    const size_t NMAX = 2100001;
+    double *orig = malloc(NMAX * sizeof(double)), *a = malloc(NMAX * sizeof(double));
+    uint64_t *bi = malloc(NMAX * sizeof(uint64_t)), *bo = malloc(NMAX * sizeof(uint64_t));
+    if (!orig || !a || !bi || !bo) { free(orig); free(a); free(bi); free(bo); printf("  two halves: skipped (no memory)\n"); return 0; }
+    enum { HU, HH, HB, HC, HI, HZ, HN, HF, HD, HR, HS, HQ, HM };
+    static const char *nm[HM] = { "uniform", "heavy_tail", "bimodal", "clusters16", "int_wide", "negzero", "nan", "infinities", "dup20pct",
+                                  "noisy ring", "sawtooth at twice the lag", "quantized" };
+    for (size_t ni = 0; ni < sizeof ns / sizeof *ns; ni++) for (int mode = 0; mode < HM; mode++) {
+        size_t n = ns[ni];
+        seed(26260 + (uint64_t)mode * 37 + ni);
+        size_t L = (size_t)(0.0062 * (double)n); if (L < 2) L = 2;
+        for (size_t i = 0; i < n; i++) {
+            double u = frand();
+            switch (mode) {
+            case HH: { double v = u < 1e-12 ? 1e-12 : u; orig[i] = pow(v, -1.0 / 1.2); } break;
+            case HB: orig[i] = ((nextr() & 1) ? 1e9 : -1e9) + frand() * 1e6; break;
+            case HC: orig[i] = (double)(nextr() % 16) * 1e8 + frand() * 1e5; break;
+            case HI: orig[i] = (double)(int32_t)(uint32_t)nextr(); break;
+            case HZ: orig[i] = (nextr() % 50 == 0) ? ((i & 1) ? 0.0 : -0.0) : u * 2e6 - 1e6; break;
+            case HD: orig[i] = (nextr() % 5 == 0) ? 42.0 : u * 2e6 - 1e6; break;
+            case HR: orig[i] = (double)((i + n / 3) % n) + (u - 0.5) * 40.0; break;
+            case HS: orig[i] = (double)(i % L) + (double)(i / L) * 1e-7; break;
+            case HQ: orig[i] = (double)(nextr() % 30000) * 0.25; break;
+            default: orig[i] = u * 2e9 - 1e9; break;
+            }
+        }
+        if (mode == HN) orig[n / 3] = NAN;
+        if (mode == HF) { orig[n / 5] = INFINITY; orig[n / 2] = -INFINITY; orig[n / 7] = INFINITY; }
+        int nan = mode == HN;
+        memcpy(bi, orig, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        for (size_t ti = 0; ti < sizeof ths / sizeof *ths; ti++) for (int off = 0; off < 2; off++) {
+            if (off) setenv("LOGOS_NO_HALVES", "1", 1); else unsetenv("LOGOS_NO_HALVES");
+            memcpy(a, orig, n * sizeof(double));
+            (void)logos_twist_last(26);
+            logos_sort_f64(a, n, ths[ti]);
+            size_t hv = logos_twist_last(26);
+            memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+            int ok = memcmp(bi, bo, n * sizeof(uint64_t)) == 0;
+            if (ok && !nan) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
+            checks++; if (!ok) { fails++; printf("  FAIL  two halves, %s, n=%zu, threads=%d%s: wrong output\n", nm[mode], n, ths[ti], off ? ", switch set" : ""); }
+            size_t pe = n / 100000; if (pe < 1) pe = 1; int P = (size_t)ths[ti] < pe ? ths[ti] : (int)pe;   /* effective_threads */
+            int must = !off && P == 2 && mode <= HI, mustnot = off || P != 2 || mode >= HR;
+            if (must || mustnot) {
+                checks++; asserted++;
+                if (must && !hv) { fails++; printf("  FAIL  two halves, %s, n=%zu, threads=%d: the route did not run\n", nm[mode], n, ths[ti]); }
+                if (mustnot && hv) { fails++; printf("  FAIL  two halves, %s, n=%zu, threads=%d%s: the route ran\n", nm[mode], n, ths[ti], off ? " with the switch set" : ""); }
+            }
+        }
+        unsetenv("LOGOS_NO_HALVES");
+        if (mode == HU) {                     /* the lazy view's partition at two threads must hand back buckets, never take the route */
+            size_t starts[LOGOS_MAX_VIEW_BUCKETS + 1]; double bmn[LOGOS_MAX_VIEW_BUCKETS], bmx[LOGOS_MAX_VIEW_BUCKETS];
+            memcpy(a, orig, n * sizeof(double)); (void)logos_twist_last(26);
+            int nbk = logos_partition_f64(a, n, 2, starts, bmn, bmx);
+            size_t hv = logos_twist_last(26);
+            checks++; asserted++;
+            if (nbk <= 0 || hv) { fails++; printf("  FAIL  two halves, lazy view partition, n=%zu: %d buckets, route ran %zu times\n", n, nbk, hv); }
+        }
+    }
+    free(orig); free(a); free(bi); free(bo);
+    printf("  two halves: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the log-line route (2026-10-19, str_ns_try): one thread, near-ordered strings. Each row checks strcmp order and that the
+ * output is a permutation of the input pointers, and names the verdict it must reach (logos_twist_last(-9)): lines arriving
+ * mostly in order must be TAKEN (1), with late lines, ties in a millisecond, a poison line that is far too large early on (the
+ * demotion must recover it), identical lines and empty strings; random lines must be DECLINED at the pre-gate (2); a strand whose
+ * windows look ordered but whose whole array carries too many strays must GIVE UP in the pass (3) and still come out sorted;
+ * with LOGOS_STR_NO_NS set, or at two threads, it must not run (0). */
+static int ns_cmp_str(const void *x, const void *y) { return strcmp(*(const char *const *)x, *(const char *const *)y); }
+static int ns_cmp_ptr(const void *x, const void *y) { uintptr_t a = (uintptr_t)*(const char *const *)x, b = (uintptr_t)*(const char *const *)y; return (a > b) - (a < b); }
+static int strns_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    static const size_t ns[] = { 65536, 100003, 400009 };
+    enum { LG, LP, LI, LE, LR, LX, LC, LM };
+    static const char *nm[LM] = { "log lines", "log lines + a poison line", "log lines, many identical", "log lines + empty strings", "random lines", "ordered windows, strays between them", "eight sorted files concatenated" };
+    for (size_t ni = 0; ni < sizeof ns / sizeof *ns; ni++) for (int mode = 0; mode < LM; mode++) for (int v = 0; v < 4; v++) {
+        size_t n = ns[ni];
+        seed(27270 + (uint64_t)mode * 41 + ni);
+        char *pool = malloc(n * 40 + 64); const char **a = malloc(n * sizeof *a), **ref = malloc(n * sizeof *ref);
+        if (!pool || !a || !ref) { free(pool); free(a); free(ref); printf("  log-line route: skipped (no memory)\n"); return 0; }
+        size_t off = 0; double t = 0;
+        for (size_t i = 0; i < n; i++) {
+            char *p = pool + off; t += frand() * 2.0;
+            double ts = t + (frand() < 0.05 ? -frand() * 500.0 : 0.0); if (ts < 0) ts = 0;
+            if (mode == LR) ts = frand() * 1e7;
+            if (mode == LC) ts = (double)(i % (n / 8 + 1)) * 3.0;
+            if (mode == LX) { size_t blk = i / 64; ts = (blk % 2 == 0) ? (double)i : frand() * (double)n; }   /* ordered at the gate's windows only by luck */
+            int len = snprintf(p, 40, "%012lld|h%02d|%c", (long long)ts, (int)(nextr() % 32), 'a' + (int)(nextr() % 26));
+            if (mode == LI && (i % 3)) len = snprintf(p, 40, "%012lld|same", (long long)ts);
+            if (mode == LE && i % 97 == 0) len = 0, p[0] = 0;
+            if (mode == LP && i == 10) len = snprintf(p, 40, "zzzzzzzzzzzz|poison");
+            a[i] = p; off += (size_t)len + 1;
+        }
+        memcpy(ref, a, n * sizeof *a);
+        qsort(ref, n, sizeof *ref, ns_cmp_str);
+        if (v == 3 && mode != LG) { free(pool); free(a); free(ref); continue; }   /* the forced give-up: on plain log lines only */
+        if (v == 1) setenv("LOGOS_STR_NO_NS", "1", 1);
+        if (v == 3) setenv("LOGOS_STR_NS_CAP", "0.01", 1);
+        logos_sort_strings_mt(a, n, v == 2 ? 2 : 1);
+        unsetenv("LOGOS_STR_NO_NS"); unsetenv("LOGOS_STR_NS_CAP");
+        int verdict = (int)logos_twist_last(-9); (void)logos_twist_last(27);
+        int ok = 1;
+        for (size_t i = 0; i < n && ok; i++) if (strcmp(a[i], ref[i])) ok = 0;
+        if (ok) { qsort(a, n, sizeof *a, ns_cmp_ptr); qsort(ref, n, sizeof *ref, ns_cmp_ptr); ok = memcmp(a, ref, n * sizeof *a) == 0; }
+        checks++; if (!ok) { fails++; printf("  FAIL  log-line route, %s, n=%zu%s: wrong output\n", nm[mode], n, v == 1 ? ", switch set" : v == 2 ? ", 2 threads" : v == 3 ? ", forced give-up" : ""); }
+        if (v == 3) { checks++; asserted++; if (verdict != 3) { fails++; printf("  FAIL  log-line route, %s, n=%zu: forced give-up read verdict %d\n", nm[mode], n, verdict); } free(pool); free(a); free(ref); continue; }
+        int want = v ? 0 : mode == LR ? 2 : (mode == LX || mode == LC) ? -1 : 1;
+        if (want >= 0) { checks++; asserted++;
+            if (v == 0 && verdict != want) { fails++; printf("  FAIL  log-line route, %s, n=%zu: verdict %d, expected %d\n", nm[mode], n, verdict, want); }
+            if (v != 0 && verdict == 1) { fails++; printf("  FAIL  log-line route, %s, n=%zu%s: the route ran\n", nm[mode], n, v == 1 ? " with the switch set" : " at 2 threads"); } }
+        if ((mode == LX || mode == LC) && v == 0) { checks++; asserted++; if (verdict == 1) { fails++; printf("  FAIL  log-line route, %s, n=%zu: taken with half the lines strays\n", nm[mode], n); } }
+        free(pool); free(a); free(ref);
+    }
+    printf("  log-line route: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- strings on prefix keys (2026-10-09, logos_sort_strings_mt): every output in strcmp order and a permutation of the input
+ * pointers. Inputs: empty strings, bytes of 0x80 and up (strcmp compares them unsigned), identical strings, strings that are
+ * prefixes of others ("", "a", "ab", ...), prefixes shared for 8, 9, 16 and 200 bytes (the key skips whole blocks), sorted and
+ * reversed input; sizes on both sides of STR_SMALL (32) and of the parallel threshold (65536); 1, 2 and 8 threads. And strings
+ * that END on the last byte before a page the process may not read: the 8-byte load must never cross into it (a crash here). ---- */
+#include <sys/mman.h>
+static int str_ptr_cmp(const void *x, const void *y) { uintptr_t a = (uintptr_t)*(const char *const *)x, b = (uintptr_t)*(const char *const *)y; return (a > b) - (a < b); }
+static int str_check(const char **out, const char **in, const char **tmp, size_t n) {
+    for (size_t i = 1; i < n; i++) if (strcmp(out[i - 1], out[i]) > 0) return 0;
+    memcpy(tmp, in, n * sizeof *tmp); qsort(tmp, n, sizeof *tmp, str_ptr_cmp);
+    const char **t2 = malloc(n * sizeof *t2); if (!t2) return 1;
+    memcpy(t2, out, n * sizeof *t2); qsort(t2, n, sizeof *t2, str_ptr_cmp);
+    int ok = memcmp(tmp, t2, n * sizeof *tmp) == 0;
+    free(t2); return ok;
+}
+static int strings_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    static const size_t sizes[] = { 2, 3, 31, 32, 33, 100, 4097, 65535, 65536, 65537, 300007 };
+    const int threads[] = { 1, 2, 8 };
+    size_t NMAX = 300007;
+    char *pool = malloc(NMAX * 240);
+    const char **in = malloc(NMAX * sizeof *in), **a = malloc(NMAX * sizeof *a), **tmp = malloc(NMAX * sizeof *tmp);
+    if (!pool || !in || !a || !tmp) { free(pool); free(in); free(a); free(tmp); printf("  strings: skipped (no memory)\n"); return 0; }
+    for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) for (int mode = 0; mode < 9; mode++) {
+        size_t n = sizes[si], o = 0;
+        seed(20100 + (uint64_t)mode * 13 + si);
+        for (size_t i = 0; i < n; i++) {
+            char *s = pool + o; size_t L = 0;
+            switch (mode) {
+            case 0: L = nextr() % 24; for (size_t j = 0; j < L; j++) s[j] = (char)('a' + nextr() % 26); break;            /* short words, empties */
+            case 1: L = 1 + nextr() % 20; for (size_t j = 0; j < L; j++) s[j] = (char)(1 + nextr() % 255); break;        /* every byte value but 0 */
+            case 2: L = nextr() % 12; for (size_t j = 0; j < L; j++) s[j] = 'a' + (char)(j % 3); break;                 /* prefixes of one another */
+            case 3: memset(s, 'x', 8); L = 8 + nextr() % 3; for (size_t j = 8; j < L; j++) s[j] = (char)('a' + nextr() % 3); break;   /* 8 shared */
+            case 4: memset(s, 'q', 9); L = 9 + nextr() % 9; for (size_t j = 9; j < L; j++) s[j] = (char)(0x80 + nextr() % 4); break; /* 9 shared, high bytes */
+            case 5: memset(s, 'p', 200); L = 200 + nextr() % 30; for (size_t j = 200; j < L; j++) s[j] = (char)('0' + nextr() % 10); break; /* 200 shared */
+            case 6: L = 16; memcpy(s, "same-string-here", 16); if (nextr() % 3 == 0) { s[15] = 'X'; } break;       /* duplicates */
+            case 7: L = (size_t)snprintf(s, 32, "k%09zu", i); break;                                                  /* sorted */
+            default: L = (size_t)snprintf(s, 32, "k%09zu", n - i); break;                                             /* reversed */
+            }
+            s[L] = 0; in[i] = s; o += L + 1;
+        }
+        for (size_t ti = 0; ti < sizeof threads / sizeof *threads + 2; ti++) {   /* the last two: 2 and 8 threads with the opt-in group hand-off */
+            int T = ti < 3 ? threads[ti] : (ti == 3 ? 2 : 8), gp = ti >= 3;
+            if (gp) setenv("LOGOS_STR_GROUPPAR", "1", 1);
+            memcpy(a, in, n * sizeof *a);
+            (void)logos_twist_last(25);
+            logos_sort_strings_mt(a, n, T);
+            size_t ran = logos_twist_last(25);
+            if (gp) unsetenv("LOGOS_STR_GROUPPAR");
+            checks++; if (!str_check(a, in, tmp, n)) { fails++; printf("  FAIL  strings, mode %d, n=%zu, threads=%d%s: wrong output\n", mode, n, T, gp ? ", LOGOS_STR_GROUPPAR=1" : ""); }
+            checks++; asserted++;
+            if ((n > 32) != (ran == 1)) { fails++; printf("  FAIL  strings, mode %d, n=%zu: the prefix-key path ran %zu times (expected %d)\n", mode, n, ran, n > 32); }
+        }
+    }
+    /* each string one 8-byte block longer than the last ('x' x 8i, then 'y'): every level splits ONE string off a group of all the
+       rest, so a sort that recursed into every group went 3000 levels deep (at 15.7 KB a frame, past an 8 MB stack). The rule that
+       loops on the largest group instead keeps it at log2 n. The strings share one buffer: s_i starts 8(k - i) bytes into it. */
+    {
+        const size_t k = 3000; char *buf = malloc(8 * k + 2);
+        const char **e = malloc(k * sizeof *e), **ein = malloc(k * sizeof *ein), **et = malloc(k * sizeof *et);
+        if (buf && e && ein && et) {
+            memset(buf, 'x', 8 * k); buf[8 * k] = 'y'; buf[8 * k + 1] = 0;
+            for (size_t i = 0; i < k; i++) ein[i] = buf + 8 * (k - ((i * 7919) % k));          /* shuffled */
+            for (int ti = 0; ti < 2; ti++) {
+                memcpy(e, ein, k * sizeof *e);
+                logos_sort_strings_mt(e, k, ti ? 8 : 1);
+                checks++; if (!str_check(e, ein, et, k)) { fails++; printf("  FAIL  strings, nested blocks, threads=%d: wrong output\n", ti ? 8 : 1); }
+            }
+        }
+        free(buf); free(e); free(ein); free(et);
+    }
+    /* strings ending on the last readable byte of a page */
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned char *m = mmap(NULL, (size_t)pg * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m != MAP_FAILED && mprotect(m + pg, (size_t)pg, PROT_NONE) == 0) {
+        size_t n = 0; const char *e[64];
+        for (int len = 0; len < 12; len++) {                           /* each string's NUL is the page's last byte */
+            unsigned char *s = m + pg - 1 - len; for (int j = 0; j < len; j++) s[j] = (unsigned char)('a' + (len + j) % 5);
+            m[pg - 1] = 0; e[n++] = (const char *)s;                     /* they overlap: each is a suffix of the longer ones */
+        }
+        for (size_t i = 0; i < 40; i++) e[n++] = (const char *)(m + pg - 1 - (i % 12));
+        const char *ein[64]; memcpy(ein, e, n * sizeof *e);
+        logos_sort_strings_mt(e, n, 1);
+        checks++; if (!str_check(e, ein, tmp, n)) { fails++; printf("  FAIL  strings at a page's end: wrong output\n"); }
+        munmap(m, (size_t)pg * 2);
+    }
+    free(pool); free(in); free(a); free(tmp);
+    printf("  strings: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
 /* ---- the small sorting networks (n = 4..16 in the leaf). Nothing else here sorts an array that short WITH a NaN in
  * it: the IEEE section starts at 5000 elements. That matters because a comparator written as a min and a max returns
  * the same operand twice when one side is a NaN and LOSES the other, which is not a permutation; this one is written
@@ -1732,10 +3202,11 @@ static int inplace_checks(void) {
  * this section passed with the route never firing at one thread: the gate's sample was 384 points there, not 2048).
  * Checked as ascending under '<' plus an identical bitwise multiset, and against the same sort with the route switched off. ---- */
 enum { RM_JITTER, RM_WINDOW, RM_ONE_UP, RM_ONE_DOWN, RM_THREE, RM_EVERYWHERE, RM_HIDDEN, RM_DUPS, RM_SEAMTIES, RM_ZEROS, RM_INF, RM_NAN,
-       RM_SUBNORMAL, RM_GAP, RM_PLATEAU, RM_SWAPPED, RM_SPARSE, RM_N };
+       RM_SUBNORMAL, RM_GAP, RM_PLATEAU, RM_SWAPPED, RM_SPARSE, RM_SPARSEFAR, RM_SPARSEENDS, RM_N };
 static const char *RM_NAME[RM_N] = { "jitter", "windows", "one stray up", "one stray down", "three strays", "strays everywhere", "strays the probe cannot see",
     "duplicates", "ties at the seams", "signed zeros", "infinities", "a NaN", "subnormals", "quiet hours (two clusters in a block)", "a plateau in a block",
-    "two blocks swapped", "sparse disorder" };
+    "two blocks swapped", "sparse kinks (every 40th pair, adjacent)", "sparse displaced (every 400th element, a third of the array away)",
+    "sparse kinks with one at each END of the array" };
 static void reach_gen(double *a, size_t n, int mode) {
     double J = (double)n / 4000.0; if (J < 50) J = 50;                  /* the reach grows with n so that the gate's ladder (distances are fractions of n) accepts it */
     const size_t B = 32768;
@@ -1759,6 +3230,17 @@ static void reach_gen(double *a, size_t n, int mode) {
     case RM_PLATEAU:  { size_t p0 = n / 2 + 1000, len = n / 4000 < 3000 ? 3000 : n / 4000; for (size_t i = p0; i < p0 + len && i < n; i++) a[i] = (double)p0 + (double)len / 2.0; } break;
     case RM_SWAPPED:  { size_t K = n / B, k = K / 2 - 5; if (K >= 40) for (size_t i = 0; i < B; i++) { double t = a[k * B + i]; a[k * B + i] = a[(k + 1) * B + i]; a[(k + 1) * B + i] = t; } } break;
     case RM_SPARSE:   for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.25; for (size_t i = 0; i + 1 < n; i += 40) { double t = a[i]; a[i] = a[i + 1]; a[i + 1] = t; } break;
+    /* the same sparseness with every displaced element a third of the array from home: the descents it makes fail the
+       kink shape on one side, so the probe must report the plain gate decline and leave it to near-sorted. Every 400th
+       (0.25%), because a far swap inverts its sampled pairs where an adjacent one never does and REACH_TAU is 2%. */
+    case RM_SPARSEFAR: for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.25;
+                       for (size_t i = 0; i < n; i += 400) { size_t j = i + n / 3 + (i * 7919u) % (n / 3 + 1); if (j >= n) break; double t = a[i]; a[i] = a[j]; a[j] = t; } break;
+    /* the every-40th kinks starting at 1 (so no interior pair touches an end), plus one kink at EACH end of the array:
+       the worker's test reads a[j - 2] and a[j + 1], which do not exist there, and until 2026-09-26 neither end was
+       ever repaired -- at P > 1 the head came back as a two-element descending run and the strand was never one run */
+    case RM_SPARSEENDS: for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.25;
+                        for (size_t i = 41; i + 1 < n - 2; i += 40) { double t = a[i]; a[i] = a[i + 1]; a[i + 1] = t; }
+                        { double t = a[0]; a[0] = a[1]; a[1] = t; t = a[n - 2]; a[n - 2] = a[n - 1]; a[n - 1] = t; } break;
     default: break;
     }
 }
@@ -1775,7 +3257,9 @@ static int reach_expect(int mode, size_t n, int threads) {
     case RM_EVERYWHERE: return tolerant ? LOGOS_REACH_SORTED_STRAYS : LOGOS_REACH_DECLINED_PROBE;
     case RM_HIDDEN: return big ? LOGOS_REACH_SORTED_STRAYS : -1;         /* eight blocks are all probe blocks: nothing is hidden there */
     case RM_SWAPPED: return n >= 3000000 ? LOGOS_REACH_DECLINED_PLAN : -1;
-    case RM_SPARSE: return LOGOS_REACH_DECLINED_GATE;
+    case RM_SPARSE: return LOGOS_REACH_DECLINED_KINKS;     /* was DECLINED_GATE until 2026-09-26: sparse AND kink-shaped now says so */
+    case RM_SPARSEFAR: return LOGOS_REACH_DECLINED_GATE;   /* sparse but displaced: the plain decline, near-sorted's kind */
+    case RM_SPARSEENDS: return LOGOS_REACH_DECLINED_KINKS; /* kinks, two of them at the ends: the same verdict, and one run */
     default: return -1;
     }
 }
@@ -1783,7 +3267,11 @@ static int reach_checks(void) {
     int checks = 0, fails = 0;
     const int threads[] = { 1, 4, 8 };
     const size_t sizes[] = { 70000, 262144, 262145, 300001, 1000003, 3000017 };
-    static const char *ST[] = { "not tried", "sorted", "sorted, strays shifted in", "declined at the gate", "declined by the probe", "declined by the plan", "declined: no memory" };
+    /* one name per LOGOS_REACH_* value, IN ORDER: when the kink verdict was added without its name here, every failing
+       row printed "the route reports '(null)'" from ST[7] one past the end, which is undefined behaviour that happened
+       to be legible. A new verdict lands in both places in the same edit. */
+    static const char *ST[] = { "not tried", "sorted", "sorted, strays shifted in", "declined at the gate", "declined by the probe", "declined by the plan", "declined: no memory",
+                                "declined: sparse kinks (for the detector)" };
     unsetenv("LOGOS_NO_REACH");
     for (int mode = 0; mode < RM_N; mode++) {
         for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++) {
@@ -1798,6 +3286,7 @@ static int reach_checks(void) {
                 if (n > 2000000 && threads[ti] != 8) continue;
                 memcpy(a, orig, n * sizeof(double));
                 int before = logos_reach_last();
+                logos_twist_last(12);                                        /* clear the one-strand counter: reading does */
                 logos_sort_f64(a, n, threads[ti]);
                 /* under the route's floor a sort must leave the answer ALONE (no thread-local access on a small sort's path), so the
                  * expectation there is whatever the previous row left, which is a real state for every mode but the first */
@@ -1805,6 +3294,10 @@ static int reach_checks(void) {
                 if (mode != RM_NAN) for (size_t i = 1; i < n; i++) if (a[i] < a[i - 1]) { ok = 0; break; }
                 checks++; if (!ok) { fails++; printf("  FAIL  short reach, %s, n=%zu threads=%d: wrong output (route: %s)\n", RM_NAME[mode], n, threads[ti], ST[got]); }
                 checks++; if (want >= 0 && got != want) { fails++; printf("  FAIL  short reach, %s, n=%zu threads=%d: the route reports '%s', this row is here for '%s'\n", RM_NAME[mode], n, threads[ti], ST[got], ST[want]); }
+                /* a kinked strand must come back as ONE run and be finished as such, at every thread count -- the kink verdict
+                   alone was not enough: a kink at index 0 left R = 2 at P > 1 and the finish never fired (2026-09-26) */
+                if ((mode == RM_SPARSE || mode == RM_SPARSEENDS) && n >= 262144) {
+                    checks++; if (!logos_twist_last(12)) { fails++; printf("  FAIL  short reach, %s, n=%zu threads=%d: the strand was not finished as one run\n", RM_NAME[mode], n, threads[ti]); } }
                 if (ti == 1 && mode != RM_NAN && mode != RM_ZEROS) {        /* the same input with the route off: two correct sorts of one array are the same bytes */
                     memcpy(b, orig, n * sizeof(double)); setenv("LOGOS_NO_REACH", "1", 1); logos_sort_f64(b, n, threads[ti]); unsetenv("LOGOS_NO_REACH");
                     checks++; if (memcmp(a, b, n * sizeof(double)) || logos_reach_last() != (n < 262144 ? got : LOGOS_REACH_NOT_TRIED)) { fails++; printf("  FAIL  short reach, %s, n=%zu: differs from the sort with the route off\n", RM_NAME[mode], n); }
@@ -2095,15 +3588,19 @@ static int fault_checks(void) {
             for (int ti = 0; ti < 2; ti++) {
                 int T = ti ? 4 : 1; long K = 0;
                 if (kind && T == 1) continue;                            /* one thread creates nothing */
-                snprintf(ft_what, sizeof ft_what, "%s %s threads=%d unfaulted", FE_NAME[e], sh, T); alarm(120);
-                int ok = ft_run(e, a, ia, orig, io, n, h, T, kind, 0, 0, !kind, &K);
+                for (int np = 0; np < (kind ? 2 : 1); np++) {                 /* thread creation: with the worker pool, then without */
+                if (np) setenv("LOGOS_NO_POOL", "1", 1);
+                snprintf(ft_what, sizeof ft_what, "%s %s threads=%d unfaulted%s", FE_NAME[e], sh, T, np ? " LOGOS_NO_POOL=1" : ""); alarm(120);
+                int ok = ft_run(e, a, ia, orig, io, n, h, T, kind, 0, 0, 1, &K);   /* cold: a warm pool would create nothing to fail */
                 checks++; if (!ok) { fails++; printf("  FAIL  %s\n", ft_what); }
                 for (int rest = 0; rest < 2; rest++) for (long k = 1; k <= K; k += step) {
                     snprintf(ft_what, sizeof ft_what, "%s %s threads=%d %s %s k=%ld of %ld", FE_NAME[e], sh, T, kind ? "thread creation" : "allocation", rest ? "rest" : "one", k, K);
                     alarm(120);
-                    ok = ft_run(e, a, ia, orig, io, n, h, T, kind, rest, k, !kind, NULL);
+                    ok = ft_run(e, a, ia, orig, io, n, h, T, kind, rest, k, 1, NULL);
                     checks++; if (kind) spawn_runs++; else alloc_runs++;
-                    if (!ok) { fails++; printf("  FAIL  %s\n", ft_what); }
+                    if (!ok) { fails++; printf("  FAIL  %s%s\n", ft_what, np ? " LOGOS_NO_POOL=1" : ""); }
+                }
+                if (np) unsetenv("LOGOS_NO_POOL");
                 }
             }
         }
@@ -2149,9 +3646,9 @@ int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);      /* redirected output is block-buffered: a crash used to eat the last 4 KB and point at the wrong section */
     printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
     static const section_t S[] = {
-        { "correctness: logos vs qsort", correctness }, { "parity extras", extras_checks }, { "sorted prefix + tail", tail_checks },
-        { "interleaved streams", streams_checks }, { "knot route", knot_checks }, { "twist", twist_checks }, { "linked list", list_checks }, { "gallop", gallop_checks }, { "mirror", mirror_checks }, { "loop-back", loop_checks }, { "round six", round6_checks }, { "prescan in blocks", prescan_checks }, { "descending ties", desc_tie_checks }, { "short-reach route", reach_checks }, { "key grid", kgrid_checks },
-        { "small networks", smallnet_checks }, { "IEEE special values", ieee_checks }, { "NaN termination", nan_termination_checks }, { "infinities", infinity_checks }, { "dominant values", dominant_checks },
+        { "correctness: logos vs qsort", correctness }, { "parity extras", extras_checks }, { "sorted prefix + tail", tail_checks }, { "runs of equal values", rle_checks }, { "cuts: windows in order", cuts_checks }, { "other fields", other_fields_checks }, { "dominant-value route", domroute_checks }, { "half the scratch", half_checks }, { "lattice entry", lat1_checks }, { "strand gate", nsstrand_checks },
+        { "interleaved streams", streams_checks }, { "knot route", knot_checks }, { "twist", twist_checks }, { "linked list", list_checks }, { "gallop", gallop_checks }, { "vector merge", vmerge_checks }, { "mirror", mirror_checks }, { "loop-back", loop_checks }, { "round six", round6_checks }, { "prescan in blocks", prescan_checks }, { "descending ties", desc_tie_checks }, { "short-reach route", reach_checks }, { "key grid", kgrid_checks },
+        { "small networks", smallnet_checks }, { "thin front", thin_checks }, { "batch", batch_checks }, { "float32 and lattice vectors", f32lat_checks }, { "in-place partition", ipp_checks }, { "two halves", halves_checks }, { "strings on prefix keys", strings_checks }, { "log-line route", strns_checks }, { "first-partition scan", fuse_checks }, { "low-cardinality vector count", lcvec_checks }, { "parallel prescan", parprescan_checks }, { "mode grid", mdgrid_checks }, { "worker pool", pool_checks }, { "pool trim", trim_checks }, { "IEEE special values", ieee_checks }, { "NaN termination", nan_termination_checks }, { "infinities", infinity_checks }, { "dominant values", dominant_checks },
         { "strict in-place entries", inplace_checks }, { "boundaries", many_and_boundaries }, { "signed zeros", signed_zero_checks },
         { "dense integers", dense_checks }, { "sorted view (f64 and int32)", view_checks }, { "resource exhaustion", fault_checks },
     };

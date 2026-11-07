@@ -230,6 +230,34 @@ DRIVER = r"""<script>(async function(){
   if(!jump||jump.options.length<2)E('no jump-to-a-shape list');
   if(!document.getElementById('shape-0'))E('the shapes have no anchors to jump to');
   if(getComputedStyle(document.querySelector('.bar')).position!=='sticky')E('the control bar does not stay in view');
+
+  /* the shapes accordion (scalebench's shape_demos_json): one entry per described shape this report measured, each with
+     both inline plots inked, and a panel heading's link must open its entry. A report older than the accordion has no
+     SHAPES and is not asked. */
+  try{
+   if(typeof SHAPES!=='undefined'&&typeof DATA!=='undefined'){
+    var want=0;DATA.forEach(function(s,i){if(i%2===0&&SHAPES.some(function(d){return d.shape===s.shape;}))want++;});
+    var items=document.querySelectorAll('#shapes details.shp');
+    if(items.length!==want)E('the shapes accordion has '+items.length+' entries for '+want+' described shapes');
+    for(var k=0;k<items.length;k++){
+     var sv=items[k].querySelectorAll('svg').length,dots=items[k].querySelectorAll('svg circle').length;
+     if(sv!==2||dots<500)E('shape entry '+items[k].id+' has '+sv+' plots and '+dots+' points');
+    }
+    var link=document.querySelector('#charts p.sub a[href^="#about-"]'),outer=document.getElementById('shapes');
+    if(want&&!link)E('no panel heading links to its shape entry');
+    else if(link){
+     var tgt=document.getElementById(link.getAttribute('href').slice(1));
+     link.click();
+     if(!tgt||!tgt.open||!outer.open)E('a panel link did not open its shape entry');
+     else{
+      var bh=tgt.querySelector('.body').getBoundingClientRect().height,ph=tgt.querySelector('svg').getBoundingClientRect().height;
+      if(bh<200||ph<60)E('an opened shape entry is '+Math.round(bh)+' px tall, its first plot '+Math.round(ph)+' px');
+     }
+     if(tgt)tgt.open=false;
+     outer.open=false;
+    }
+   }
+  }catch(err){E('the shapes check threw: '+(err&&err.stack||err));}
  }catch(err){E('the driver threw: '+(err&&err.stack||err));}
  finally{window.__ixdone=true;}
 })();</script>"""

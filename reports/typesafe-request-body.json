@@ -1,0 +1,900 @@
+{
+  "state": {
+    "project": "logos-sort: a distribution-aware adaptive numeric sort engine in C. Thesis: addressing beats comparing -- detect structure (cardinality, sortedness, skew, quantization) and dispatch to a zero- or low-comparison path instead of a comparison sort.",
+    "hardware": "i9-13900H, 6 performance cores + 8 efficient cores, 14 bench threads, WSL2. Single socket.",
+    "method": {
+      "paired_ab": "two variants run adjacently on the two halves of one array, order alternated; median of the ratio with p10/p90. Drift cancels inside a pair, ordering bias across pairs.",
+      "resolving_floor": "the same engine on both sides reads 1.000; 40 pairs resolve ~3.7% at 8M and ~6.1% at 1M. An effect below that is not a result.",
+      "layout_bias": "engine copies differing only in renamed symbols differ up to 1.24x from code alignment, so any claim under 1.25x needs the copy assignment permuted or the mechanism traced.",
+      "verification": "every benchmark checks output against a reference; ~45,899 harness property checks.",
+      "calibration_line": "memcpy 64MB and std::sort 1M are printed per run; quiet is ~2.9ms/~65ms. A loaded box flatters logos, because barrier-heavy opponents lose more to preemption."
+    },
+    "competitive_position": "At 14 threads on AVX2 hardware: parity with x86-simd-sort on random shapes (0.86-1.08x), ahead on structured (few_distinct 1.4x, quantized 1.76x, block shapes 2.2-2.5x). Loses to AVX-512 x86-simd-sort on all unstructured shapes. Loses 2-9x to std::sort below ~100 elements.",
+    "memory": "Peak heap of one cold call, bytes per element at 10M, one thread: logos 15.7, LSD radix 16.0, timsort 3.9, IPS4o 0.2, std::sort 0.0, x86-simd-sort 0.0, logos strict in-place entry 0.0."
+  },
+  "model": "jev-latest",
+  "questions": {
+    "Q_C_C1": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD scatter (vpscatter). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C2": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD histogram (vpconflictd). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C3": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD bucket-index in coarse. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C4": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: SIMD OR/AND byte-skip. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C5": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Winner/loser tree merge, near-sorted. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C6": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Shared per-thread context pool. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C7": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Parallel merge sort (chunk-sort + k-way merge). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C8": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Cache-conscious COARSE_K (64–512). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C9": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: logos partition + SIMD leaf, parallel. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C10": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Golden-ratio pivot. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C11": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Ping-pong (remove copyback). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C12": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Private per-thread buckets (NUMA). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C13": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: JS-era: flips/descent counter, cardinality probe, gap-statistic gallop, wider radix digits (whole-array, 1T), greedy ascending subsequence. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C14": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: 4.0.0 camelCase revision. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C15": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: J5 first cut: interval-overlap gate on raw runs. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C16": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: J5 second cut: sequential probe + spawn-then-bail. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C17": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Leaf knobs: flash m = n/4, m = n/16, coarse on ~100k buckets (make leafbench). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C19": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: AVX2 quicksort in the PARALLEL leaf (33k-element L2-resident buckets, make simdbench -DLOGOS_AVX2_PARALLEL). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C20": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Model splitter table (H0c: linear bucket-index model per value cell, third trial candidate; -DLOGOS_MODEL_TABLE). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C21": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: 128-element bitonic base case for the AVX2 leaf. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C25": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Exponent-histogram bucket map (-DLOGOS_EXMAP): flat table indexed by binade, linear interpolation on the mantissa, an approximate inverse CDF in one load and one multiply. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C26": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route, first cut of the sweep: every run endpoint cuts BELOW its value. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C27": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route gated at J5's n/2, on a predicted 14-thread break-even at 60–100% crossing. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C28": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route's placement under relocation's one-thread-per-500k cap. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C29": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Untying three or more live strands in a PARALLEL sort (knot route, cost 1.57n). Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C30": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Knot route, first cut: runtime switches read with getenv on every sort, and a cost gate with no minimum run length. Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C31": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: Header and README: \"logos_sort_f64 uses ~9n (README: ~8n) bytes of scratch\", \"logos_sort_i32 ~5n (README: ~16n)\". Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_C_C32": {
+      "type": "noul",
+      "instructions": "In a distribution-aware numeric sort engine (logos-sort), this was implemented and measured end to end: logos_release_buffers() \"frees the persistent buffers\". Judge whether it BEAT the engine as it shipped.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor (>1.05x) on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D1": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Lattice (direct-index) counting. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D2": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Low-cardinality parallel counting (≤1024 distinct). Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D3": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Moderate-cardinality hash counting (≤65 536 distinct). Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D4": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Near-sorted index-partition + one-pass P-way band merge. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D5": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Bucket-index cache + destination prefetch. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D6": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Dynamic chunking + spin-then-block barrier. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D7": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Native int32 engine (no widening). Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D8": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Persistent scratch pool. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D9": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: argSort (stable, index-carrying) + apply / inverse permutation. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D10": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Order model (rank/select) without materialising. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D11": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: One-pass analytics instead of sort-first. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D12": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Strict in-place (~1n) variants. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D13": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Disjoint-run relocation (J5): memcpy shuffled sorted blocks into place from sorted run descriptors. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D14": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Per-phase profiler: CPU vs preempted vs stalled vs idle per thread, leaf path per bucket, HTML treemaps. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D15": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Direct-index splitter tables with per-thread trial (H0b + J15): O(1) bucket lookup in the histogram. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D16": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: 12 buckets/thread (J16) + table leaf with the root style chosen per thread from the trial's root-resolution fraction. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D17": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Profiler and parbench carry x86-simd-sort (AVX-512 or AVX2 per build) and IPS⁴o at equal thread counts; single-thread SIMD column now really single-threaded. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D18": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Thread-count policy: at most one thread per 100k elements (found by the scaling benchmark, A13). Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D19": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Scaling benchmark: time vs n for every contender and shape, 1T and P, linear axes with O(n) / O(n log n) references and fitted exponents. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D23": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Weyl sample positions (floor(frac(i·φ)·n) in every sampler; three-gap theorem). Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D39": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Per-mode certificate and linear map: each mode's slice of the sample is tested for uniformity on its own, and if every mode certifies the partition buckets with branch-free mode selection plus one multiply-add instead of a table per mode. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D40": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: The knot route: runs as strands, a sweep over the 2R run endpoints, pieces that lie alone are copied and only what crosses is merged; staircases of overlapping sorted blocks, which relocation declines because one chain covers everything, no longer pay for a full sort. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D41": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: Resource exhaustion costs speed, never correctness: every allocation and every thread creation of a cold call can fail, singly or from some point on, and the array still comes back sorted. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_D_D42": {
+      "type": "noul",
+      "instructions": "In logos-sort, this was built and A/B'd against the engine as it shipped: make memprobe: what one cold sort weighs, what it still holds, what is left after release; f64 and int32, 1 thread and P, the in-place entries beside them. Judge whether it BEAT the engine by more than the resolving floor.",
+      "criteria": {
+        "true": "It beat the shipped engine by more than the resolving floor on its target shapes",
+        "false": "It did not: neutral, mixed, or slower"
+      }
+    },
+    "Q_S01": {
+      "type": "noul",
+      "instructions": "In logos-sort: Branchless Batcher networks for 4-16 elements in the leaf, generated and proved by the 0-1 principle before being written. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S02": {
+      "type": "noul",
+      "instructions": "In logos-sort: The lattice MAP phase claims chunks from an atomic counter instead of taking equal slices. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S03": {
+      "type": "noul",
+      "instructions": "In logos-sort: The same work queue applied to relocation's output tiles. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S04": {
+      "type": "noul",
+      "instructions": "In logos-sort: Each lattice worker allocates its own count table rather than the caller allocating all P before the spawn. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S05": {
+      "type": "noul",
+      "instructions": "In logos-sort: The lattice route's idle threads are its serial merge. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S06": {
+      "type": "noul",
+      "instructions": "In logos-sort: The lattice route's 2ms of table teardown is worth attacking. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S07": {
+      "type": "noul",
+      "instructions": "In logos-sort: The lattice emit phase's low concurrency is thread imbalance. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S08": {
+      "type": "noul",
+      "instructions": "In logos-sort: Knowing the data FORMAT (that values are dates) beats certifying the distribution, for NUMERIC timestamps. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S09": {
+      "type": "noul",
+      "instructions": "In logos-sort: Knowing the date format pays when the dates are TEXT. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S10": {
+      "type": "noul",
+      "instructions": "In logos-sort: Projecting each element onto a sphere of radius n (x=value, y=a prime, z=the index) and sorting the projection. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S11": {
+      "type": "noul",
+      "instructions": "In logos-sort: The scale report's memory column reproduces make memprobe from an independent code path. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S12": {
+      "type": "noul",
+      "instructions": "In logos-sort: The dispatcher's frame grew across one session and that is the untraced small-call drift. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S13": {
+      "type": "noul",
+      "instructions": "In logos-sort: A trace build can be used to price a phase. Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S14": {
+      "type": "noul",
+      "instructions": "In logos-sort: The triple-reversal weld (condense into runs, meta-sort by min edge, in-place triple reversals, seam weld behind an O(1) check). Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_S15": {
+      "type": "noul",
+      "instructions": "In logos-sort: The handed-off Moebius hybrid's micro-kink branch (Reidemeister I on 2-3 element dips). Judge whether this held up under a paired A/B against the shipped engine, with the resolving floor at ~3.7% and layout bias up to 1.24x on copies.",
+      "criteria": {
+        "true": "It held up and shipped",
+        "false": "It did not hold up: neutral, slower, or the claim was false"
+      }
+    },
+    "Q_SZ_networks": {
+      "type": "score",
+      "instructions": "Branchless Batcher sorting networks for 4-16 elements replacing insertion sort in the leaf. Rate the speedup on RANDOM calls at n=16, one thread.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_net4": {
+      "type": "score",
+      "instructions": "The same networks, rated on RANDOM calls at n=4.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_latqueue": {
+      "type": "score",
+      "instructions": "The lattice map phase claiming chunks from a counter instead of equal slices, at 14 threads on quantized. Rate the speedup.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_tiles": {
+      "type": "score",
+      "instructions": "The same work queue applied to relocation's memcpy output tiles, 14 threads. Rate it.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_prescan": {
+      "type": "score",
+      "instructions": "Making the dispatcher's prescan compare with vectors (AVX2 blocks of 32) where its block loop had compiled to sixteen scalar compares and a serial OR chain. Rate it on SORTED input.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_kink": {
+      "type": "score",
+      "instructions": "Swapping a kinked adjacent pair back where it stands inside a run (Reidemeister I), on sorted blocks with 0.1% kinks at one thread. Rate it.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_datestr": {
+      "type": "score",
+      "instructions": "Parsing fixed-width ISO-8601 timestamps to a numeric key and using argsort + one gather, against std::sort on std::string. Rate it.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_datenum": {
+      "type": "score",
+      "instructions": "Telling the sort the origin and step of NUMERIC epoch-millisecond timestamps, so it can convert to integer keys and radix only the varying bytes. Rate it against the engine.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_hugepage": {
+      "type": "score",
+      "instructions": "Huge pages for the engine's large buffers, at 14 threads and 8M, with the mechanism verified firing (98MB AnonHugePages vs 0). Rate it.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_SZ_gallop": {
+      "type": "score",
+      "instructions": "A galloping two-strand merge for one sparse strand spanning every value over dense blocks, one thread, 8.4M. Rate it.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_MECH_lattice_idle": {
+      "type": "choice",
+      "instructions": "logos-sort's lattice counting route at 14 threads shows only 8.4 of 14 threads busy on average, with NONE waiting at a barrier and no preemption (cpu/busy = 1.00). Every thread is handed exactly n/P work in both of its parallel phases. Which is the binding constraint?",
+      "criteria": {
+        "serial_merge": "the serial merge between the two parallel phases",
+        "table_teardown": "freeing the per-thread count tables at the end",
+        "thread_creation": "creating and joining the worker threads, paid once per parallel phase",
+        "memory_bandwidth": "the emit phase saturating memory bandwidth, so extra threads cannot help",
+        "thread_imbalance": "unequal work per thread inside the phases",
+        "cache_pressure": "the per-thread tables being too large for L2"
+      }
+    },
+    "Q_MECH_proposal_failure": {
+      "type": "choice",
+      "instructions": "An outside sorting proposal arrives for logos-sort. Given that the engine sorts at 0.8-2.1 ns/element at 14 threads and already certifies cardinality, sortedness, skew and quantization from one shared sample, which failure mode will the proposal hit FIRST?",
+      "criteria": {
+        "per_element_cost": "its per-element transform costs more than the whole sort",
+        "destroys_order": "its transform is not monotone in the value, so the output is not sorted",
+        "already_subsumed": "the engine's existing routes already exploit the same structure",
+        "isolated_win_only": "the kernel wins in isolation and loses end to end",
+        "gate_never_fires": "the branch it relies on fires zero times on its target shape",
+        "fixed_cost_per_call": "it is free at scale but adds cost to every small call"
+      }
+    },
+    "Q_MECH_small_end": {
+      "type": "choice",
+      "instructions": "logos-sort loses 2-9x to std::sort below ~100 elements. Entering the dispatcher costs ~5.6ns before any work, and psort_f64's stack frame is 42,576 bytes, which stack-clash protection probes a page at a time on EVERY call (11 probes). Which lever recovers the most at n = 2-10?",
+      "criteria": {
+        "thin_front": "a small-frame front function, with the large body behind a call",
+        "alignment": "an alignment policy (-falign-functions/-falign-loops)",
+        "fewer_gates": "skipping more dispatcher gates at tiny n",
+        "networks": "branchless sorting networks (already shipped for 4-16)",
+        "nothing": "nothing structural; the remaining cost is irreducible"
+      }
+    },
+    "Q_OPEN_O01": {
+      "type": "score",
+      "instructions": "A persistent worker pool replacing per-call pthread_create. Context: The lattice route pays spawn+join twice (map and emit): create+join of 13 workers measures 0.564ms of a 1.597ms emit phase, about 1.13ms of a 6.58ms call. Every pthread_create already goes through par_run/par_spawn, so it is a change to two functions rather than 23 sites. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "above 1.40"
+      ]
+    },
+    "Q_OPEN_O02": {
+      "type": "score",
+      "instructions": "Interleaving the lattice map's keys[] and cnts[] into one 16-byte record. Context: The map is 68% of the route at concurrency 10.72/14. Its hot path touches keys[idx] then cnts[idx] at the same random index in two separate 400KB arrays: two cache lines per element where one record would be one. Caution: the ledger's 'interleaved counters' for the partition histogram measured neutral (0.95-1.04). Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "above 1.40"
+      ]
+    },
+    "Q_OPEN_O03": {
+      "type": "score",
+      "instructions": "A thin front for the dispatcher: prescan and insertion sort in a small-frame function, the large body behind a call. Context: psort_f64's frame is 42,576 bytes, so stack-clash protection probes 11 pages on every call including a sort of 2 elements. Entering the dispatcher costs ~5.6ns before any work. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "1.40-2.0",
+        "above 2.0"
+      ]
+    },
+    "Q_OPEN_O04": {
+      "type": "score",
+      "instructions": "An MSD radix for the f64 leaf that stops after the top four key bytes and finishes tie groups by insertion. Context: Measured: on uniform, heavy_tail and int_wide the real tie groups under a 32-bit key prefix hold at most 7-10 elements, and few_distinct/quantized ties are 100% duplicates (free). But clustered collapses to 10,274 and bimodal to 512,897, because the top 32 bits resolve to ~1e-6 of the magnitude inside one binade. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "above 1.40"
+      ]
+    },
+    "Q_OPEN_O05": {
+      "type": "score",
+      "instructions": "Splitting one overlapping chain's merge across threads in relocation's phase 2. Context: Phase 2 is already queue-driven, but one long chain is a single indivisible task, so one thread merges it while thirteen wait at the second barrier. Equalising the output tiles changed nothing (0.96-1.04), which is what points here. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "above 1.40"
+      ]
+    },
+    "Q_OPEN_O06": {
+      "type": "score",
+      "instructions": "Windowing the f64 partition's key grid from trimmed quantiles instead of the raw sample. Context: One zero in the sample is enough to defeat the certificates: a sloped sine starts at 0, a[0] is always sampled, the key grid in total-order key space goes coarse because the neighbourhood of zero spans hundreds of binades, and the grid is rejected. The same wave shifted to its crest runs at 0.85-0.88 of the time. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "above 1.40"
+      ]
+    },
+    "Q_OPEN_O07": {
+      "type": "score",
+      "instructions": "An int32 twin of the short-reach route. Context: The f64 short-reach route (sort index blocks where they lie, repair only the seams) is 1.9-2.5x at one thread and 1.3-1.5x at 14, and weighs 0.10 bytes per element at one thread against 15.5. int32 has no such route, and no relocation either. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss (<1.00)",
+        "inside the floor (1.00-1.04)",
+        "1.05-1.15",
+        "1.15-1.40",
+        "above 1.40"
+      ]
+    },
+    "Q_OPEN_O08": {
+      "type": "score",
+      "instructions": "A GPU/SIMT port of the counting and radix paths. Context: The thesis is that addressing beats comparing; on a CPU the scatter is bound by per-core latency (proved three times: ping-pong removed 37% of traffic for 12% of time, huge pages and streaming stores both measured exactly zero). A GPU is the one hardware where scatter is cheap. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss",
+        "no better than the CPU engine",
+        "2-5x",
+        "5-20x",
+        "above 20x"
+      ]
+    },
+    "Q_OPEN_O09": {
+      "type": "score",
+      "instructions": "logos_query: promoting the order/analytics API (rank, select, quantiles, topk, count_in_range, distinct) to first-class entry points. Context: When the deliverable is ORDER or ANALYTICS rather than a sorted array, the no-scatter model already measures quantiles 87x, top-k 7x, range-count 42x against sort-first baselines -- but those baselines were unfair (sort-first and nth_element), and a fair querybench against radix-select and streaming heaps is still owed. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss",
+        "inside the floor",
+        "1.5-3x",
+        "3-10x",
+        "above 10x"
+      ]
+    },
+    "Q_OPEN_O10": {
+      "type": "score",
+      "instructions": "A structure-router: probe cheaply, send structured data to logos's counting/lattice paths and everything else to x86-simd-sort wholesale. Context: logos beats x86-simd-sort only on structured data (few_distinct 1.4x, quantized 1.76x, block shapes 2.2-2.5x) and loses on every unstructured shape. The probe is the shared sample, already 1-4% of a call. Rate the speedup a paired A/B would measure against the engine as it ships, remembering that the resolving floor is ~3.7% at 8M.",
+      "criteria": [
+        "a loss",
+        "inside the floor",
+        "1.1-1.3x",
+        "1.3-2.0x",
+        "above 2.0x"
+      ]
+    },
+    "Q_M_floor": {
+      "type": "noul",
+      "instructions": "A benchmark reports a 4% speedup as the median of 40 paired runs. On the same harness, the SAME code on both sides reads 1.000 with a p90 deviation of 8-14% per pair, and 40 pairs resolve about 3.7%. Judge the claim: the 4% is reportable as a result, provided the null is stated alongside it.",
+      "criteria": {
+        "true": "The claim holds: 4% is just outside the measured floor, so it is reportable with the null quoted",
+        "false": "The claim fails: 4% is inside the noise and needs more pairs or a traced mechanism"
+      }
+    },
+    "Q_M_layout": {
+      "type": "noul",
+      "instructions": "Two engine copies built from IDENTICAL source and flags, differing only in renamed symbols, measured up to 1.24x apart on a quiet box, deterministically, because symbol lengths change code alignment. A new A/B now shows 1.15x. Judge the claim: that 1.15x should not be trusted until the variant-to-copy assignment is permuted or the mechanism is traced directly.",
+      "criteria": {
+        "true": "The claim holds: below about 1.25x the layout bias can produce the whole effect",
+        "false": "The claim fails: 1.15x is large enough to trust as measured"
+      }
+    },
+    "Q_M_trace": {
+      "type": "noul",
+      "instructions": "A build instrumented with per-phase tracing (fprintf at each phase boundary) times a phase at 2 ms. Judge the claim: that number must not be used to decide whether the phase is worth optimising.",
+      "criteria": {
+        "true": "The claim holds: the trace calls change the whole function's code generation, so such a build says WHICH path ran and what share each phase took, never a price against a normal build",
+        "false": "The claim fails: the traced build runs the same code, so its phase timing is usable"
+      }
+    },
+    "Q_M_oracle": {
+      "type": "noul",
+      "instructions": "A double-precision sort's output is compared byte-for-byte against libc qsort's output on the same input. Judge the claim: that is NOT a sound correctness oracle.",
+      "criteria": {
+        "true": "The claim holds: qsort treats -0.0 and +0.0 as equal, so byte comparison flags correct sorts as wrong; check ascending under < plus the bitwise multiset instead",
+        "false": "The claim fails: identical bytes is the strongest available check"
+      }
+    },
+    "Q_M_microbench": {
+      "type": "noul",
+      "instructions": "A kernel measures 1.22x faster than the one it replaces, in isolation. Judge the claim: it should not ship until the FULL operation is A/B'd end to end.",
+      "criteria": {
+        "true": "The claim holds: in this repo three kernels won in isolation and LOST when integrated",
+        "false": "The claim fails: a faster kernel makes the whole faster"
+      }
+    },
+    "Q_M_loaded": {
+      "type": "noul",
+      "instructions": "A fair-fight benchmark runs with its calibration line reading 3.5x the quiet reference, and its ratios favour the engine under test. Judge the claim: those ratios are an upper bound rather than a measurement.",
+      "criteria": {
+        "true": "The claim holds: barrier-heavy opponents lose more to preemption than chunk-parallel phases do, so a loaded box flatters this engine",
+        "false": "The claim fails: every contender ran under the same load, so the ratios hold"
+      }
+    },
+    "Q_M_fallback": {
+      "type": "noul",
+      "instructions": "A resource-exhaustion fallback path is written and code-reviewed but has never executed. Judge the claim: it cannot be relied on until it has been forced to run.",
+      "criteria": {
+        "true": "The claim holds: injecting failures found 2,215 of 8,316 allocation failures and 154 of 186 thread-creation failures ending in wrong output, a crash or a hang, under thousands of green checks",
+        "false": "The claim fails: the code is straightforward and was reviewed"
+      }
+    },
+    "Q_M_stub": {
+      "type": "noul",
+      "instructions": "A charting library is replaced by a hand-written stub in tests, and 216 charts pass every test the stub drives. Judge the claim: the rendering is still unverified.",
+      "criteria": {
+        "true": "The claim holds: in a real browser a log axis could not be zoomed inside one decade and a pan killed the tab; a fake must reproduce the library's awkward behaviour",
+        "false": "The claim fails: 216 charts is thorough coverage"
+      }
+    },
+    "Q_M_precision": {
+      "type": "noul",
+      "instructions": "A vendor reports '193.6x faster' with no stated repetition count, measured from laptops. Judge the claim: the figure's four significant digits are not supported by its method.",
+      "criteria": {
+        "true": "The claim holds: four significant figures implies about +-0.05%, which an unrepeated laptop measurement cannot support",
+        "false": "The claim fails: the figure is simply what they measured"
+      }
+    },
+    "Q_M_statistic": {
+      "type": "noul",
+      "instructions": "A routing gate is documented in a comment as reading an inversion rate over about 1900 sampled pairs. Judge the claim: that comment should not be trusted when reasoning about why the gate misfires.",
+      "criteria": {
+        "true": "The claim holds: count what the loop actually reads. The same comment here described a loop reading 7 pairs a whole array apart, and it turned away 6 of 7 near-sorted inputs",
+        "false": "The claim fails: the comment documents the code's intent and is a fair summary"
+      }
+    }
+  }
+}

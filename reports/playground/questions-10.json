@@ -1,0 +1,82 @@
+{
+  "Q_M_floor": {
+    "type": "noul",
+    "instructions": "A benchmark reports a 4% speedup as the median of 40 paired runs. On the same harness, the SAME code on both sides reads 1.000 with a p90 deviation of 8-14% per pair, and 40 pairs resolve about 3.7%. Judge the claim: the 4% is reportable as a result, provided the null is stated alongside it.",
+    "criteria": {
+      "true": "The claim holds: 4% is just outside the measured floor, so it is reportable with the null quoted",
+      "false": "The claim fails: 4% is inside the noise and needs more pairs or a traced mechanism"
+    }
+  },
+  "Q_M_layout": {
+    "type": "noul",
+    "instructions": "Two engine copies built from IDENTICAL source and flags, differing only in renamed symbols, measured up to 1.24x apart on a quiet box, deterministically, because symbol lengths change code alignment. A new A/B now shows 1.15x. Judge the claim: that 1.15x should not be trusted until the variant-to-copy assignment is permuted or the mechanism is traced directly.",
+    "criteria": {
+      "true": "The claim holds: below about 1.25x the layout bias can produce the whole effect",
+      "false": "The claim fails: 1.15x is large enough to trust as measured"
+    }
+  },
+  "Q_M_trace": {
+    "type": "noul",
+    "instructions": "A build instrumented with per-phase tracing (fprintf at each phase boundary) times a phase at 2 ms. Judge the claim: that number must not be used to decide whether the phase is worth optimising.",
+    "criteria": {
+      "true": "The claim holds: the trace calls change the whole function's code generation, so such a build says WHICH path ran and what share each phase took, never a price against a normal build",
+      "false": "The claim fails: the traced build runs the same code, so its phase timing is usable"
+    }
+  },
+  "Q_M_oracle": {
+    "type": "noul",
+    "instructions": "A double-precision sort's output is compared byte-for-byte against libc qsort's output on the same input. Judge the claim: that is NOT a sound correctness oracle.",
+    "criteria": {
+      "true": "The claim holds: qsort treats -0.0 and +0.0 as equal, so byte comparison flags correct sorts as wrong; check ascending under < plus the bitwise multiset instead",
+      "false": "The claim fails: identical bytes is the strongest available check"
+    }
+  },
+  "Q_M_microbench": {
+    "type": "noul",
+    "instructions": "A kernel measures 1.22x faster than the one it replaces, in isolation. Judge the claim: it should not ship until the FULL operation is A/B'd end to end.",
+    "criteria": {
+      "true": "The claim holds: in this repo three kernels won in isolation and LOST when integrated",
+      "false": "The claim fails: a faster kernel makes the whole faster"
+    }
+  },
+  "Q_M_loaded": {
+    "type": "noul",
+    "instructions": "A fair-fight benchmark runs with its calibration line reading 3.5x the quiet reference, and its ratios favour the engine under test. Judge the claim: those ratios are an upper bound rather than a measurement.",
+    "criteria": {
+      "true": "The claim holds: barrier-heavy opponents lose more to preemption than chunk-parallel phases do, so a loaded box flatters this engine",
+      "false": "The claim fails: every contender ran under the same load, so the ratios hold"
+    }
+  },
+  "Q_M_fallback": {
+    "type": "noul",
+    "instructions": "A resource-exhaustion fallback path is written and code-reviewed but has never executed. Judge the claim: it cannot be relied on until it has been forced to run.",
+    "criteria": {
+      "true": "The claim holds: injecting failures found 2,215 of 8,316 allocation failures and 154 of 186 thread-creation failures ending in wrong output, a crash or a hang, under thousands of green checks",
+      "false": "The claim fails: the code is straightforward and was reviewed"
+    }
+  },
+  "Q_M_stub": {
+    "type": "noul",
+    "instructions": "A charting library is replaced by a hand-written stub in tests, and 216 charts pass every test the stub drives. Judge the claim: the rendering is still unverified.",
+    "criteria": {
+      "true": "The claim holds: in a real browser a log axis could not be zoomed inside one decade and a pan killed the tab; a fake must reproduce the library's awkward behaviour",
+      "false": "The claim fails: 216 charts is thorough coverage"
+    }
+  },
+  "Q_M_precision": {
+    "type": "noul",
+    "instructions": "A vendor reports '193.6x faster' with no stated repetition count, measured from laptops. Judge the claim: the figure's four significant digits are not supported by its method.",
+    "criteria": {
+      "true": "The claim holds: four significant figures implies about +-0.05%, which an unrepeated laptop measurement cannot support",
+      "false": "The claim fails: the figure is simply what they measured"
+    }
+  },
+  "Q_M_statistic": {
+    "type": "noul",
+    "instructions": "A routing gate is documented in a comment as reading an inversion rate over about 1900 sampled pairs. Judge the claim: that comment should not be trusted when reasoning about why the gate misfires.",
+    "criteria": {
+      "true": "The claim holds: count what the loop actually reads. The same comment here described a loop reading 7 pairs a whole array apart, and it turned away 6 of 7 near-sorted inputs",
+      "false": "The claim fails: the comment documents the code's intent and is a fair summary"
+    }
+  }
+}

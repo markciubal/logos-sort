@@ -5,6 +5,17 @@ output, calibration-checked, like-vs-like threading). Where a run was loaded,
 that is noted. Machine for parallel figures: 20-thread single-socket box under
 WSL2; sandbox figures are a 1-core AVX-512 Xeon.
 
+**How to read this file (2026-11-06).** It is a log, not a summary. §1–3d, 1b–1h,
+3h, 3t and 3s are the September 2026 record (the old AVX-512 box, then the first
+runs on the AVX2 i9-13900H that has been the reference box since), kept as
+written. From **§3bw** down to §3e the sections run NEWEST FIRST: 3bw is the
+latest engine change (the near-sorted route's strand gate), 3bt holds the current
+competitive picture (the 2026-11-05 scale report and scoreboard, with Google's
+VQSort), and §4–6 at the end are the original closing sections. For the live
+state read CLAUDE.md's header, `reports/scale-report.html` and
+`engines/c/CHANGELOG.md`; for every claim's grade, TRUTH_TABLE.md and its
+section S.
+
 ## 1. The fair fight (engines/c, parbench-full, 20 threads, 8M f64)
 
 Latest complete run (calibration showed load; treat margins as ±20–30%, but the

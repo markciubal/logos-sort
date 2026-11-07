@@ -50,13 +50,21 @@ built into `engines/c/libvqsort.a`; one thread only, `make scoreboard` and `make
 slowest of the three vector sorts: 1.36-1.42x behind x86-simd-sort on unstructured doubles at 8.4M, behind on every scoreboard
 row, and it reads no order (a sorted array costs it what random data does). FINDINGS 3bt.** AVX-512 not measured.
 
+**State on 2026-11-06** (FINDINGS 3bt and 3bw; `reports/scale-report.html` measured 2026-11-05; the README's table):
+at 10M on the AVX2 box logos is the fastest sort measured on 10 of 17 inputs at one thread (level on 5; slower on
+int_wide 1.05x and strings: words 1.15x, both against x86-simd-sort) and on 17 of 17 at 14 threads; below 1M at 14
+threads it loses to IPS4o on 5-8 of 13 numeric shapes, because the thread policy runs one thread under 100k elements
+per thread. The latest engine change is the near-sorted route's strand gate (3bw). The version string is still 3.6.0
+and every change since is "(unreleased)" in engines/c/CHANGELOG.md. The whole tree is committed (5 commits, the last
+2026-11-06). TRUTH_TABLE.md section S re-grades the September claims; bizdev/ reads the same data commercially.
+
 ## Repository layout
 
 ```
 engines/c/          FLAGSHIP. logos_psort.c (engine), logos_extra.c (argSort,
                     permutations, outliers, strings), logos_simd.cpp (optional
                     AVX-512 leaf + kernels), parbench.cpp (the fair fight),
-                    scaling.cpp, harness.c (~55,114 checks), PARITY.md, CHANGELOG.md;
+                    scaling.cpp, harness.c (54,832 checks in 48 sections, 2026-11-06), PARITY.md, CHANGELOG.md;
                     stringbench.cpp (C strings: prefix keys against std::sort and x86-simd-sort's key-value sort; bench_strings.h: the
                     string shapes and the prefix scheme, shared with scalebench.cpp), roundbench.c (any per-sort switch against the
                     shipped engine, f64, 23 shapes with twelve structured guards), strsmallbench.cpp (small string calls, paired),
@@ -160,7 +168,8 @@ Start with `engines/c/`. `make test` must pass before and after any change.
 
 1. **Verify before timing.** Every benchmark checks output against a reference
    (`std::sort` / `qsort`). A fast wrong answer is worthless. `harness.c` runs
-   about 55,114 property checks; keep them green.
+   54,832 property checks in 48 sections (2026-11-06; the resource section's count
+   moves with thread timing); keep them green.
 2. **Read the calibration line first — but expect it to say "loaded", and
    know why.** `parbench` prints memcpy-64MB and std::sort-1M times. On the
    reference box these read ~2.9 ms / ~65 ms when it has been idle and 4–7 ms
@@ -1335,7 +1344,7 @@ wastes the session.
 ## Build / verify quick reference (engines/c)
 
 ```sh
-make test            # ~55,114 checks — must pass
+make test            # 54,832 checks in 48 sections (2026-11-06) — must pass
 make parbench        # fair fight, no external deps
 make parbench-simd XSS=../x86-simd-sort/src            # + x86-simd-sort (AVX-512)
 make parbench-full XSS=... IPS4O=../ips4o/include      # + IPS4o (needs libtbb-dev)

@@ -1,14 +1,17 @@
 # logos-sort (Rust)
 
-> **Parity status (read first).** This Rust port is the **v2 engine**: parallel
-> sample sort + coarse interpolation leaf, plus (v0.3) native int32 and a strict
-> in-place mode. It is **behind the C engine (v3)**, which additionally has the
-> full JS-faithful dispatcher — run detection + galloping merges, momentum
-> insertion, gap-split, skew-probe/exponent-bit coarse, quantized-float radix,
-> lattice & low-cardinality counting, buffer pooling, prefetch, and the
-> near-sorted parallel merge. Bringing those to Rust is a multi-stage port, not
-> done here. Use the C package (`logos-sort-c`) for the fastest, most complete
-> engine; this crate is the safe-Rust reference and the in-place experiment.
+> **Parity status (read first; 2026-11-06).** This Rust port is the **v2 engine**:
+> parallel sample sort + coarse interpolation leaf, plus (v0.3) native int32 and a
+> strict in-place mode. It is **well behind the C engine**, which has the JS-faithful
+> dispatcher and, since September 2026, some thirty structure-reading routes added
+> one paired A/B at a time: run relocation and the knot route, the short-reach route,
+> the near-sorted parallel route, lattice and counting routes with a verified perfect
+> hash, an AVX2 quicksort leaf level with x86-simd-sort's, a histogram-free parallel
+> partition with uniformity certificates, strings on 8-byte prefix keys, a lazy sorted
+> view, a persistent worker pool. The matrix is `../c/PARITY.md`; the record is
+> `../c/CHANGELOG.md` and `../../FINDINGS.md`. Bringing those to Rust is a multi-stage
+> port, not started. Use the C engine for the fastest, most complete implementation;
+> this crate is the safe-Rust reference and the in-place experiment.
 
 ## v0.3.0
 - **Native i32** path (was already present) and a **strict in-place mode**

@@ -51,3 +51,22 @@ PITCH-duckdb.md (marked do-not-send: license), tools/parse_report.py.
 
 **Needs a human decision:** the license (IP.md Section 2) and the patent question (Section 3) before anything is
 made public; one hour of counsel on the AI-authorship question; whether a second machine can be had.
+
+## 2026-11-06, later — the strand gate lands; the tree is committed; the project's documents are refreshed
+
+**Engine change:** the near-sorted parallel route's strand gate (FINDINGS 3bw, `make strandgate`). At more than one
+thread the route had been claiming sorted runs that lie IN ORDER and overlap their neighbours (log batches appended
+as they close; a few neighbours swapped or late), sorting a tenth of the array as strays and running 1.6-3.9x slower
+than the engine with the route off. A gate that tells strands from strays by scale now declines them: 1.7-3.9x at 14
+threads on six such inputs at 8.4M, 1.6-3.3x at 1M, 2.1-5.3x at 2-4 threads; 21 guard inputs 0.95-1.07.
+
+**Effect on the claims:** none change grade. No scale-report input has that shape (its near_sorted is random swaps;
+its block inputs are shuffled, which the relocation and knot routes take), and the report's own inputs were among the
+guards (roundbench 0.98-1.05, tsbench 0.97-1.05). It becomes a green candidate only if an "in-order batches" input is
+added to the report (harness work of the GAPS 7 kind), and it is a buyer-shaped input: log segments concatenated in
+arrival order, sorted on many threads.
+
+**Repository facts changed:** everything is committed (5 commits; the last, 2026-11-06, carries FINDINGS 3bd-3bw, the
+probes and this folder; 00-STATE §4 updated). The README, PARITY.md, TRUTH_TABLE.md (a section S re-grading the
+September claims), the reports index and the C engine's README were brought current the same day. The version string
+stays 3.6.0 with every change since September listed in CHANGELOG as "(unreleased)"; a 3.7.0 cut is the author's call.

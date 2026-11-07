@@ -1,8 +1,18 @@
 # Implementing logos-sort in C — a step-by-step guide
 
+> **Scope, 2026-11-06.** This guide describes the ORIGINAL core: a parallel sample sort
+> over an interpolation leaf, the ~220-line design `logos_psort.c` started from. The
+> shipped engine is that core with a dispatcher of some thirty structure-reading routes
+> in front of it and runs to about 11,000 lines; its public API is `logos_psort.h`, its
+> history `CHANGELOG.md`, its measurements `../../FINDINGS.md`, and `README.md` here says
+> how it decides. The steps below are still the right order to build the core from
+> scratch, and §6's heavy-tail limitation is solved in the shipped engine (the key grid,
+> the exponent-bit coarse path, the quantile partition). Where this guide and the source
+> disagree, the source is current.
+
 This walks through building the algorithm from scratch, then verifying and
 benchmarking it against `qsort`. The finished reference implementation is
-`logos_psort.c` (~220 lines); the harness is `harness.c`.
+`logos_psort.c`; the harness is `harness.c`.
 
 ## 0. The idea, in one paragraph
 
@@ -115,9 +125,9 @@ that passes do the timings mean anything.
 ## 3. Run it
 
 ```sh
-make run          # builds ./harness and runs it
-# or manually:
-cc -O3 -pthread logos_psort.c harness.c -o harness -lpthread -lm && ./harness
+make test         # builds ./harness and runs it
+# or manually (the harness also links the extras and the view):
+cc -O3 -std=gnu11 -pthread logos_psort.c logos_extra.c logos_view.c harness.c -o harness -lpthread -lm && ./harness
 ```
 
 Exit code `0` means every correctness check passed. Output has two parts:
@@ -149,8 +159,11 @@ If the mount you're in is `noexec` (some sandboxes), build in `/tmp`.
 | `OVERSAMPLE` | 32 | samples per bucket for splitters (more = better balance) |
 | `MIN_PARALLEL` | 65536 | below this, stay sequential (thread spawn isn't free) |
 
-Change one, re-run `make run`, keep it only if the *table* improves. Every
-knob here was chosen by measurement on one machine; yours may differ.
+Change one, re-run `make test`, keep it only if the *table* improves. Every
+knob here was chosen by measurement on one machine; yours may differ. (The
+shipped engine's constants were later swept four values each over nineteen
+shapes, `make knobbench`, TRUTH_TABLE.md §N; a knob A/B today is a paired run
+in one binary, `make roundbench` or `make twinbatch`, not two `make test` runs.)
 
 ## 6. Known limitation: heavy-tailed data
 

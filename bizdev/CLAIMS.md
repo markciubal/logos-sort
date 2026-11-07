@@ -28,7 +28,7 @@ Regenerate the rows with `python -I bizdev/tools/parse_report.py reports/scale-r
 | G12 | 14 threads, 3.16M and 10M: fastest sort in the report on all 13 numeric shapes, 1.07-7.15x | all 13 numeric | 14 | best of IPS4o, x86-simd-sort, gnu_parallel | n/a | 13 of 13 at both sizes | 1.07 (bimodal 10M) to 7.15 (block_overlap 3.16M) | 9.0-17.1 | block_kinked 1.05 at 1M |
 | G13 | Log lines, 14 threads: 1.5-1.7x over IPS4o (strcmp), 26 B/el vs 30 / 3 | strings: logs | 14 | IPS4o (30.1 / 3.0) | 13.7 / 23.3 | 172 / 259 | 1.69 / 1.50 | 26.3 | 0.51 at 100k |
 | G14 | Against scalar std::sort at one thread: 7.2-8.6x on uniform doubles, 7.4-8.4x on heavy_tail / bimodal / int_wide, 4.0-5.5x on near_sorted, 21-39x on few_distinct / quantized / block shapes, 4.7x on log lines (strcmp), 12x on uuids | all | 1 | std::sort (0.0) | uniform 15.0 / 108.5 | uniform 144.6 / 1242 | uniform 7.2 / 8.6; few_distinct 21.4 / 26.1; block_perm 31.3 / 39.1; near_sorted 4.0 / 5.5 | 0-16 | sine_slope 2.22 at 1M; reach_mirror 2.15 at 100k |
-| G15 | Correctness envelope: NaN never hangs or crashes (output a permutation), infinities, subnormals, signed zeros, payload NaNs tested; 7,894 injected allocation and thread-creation failures with 0 wrong outputs; ~55,114 property checks | n/a | n/a | basis: harness and faultprobe, not the scale report | | | | | |
+| G15 | Correctness envelope: NaN never hangs or crashes (output a permutation), infinities, subnormals, signed zeros, payload NaNs tested; 7,894 injected allocation and thread-creation failures with 0 wrong outputs; 54,832 property checks in 48 sections (2026-11-06) | n/a | n/a | basis: harness and faultprobe, not the scale report | | | | | |
 
 ## Amber (holds in one regime)
 

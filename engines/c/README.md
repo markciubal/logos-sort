@@ -1,35 +1,49 @@
-# logos-sort (C, multi-threaded) — v3
+# logos-sort (C, multi-threaded) — the flagship engine
 
-The JavaScript engine's numeric dispatcher, ported to C, running as the
-per-bucket leaf (and the sequential path) underneath a parallel sample-sort top
-level. Numbers only (f64, i32).
+A distribution-aware adaptive numeric sort: one shared sample reads the data's structure (cardinality, order, skew,
+quantization, runs, reach) and dispatches to the cheapest route that fits — counting and lattice routes that place every
+element by arithmetic, run routes that move sorted stretches whole and merge only where they cross, a near-sorted route,
+and under all of them a histogram-free parallel partition with an AVX2 quicksort leaf for data that has no structure.
+Numbers (f64, i32) and NUL-terminated C strings. Where it stands: `../../README.md`; the measurements: `../../FINDINGS.md`;
+every change with its A/B: `CHANGELOG.md`; the rules and the ledger of what failed: `../../CLAUDE.md`.
 
 ## Package
 
 ```
-logos_psort.h     public API (3 functions) + LOGOS_PSORT_VERSION
-logos_psort.c     the engine (single translation unit, no dependencies beyond libc/pthread/libm)
-harness.c         test: 570 correctness checks vs qsort + benchmark
-example.c         minimal usage
-parbench.cpp      optional fair-fight bench vs std::sort / __gnu_parallel::sort (g++ + OpenMP)
-Makefile          build, test, example, install, uninstall, dist, clean
-IMPLEMENTING.md   from-scratch implementation guide
-wasm/             Emscripten build recipe (threaded WebAssembly)
-CHANGELOG.md · LICENSE · .gitignore
+logos_psort.h     the public API (below) and LOGOS_PSORT_VERSION (3.6.0; every change since is "(unreleased)" in CHANGELOG.md)
+logos_psort.c     the engine: one translation unit, ~11,000 lines, libc + pthreads + libm, no other dependency
+logos_extra.c     argsort, permutations, outliers, the one-thread string entry
+logos_view.h/.c   the lazy sorted view (partition now, sort a bucket when it is read); logos_view_impl.h
+logos_simd.cpp    OPTIONAL: AVX-512 kernels and the SIMD-leaf hooks of 2026-09 (legacy; measured, kept opt-in)
+logos_xss.cpp     OPTIONAL: x86-simd-sort's quicksort as the sequential leaf and the two-thread hybrid (-DLOGOS_XSS_LEAF)
+harness.c         the correctness harness: 54,832 property checks in 48 sections on 2026-11-06 (make test)
+Makefile          129 targets: the library, the harness, the sanitizers, the fault probe, the scoreboard, the scale report,
+                  and about a hundred paired A/B benches and probes (each one described in ../../CLAUDE.md's quick reference)
+bench_common.h    the paired A/B harness (bench_paired) and BENCH_THREADS; bench_sorts.h: the LSD radix and timsort baselines;
+                  bench_strings.h: the string shapes and the 8-byte prefix scheme shared by stringbench and scalebench
+gen_avx2_leaf.py  generates the AVX2 leaf's networks; gen_small_net.py: the 4-16 element networks, each proved by the 0-1 principle
+uplot_embed.h     uPlot, vendored (vendor/) and inlined so that every report is one file
+wasm/             Emscripten build recipe · example.c · IMPLEMENTING.md (the original core, as a guide) · PARITY.md · LICENSE
 ```
 
 ### Build and test
 
 ```sh
-make            # liblogos_psort.a, liblogos_psort.so, ./harness, ./example-bin
-make test       # run the harness: correctness (exit code != 0 on any failure) + benchmark
-make example    # build and run the usage example
-make dist       # source tarball logos-sort-c-3.0.0.tar.gz (builds standalone)
-make clean
+make                 # liblogos_psort.a, liblogos_psort.so, ./harness, ./example-bin
+make test            # the harness: 54,832 checks, exit code != 0 on any failure; then a short benchmark against qsort
+make sanitize        # the whole harness under ASan + UBSan + float-cast-overflow, leak checking on
+make tsan            # ... and under ThreadSanitizer
+make faultprobe      # every allocation and thread creation of a cold call failed in turn: 7,894 injected failures, 0 bad
+make scoreboard      # who is fastest: logos, x86-simd-sort, VQSort, IPS4o, std::sort / gnu_parallel; 17 shapes, 1 and 14 threads
+make scale-full      # time against n for every contender and 17 inputs -> ../../reports/scale-report.html
+make dist            # logos-sort-c-3.6.0.tar.gz
 ```
 
-Any C11 compiler with POSIX threads. Override as needed:
-`make CC=clang CFLAGS="-O2 -pthread"`.
+Built and run only with GCC 13 on x86-64 Linux (WSL2 here). The AVX2 kernels are `#pragma GCC target` regions chosen at
+run time, so the default flags carry no `-march`. The opponents are clones beside this directory, ignored by git:
+`git clone intel/x86-simd-sort`, `git clone ips4o/ips4o` (plus `apt install libtbb-dev`), `git clone --branch 1.4.0
+google/highway` and then `make libvqsort.a` (no cmake needed). Every bench runs at `BENCH_THREADS` (14, this box's
+physical core count); override a run with `LOGOS_THREADS=N`.
 
 ### Install and link
 
@@ -50,91 +64,121 @@ cc myprog.c -llogos_psort -lpthread -lm   # shared; or link liblogos_psort.a dir
 ### API
 
 ```c
-void   logos_sort_f64(double  *a, size_t n, int nthreads); /* ascending, in place */
+/* sorting */
+void   logos_sort_f64(double *a, size_t n, int nthreads);           /* ascending, in place; the same result for any nthreads */
 void   logos_sort_i32(int32_t *a, size_t n, int nthreads);
-void   logos_sort_f64_nan_last(double *a, size_t n, int nthreads); /* NaNs to the tail, bits intact, then the prefix sorted */
-size_t logos_nan_to_end_f64(double *a, size_t n);          /* that pass alone; returns the length of the NaN-free prefix */
-void   logos_sort_f64_inplace(double  *a, size_t n, int nthreads); /* no scratch at all; slower; sequential */
+void   logos_sort_f64_batch(double *a, const size_t *off, size_t nseg, int nthreads);  /* many arrays end to end; parallel ACROSS segments */
+void   logos_sort_f64_nan_last(double *a, size_t n, int nthreads);  /* NaNs to the tail, bits intact, then the prefix sorted */
+size_t logos_nan_to_end_f64(double *a, size_t n);                   /* that pass alone; returns the NaN-free prefix's length */
+void   logos_sort_f64_inplace(double *a, size_t n, int nthreads);   /* no n-sized scratch at all; 6-24x slower; parallel from 2^20 */
 void   logos_sort_i32_inplace(int32_t *a, size_t n, int nthreads);
-void   logos_release_buffers(void);                        /* returns everything kept between calls */
-int    logos_num_cpus(void);                               /* sensible default for nthreads */
-int    logos_reach_last(void);                             /* diagnostic, for tests: what the short-reach route did on the last f64 sort of 2^18+ elements */
+/* strings: NUL-terminated, strcmp order, equal strings in any order, ~24 bytes per string of scratch */
+void   logos_sort_strings(const char **a, size_t n);                /* one thread */
+void   logos_sort_strings_mt(const char **a, size_t n, int nthreads);
+/* records by key */
+void   logos_argsort_f64(const double *a, size_t n, uint32_t *perm);    /* stable; a is not modified; n < 2^32 */
+void   logos_argsort_i32(const int32_t *a, size_t n, uint32_t *perm);
+void   logos_apply_perm_f64(const double *src, const uint32_t *perm, size_t n, double *out);   /* and _i32; logos_inverse_perm */
+size_t logos_find_outliers_f64(const double *a, size_t n, uint32_t *out, size_t cap, size_t budget);
+/* the lazy sorted view, logos_view.h: logos_view_create_f64 / _i32, then at, range, topk, rank, ranks, quantiles,
+   count_in_range, all, materialised, free; underneath it logos_partition_f64 / _i32 and logos_sort_buckets_f64 / _i32 */
+/* housekeeping and diagnostics */
+int    logos_num_cpus(void);
+void   logos_release_buffers(void);         /* returns everything kept between calls: pools, contexts, the worker pool, the heap (malloc_trim) */
+int    logos_reach_last(void);              /* what the short-reach route did on this thread's last large sort */
+size_t logos_twist_last(int which);         /* some forty counters that name which route or kernel ran: the harness asserts paths by them */
+size_t logos_mirror_count(int reset);
+int    logos_prescan_agree(const double *a, size_t n);
+/* per-phase profiling: build with -DLOGOS_PROFILE, read logos_profile_get(); `make profile` renders it */
 ```
-Results never depend on `nthreads` (tested at 1/2/4/8); `nthreads <= 1` is fully sequential. Not a stable sort.
 
-**Memory, measured** (`make memprobe`: peak traced heap of one cold call, on top of the input). `logos_sort_f64`: 15.5 bytes per
-element at one thread, about 23 at fourteen on data that reaches the partition, about 9 on the relocation and knot routes, under 1
-on the counting routes, and 0.10 / 1.33 (one thread / fourteen) on the short-reach route, which asks for no n-sized buffer. `logos_sort_i32`: 11.5 bytes per 4-byte element at one thread, about 6.5 at fourteen on the partition, under 0.1 on the counting route. The in-place entries: 0. The buffers are kept between calls;
-`logos_release_buffers()` returns all of them. (This section said "~8n" until the day it was measured.)
+**The contract.** Ascending, in place, identical for any thread count (tested at 1/2/4/8); `nthreads <= 1` is fully
+sequential, and above one the engine runs at most one thread per 100,000 elements, with per-route caps. Not stable
+(argsort is). **One call at a time per process:** the context pool, the bundle table and the worker pool are globals,
+and concurrent calls gave wrong output when tried. Infinities, subnormals and signed zeros are ordinary values and are
+tested; with a NaN present the ORDER is unspecified, of the other values too, but the call returns, nothing crashes and
+the output is a permutation of the input's bit patterns (use `_nan_last` when the data may hold NaNs). A failed `malloc`
+or `pthread_create` costs speed, never correctness (`make faultprobe`; there is no error return because there is no
+failure left to report). `n` is a `size_t`; above 2^32 - 1 elements the buffered engine hands the array to the in-place
+sort (read, not run: no machine here holds one). Run-time switches: `LOGOS_LOWMEM=1` (the in-place partition and the
+hard pool trim together), `LOGOS_TRIM=1|hard`, `LOGOS_PART_INPLACE=1`, and one `LOGOS_NO_<route>=1` per route for the
+A/Bs, each read inside its route and never on the small-call path (`../../CLAUDE.md` lists them).
 
-**Special values.** Infinities, subnormals and signed zeros are ordinary values, and tested. With a NaN in the array the ORDER is
-unspecified, of the other values too; what holds even then, and is tested, is that the call returns, nothing crashes and the output
-is a permutation of the input's bit patterns. Use `logos_sort_f64_nan_last` when the data may hold NaNs: it costs one sequential pass.
+**Memory, two figures.** ASKED FOR (`make memprobe`: peak traced heap of one cold call, on top of the input):
+`logos_sort_f64` about 16 bytes per element at one thread on the partition path and 14-17 at fourteen, about 9 on the
+relocation and knot routes, under 1 on the counting routes, 0.1 / 1.3 on the short-reach route; strings about 24 per
+string; `logos_sort_i32` 11.5 / 6.5 per 4-byte element; the in-place entries 0. RESIDENT (`make rssprobe`, `make
+mixprobe`): the one-thread AVX2 path touches under 0.1 bytes per element of what it asked for, the routes that place
+or merge at most 4.4 (half a scratch), the 14-thread partition about 8.8, and about 14 stays between calls after ten
+mixed sorts until `logos_release_buffers()`. (This section said "~8n" until the day it was measured.)
 
-**When a resource runs out.** A failed `malloc` or `pthread_create` costs speed, never correctness: the array still comes back
-sorted, by a route that needs less, down to a sort that needs nothing. `make faultprobe` fails every allocation and every thread
-creation of a cold call in turn; `make test` repeats a sample of that in-process. There is no error return because there is no
-failure left to report.
+## How the dispatcher decides
 
-**Sizes.** `n` is a `size_t`. The buffered engine counts in 32 bits, so arrays above 2^32 - 1 elements go to the in-place sort
-(read, not run: no machine here holds one). Built and run only with GCC 13 on x86-64 Linux.
+In outline, cheapest first; every route certifies from the data and declines in O(sample) or behind a budget. A
+`-DLOGOS_TRACE` build prints the exact decision for any input, and the harness asserts the path for every route.
 
-## What was ported (from `lib/sort.js`)
+1. **The thin front** answers calls of up to 2047 elements before the dispatcher is entered: a vector prescan, kink
+   windows, branchless networks for 4-16 elements, the AVX2 kernel above that.
+2. **The prescan** (blocks of 16 or 32 compared with vectors; in parallel past 64K): sorted returns and reversed is
+   reversed; where it stops decides the sorted-prefix-plus-tail and unsorted-head-plus-suffix routes; the loop-back
+   rotates a ring buffer that was read from the wrong slot.
+3. **One shared sample** (2048 Weyl positions, extended to 5376 only for the partition): the distinct count and a
+   Chao1 estimate, a NaN flag, a lag-144 inversion rate, a KS distance from uniform, the short-reach ladder; a
+   position-ordered copy for the wave, the cuts and the strand gate.
+4. **The counting routes**, which place every element by arithmetic: dense integers by bitmap (sequential), the
+   lattice (a direct index, the map in AVX2, chunks claimed; an entry for lattices whose sample shows no repeats, with
+   off-lattice values spilled and merged in), low cardinality (a verified perfect hash, up to 8 values counted in
+   vector registers, a write-only emit), the hash route for moderate cardinality, and a dominant value filled in
+   around the rest.
+5. **The short-reach route**: when no inverted pair is further apart than a few thousand positions, index blocks are
+   sorted where they lie and only the seams are repaired; strays go back by one in-place shift.
+6. **Sequential sorts** then try the run routes: relocation and the knot route (runs as strands; pieces that lie alone
+   are copied, crossings merged by vector two-strand, galloping and k-way merges; descending runs consumed as they
+   lie; kinks swapped back; strays lifted), the whole-array mirror, interleaved streams, the wave, the cuts, runs of
+   equal values, and finally **the leaf**: the in-house AVX2 quicksort for unstructured ranges (flash sort where local
+   order survives, coarse buckets above), with float32 narrowing and the int32 radix for integer-valued data.
+7. **Parallel sorts** try the near-sorted route (behind the kink gate and the strand gate), the parallel knot route,
+   two halves at two threads, and then **the partition**: histogram-free, with regions sized from the sample and a
+   spill list; the bucket of an element by one multiply-add under a uniformity certificate (value or key space), by
+   per-mode certificates and a mode grid, by the key grid for heavy tails, or by direct-index splitter tables chosen
+   by trial on each thread's first chunks; 12 buckets per thread claimed from a queue, each sorted by the leaf (the
+   sequential leaf's own policy where a bucket is past L2), on threads from a persistent pool.
 
-Per range, the dispatcher does what the JS `sort_fn` / `sort_fn.f64` do, with the
-same thresholds:
-
-- **one-pass prescan** — min, max, all-integer?, ascending?, descending? →
-  already sorted returns in O(n); reversed is reversed in place
-- **integers** — span ≤ n → counting sort; int32 range → LSD radix with
-  fused histogram and **constant-byte skip** (a byte identical everywhere
-  contributes no ordering, so its pass is skipped)
-- **natural runs** — `detect_runs_limited` (descending runs reversed in place,
-  prefix-based bail) → bottom-up run-merge: **galloping 2-way** (`merge_gallop`,
-  adaptive min-gallop with eager start) and **4-way tournament with galloping**
-  (`merge_4way_hybrid`) when ≥16 runs remain
-- **nearly sorted** (40-point inversion sample) → insertion, or **momentum
-  insertion** with the **displacement budget** that aborts to the distribution
-  paths when the verdict was wrong (the fix for the front-loaded cliff)
-- **large data** → 64-sample **gap detection** → multimodal → **gap-split**
-  Hoare partition + recurse; flash-safe & <500k → **flash sort**; sampled
-  **skew probe** >8 → **exponent-bit ("bits") coarse** bucketing; else
-  **value coarse bucket sort** (K=2048, bucket-index cache, depth cap)
-- **otherwise** → **dual-pivot introsort** (`sort5` pivots, 3-region partition,
-  Dutch-flag fallback for duplicates, heapsort at depth 0)
-- **typed entry** (≥65536): quantized data (≤4 active key bytes, n≤8M) →
-  **8-pass float radix over the IEEE total-order key**, constant bytes skipped;
-  skewed → bits coarse
+Every one of these routes was A/B'd into place in one binary; the ideas that were built and lost are the ledger in
+`../../CLAUDE.md`, and the two months of rounds that added most of them are FINDINGS 3bd-3bw.
 
 ## Deliberate deviations from the JS engine
 
-1. **Per-thread context instead of module-level state.** JS keeps a pooled
-   scratch buffer and the `last_bail_avg_run` side channel at module scope.
-   Buckets sort concurrently here, so every such thing lives in a per-thread
-   `ctx_t` (scratch, bucket-index cache, per-depth counters, radix histograms,
-   `last_bail_avg_run`). Semantics identical; thread-safe.
-2. **Bits-coarse same-high-word fallback → value coarse (not quicksort).** The
-   harness's bimodal generator exposed a latent JS inefficiency: tight clusters
-   at large magnitude trip the skew probe, route to bits-coarse, and every
-   value in a cluster shares one high word — where JS falls to a full quicksort
-   on the whole cluster. Values sharing a high word are close together, which is
-   exactly where value-linear bucketing works. Measured: 895 → 366 ms on 8M.
-   **Worth back-porting to the JS engine.**
-3. Not ported: strings (a separate engine), `arg_sort`, `find_outliers`,
-   `sort_with_proxy`.
+1. **Per-thread context instead of module-level state.** JS keeps a pooled scratch buffer and the `last_bail_avg_run`
+   side channel at module scope. Buckets sort concurrently here, so every such thing lives in a per-thread `ctx_t`
+   (scratch, bucket-index cache, per-depth counters, radix histograms, `last_bail_avg_run`); contexts are taken lazily
+   from a persistent bundle table and sized for a typical bucket, an oversized bucket borrowing a shared block.
+2. **Bits-coarse same-high-word fallback → value coarse (not quicksort).** The harness's bimodal generator exposed a
+   latent JS inefficiency: tight clusters at large magnitude trip the skew probe, route to bits-coarse, and every value
+   in a cluster shares one high word, where JS falls to a full quicksort. Values sharing a high word are close together,
+   which is exactly where value-linear bucketing works. Measured: 895 → 366 ms on 8M. **Worth back-porting.**
+3. **Strings took their own road.** The JS string engine's fast paths (per-level LCP skip, packed-prefix radix, string
+   run-merge) were not ported; instead `logos_sort_strings_mt` sends 8-byte prefix keys through the numeric machinery,
+   and is faster. `sortWithProxy` is the one JS entry with no C counterpart. argsort, permutations and outliers are in
+   `logos_extra.c`.
 
-## Parallel top level (v2, unchanged)
+## The parallel top level, as it is today
 
-Sample → quantile splitters → parallel histogram → parallel scatter into 4×P
-value-balanced buckets → per-bucket leaf via an atomic work queue with parallel
-copyback. One thread spawn; barrier-synchronized phases; per-thread arenas;
-branchless bucket lookup; no locks outside the barrier. See `IMPLEMENTING.md`.
+The v2 sample sort (sample → quantile splitters → histogram → scatter → per-bucket leaf) is now: no histogram at all
+(bucket regions sized from the sample with 60% slack, blocks reserved with one atomic through a write-combining stage,
+a spill list merged at the leaf, a decline to the histogram path above n/16 spills); the bucket id by a direct-index
+table in value or key space chosen by trial on each thread's first chunks, or by one multiply-add when a certificate
+passes; 12 buckets per thread claimed from an atomic queue; destination prefetch; `par_run` / `par_spawn` over a
+persistent worker pool with every thread-creation failure handled; contexts and scratch taken lazily. The first
+per-phase profile (2026-09-10, `make profile`) found the histogram's binary search at ~100 ns per element and 49-70% of
+the parallel wall; one round removed the search (the splitter tables) and the next removed the pass.
 
-## Build / run
+## The record below
 
-```sh
-make run     # builds ./harness: 570 correctness checks vs qsort, then benchmark
-```
+Everything from here down is the dated record of each change as it landed, oldest at the bottom; the earliest sections
+describe the v2 → v3 port on a single-core sandbox and quote the check counts and numbers of their day. It is kept
+because a measured dead end is a deliverable. For the current numbers read `../../FINDINGS.md` and
+`../../reports/scale-report.html`; for the current correctness posture, the last two sections of this file.
 
 ## Testing a knob: use `pfbench`, not repeated `parbench` runs
 
@@ -894,41 +938,38 @@ loss** — pdqsort-family sorts handle few distinct values in near-O(n), while
 the JS counting gate here allocates a 4M-entry count array. Retuning
 `COUNTING_SORT_K` for C is the fix.
 
-## Correctness
+## Correctness, today
 
-`harness.c` checks every (shape × size × thread count) against `qsort` element
--for-element plus an XOR-of-bits permutation checksum. Fifteen shapes, several
-targeting one ported path each: `segmented` (4-way merge), `few_runs` (gallop),
-`prefix_shuffle` (momentum abort), `bimodal` (gap-split), `quantized` (float
-radix), `int_wide` (int32 radix), `heavy_tail` (bits coarse). **570 checks,
-0 failures.**
+`make test` on 2026-11-06: **54,832 checks in 48 sections, 0 failures**, about 3.5 minutes (the resource section's
+count moves a little with thread timing). Every sort is checked for ascending order under `<` AND for the bit-pattern
+multiset: qsort as the sole oracle once flagged two correct sorts, because it calls -0.0 and +0.0 equal. Sections cover
+NaN (the call must RETURN, under a watchdog), infinities, subnormals, payload NaNs, signed zeros, int32 sentinels, a
+sawtooth that aliases the sample's lag, every n from 0 to 300 and every size gate approached from both sides, and about
+1,900 checks that repeat a sample of the fault injection in-process. Every route's section names the path it expects
+(`logos_twist_last`, `logos_reach_last`), because a section that cannot say which branch ran tests nothing in particular.
+Beside it: `make sanitize` (ASan + UBSan + float-cast-overflow, leak checking on; 4 known reports, the clamped
+NaN-to-index casts of open item 0h (e)), `make tsan` (0 races), `make faultprobe` (every allocation and thread creation
+of a cold call failed in turn: 7,894 injected failures, 0 wrong outputs, crashes or hangs), and three invariant probes
+that time rather than check: order must never cost (`make orderprobe`), isomorphs must cost the same (`make symprobe`),
+one element across a size gate must not cost 10% more (`make edgeprobe`).
 
-## Results vs qsort (single-core sandbox, 8M, sequential)
+## Honest residuals, today
 
-| shape | v2 (interp leaf) | **v3 (JS-faithful leaf)** |
-|---|---|---|
-| near_sorted | 3.9× | **11.0×** — run-merge + gallop now exploit order |
-| heavy_tail | 0.75× (loss) | **5.5×** — skew probe → bits coarse |
-| prefix_shuffle | — | **8.0×** — no cliff (momentum budget) |
-| quantized | — | **8.7×** (12.8× at 1M) — float radix |
-| int_wide | — | **7.0×** (11.5× at 1M) — int32 radix |
-| bimodal | — | **4.5×** after deviation #2 (1.9× before) |
-| uniform / clustered | 6.1× / 6.0× | 6.1× / 6.2× (same coarse design) |
-| few_distinct | 7.8× | 5.3× — see residuals |
-
-## Honest residuals
-
-- **`few_distinct` regressed** (70 → 146 ms). Those values are integer-valued
-  with span ≈ 0.5n, so the JS counting gate fires with a 4M-entry count array
-  and cache-unfriendly increments. Faithful to JS — whose gate is tuned against
-  a JS radix — but the old value-coarse leaf handled this shape better in C.
-  The gate constant is *language-relative* (a finding from the Python port);
-  retuning `COUNTING_SORT_K` for C is the fix.
-- **Partitioning forfeits order.** On the parallel path, near-sorted and
-  segmented shapes lose most of their sequential advantage (the partition
-  scatters the structure the run-merge exploits; each bucket must rediscover
-  it). A top-level near-sortedness check routing to a parallel merge instead of
-  a partition is the right follow-up.
-- `logos_sort_i32` still widens to double (exact); the dispatcher then takes
-  the counting / int32-radix paths, but the two conversion passes remain.
-- `t>1` numbers on a single core measure coordination overhead only.
+- **Unstructured doubles at one thread are level with x86-simd-sort's AVX2 kernels, not ahead** (0.986-1.047), and
+  `int_wide` is behind (0.86: the int32 radix against a vector quicksort). `sine_slope` at one thread is the worst
+  numeric row of the scale report (0.54 at 1M, 0.92 at 10M): a per-level cost of in-place vector quicksort on locally
+  ordered input, measured to be the same inside the library's kernel.
+- **Below 1M at 14 threads the engine loses to IPS4o on 5-8 of 13 shapes** (100k-316k): the thread policy runs one
+  thread per 100,000 elements and the per-route caps were set at 1M-3M. The small end below 10k is settled (the thin
+  front); the parallel middle is not.
+- **Strings:** `words` and `uuids` are level with or behind the same prefix scheme on x86-simd-sort's key-value sort
+  (0.84-0.97 at one thread), at 24 bytes per string against 8.
+- **One call at a time per process**; f64 and i32 only (no i64; no key-payload pair sort, so records go through argsort
+  plus a gather, two passes); not stable; built only with GCC 13 on x86-64 Linux; no CI. `../../bizdev/GAPS.md` ranks
+  these by what they unlock.
+- **The partition path asks for ~16 bytes per element at one thread** while touching under 0.1 of them; the scale
+  report's memory circles show what was asked, not what was resident.
+- **The strict in-place variant is 2.7-32x slower than the best rival** on every numeric row of the report: it is the
+  fallback the resource-exhaustion contract needs, not a product.
+- The queued work, ranked by measured upside, is `../../experiments/IDEAS_LOG.md`; the next build in it is the
+  prime-factor knot solver's pinned arcs inside the knot route's plan (FINDINGS 3bv).

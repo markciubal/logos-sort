@@ -4,6 +4,12 @@ Compiled 2026-09-10 from CLAUDE.md, FINDINGS.md, engines/c/{CHANGELOG,PARITY,REA
 experiments/paradigm/*.md, and the engine source (logos_psort.c 3.6.0). Nothing here was
 re-measured; every status is a reading of the repo's own record.
 
+**Addendum 2026-11-06.** Section S, directly below the legend, re-grades the headline claims against the
+2026-11-05 scale report and scoreboard and says where every avenue in H, J and M stands after the two
+months of rounds between (FINDINGS.md 3bd-3bw; engines/c/CHANGELOG.md). The body of A-N is left as it
+was compiled, except the factual tables F and G, which are brought current. CLAUDE.md's ledger and its
+"positive results" list are the live record; this file grades.
+
 Status legend
 
 | status | meaning |
@@ -13,6 +19,85 @@ Status legend
 | **FALSE** | implemented and measured to lose; in the negative ledger |
 | **INFERRED** | consistent with the measurements but never tested directly |
 | **UNTESTED** | no measurement exists in the repo |
+
+---
+
+## S. Status on 2026-11-06: what changed since this table was compiled
+
+Fifty-seven days and some thirty engine rounds separate this section from the body of the table. The reference
+machine is now the AVX2 box throughout (i9-13900H, 6 P + 8 E cores, GCC 13.3.0, WSL2, 14 benchmark threads); the
+AVX-512 box behind sections A and K has not been re-run. Sources: `reports/scale-report.html` (measured 2026-11-05;
+13 numeric and 4 string inputs, 1 and 14 threads; x86-simd-sort AVX2, VQSort AVX2, IPS⁴o at 14 threads,
+`__gnu_parallel::sort`, LSD radix, timsort; rows parsed with `bizdev/tools/parse_report.py`), `make scoreboard`
+(8.4M, 17 shapes, interleaved, minimum of 7; FINDINGS 3bj and 3bt), and each round's paired A/B. Ratios are read
+within a row. The scale report was taken with the box in its usual loaded state, and barrier-heavy rivals lose more
+to load than logos does, so its 14-thread ratios are upper bounds (A3b still holds).
+
+### S1. The headline claims, re-graded
+
+| # | claim as of 2026-09-11 | status 2026-11-06 | evidence |
+|---|---|---|---|
+| A1 | logos 1T beats `std::sort` on every shape | MEASURED, holds | 10M: uniform 8.6×, heavy_tail / bimodal / int_wide 7.4–8.4×, near_sorted 5.5×, few_distinct / quantized / block shapes 21–39×; strings 4.7× (log lines) to 12× (uuids) over `std::sort` with strcmp |
+| A2 | logos PT beats `__gnu_parallel::sort` on every shape | MEASURED, holds | every 14-thread row of the scale report from 1M up |
+| A3, A3b | IPS⁴o at equal threads | MEASURED 2026-11-05 with IPS⁴o GIVEN 14 threads (before 3bt the scale report let it take all 20): logos faster on 13 of 13 numeric inputs at 3.16M and 10M (1.07–7.15×) and 12 of 13 at 1M; **loses on 5–8 of 13 at 100k–316k** | the thread policy runs one thread below 100,000 elements per thread, so at 100k a one-thread logos meets a 14-thread IPS⁴o. Open: bizdev GAPS 6 |
+| A4 | x86-simd-sort 1T beats logos 1T on every shape | **FALSE on the AVX2 box: level on unstructured doubles, ahead on structure** | scoreboard 8.4M: uniform / heavy_tail / bimodal / clustered 0.986–1.047 on the in-house kernel. Scale report 10M: uniform 1.02, bimodal 0.95, heavy_tail 0.88, **int_wide 0.86 (a loss: the int32 radix against a vector quicksort)**, sine_slope 0.92 (0.54 at 1M, the worst numeric row); near_sorted 3.65×, quantized 2.42×, few_distinct 1.45×, block shapes 2.6–3.6× over the best rival (timsort there). AVX-512: unmeasured since 2026-09 |
+| A5 | x86-simd-sort MT beats logos at PT on unstructured shapes | FALSE | 10M, 14 threads: uniform 1.51×, heavy_tail 1.78×, int_wide 1.33×, bimodal 1.07× over x86-simd-sort's OpenMP sort, the best rival on those rows |
+| A5b | the library leaf under the partition | SUPERSEDED by the hybrid (3be–3bi) | the library's quicksort as the SEQUENTIAL leaf and at up to two threads, optional (`-DLOGOS_XSS_LEAF`). Under the 14-thread partition the ledger's verdict stands, except that the sequential leaf's own policy inside buckets past L2 wins 1.05–2.09× (3bm) |
+| A6 | few_distinct and quantized beat x86-simd-sort MT | MEASURED, holds | 14T at 10M: 3.04× and 4.42× over the best rival (IPS⁴o); 1T 1.45× and 2.42× over x86-simd-sort |
+| A7 | near_sorted a tie at PT | now a WIN | 14T: 1.92× over IPS⁴o at 10M, 3.47× at 3.16M; 1T 3.65× over x86-simd-sort, at 0.4 bytes per element |
+| A8 | logos + SIMD leaf reaches parity with x86-simd-sort 1T, never exceeds it | holds, and the parity is now the in-house kernel's too | 3bi: logos with the library leaf is level with the bare library call (0.991–1.010), checks included; 3bh: the in-house kernel within 1.07–1.12× of the library's |
+| A9 | the SIMD leaf is worse than plain logos multi-threaded | PARTLY SUPERSEDED (3bm) | see A5b |
+| A10 | the 1T unstructured gap cannot be closed within "produce a sorted array" | the gap CLOSED to parity, not by restructuring the scatter (the ledger's three negatives stand) but in the leaf: the AVX2 quicksort (3g), its bridge to the library's kernel (3bh), the profile phase folded into its first partition (3bi) | |
+| A11 | behaviour on AVX2-only hardware | now the reference box; every row above is it | |
+| A12 | multi-socket / NUMA | UNTESTED, unchanged | |
+| A13 | the pattern at other sizes | MEASURED (scale report, 100k–10M): at 14 threads it holds from 1M up; at one thread the unstructured rows are 0.83–0.91 at 100k–1M and 1.02–1.09 at 3.16M–10M, the structured wins hold at every size | the small end (0 to 10k) is FINDINGS 3ad, 3ba, 3bk, 3bn: the thin front answers calls of up to 2047 elements before the dispatcher |
+| A14 | FINDINGS §1 numbers are exact | still FALSE; §1–2 are the September baseline and 3bt the current picture | |
+| A15 (new) | Google's VQSort (Highway 1.4.0) | MEASURED 2026-11-05, AVX2 only | the slowest of the three vector sorts here: 1.36–1.42× behind x86-simd-sort on unstructured doubles, behind on every scoreboard row, and it reads no order (a sorted array costs it what random data does: 40× logos) |
+| A16 (new) | strings | MEASURED (3bl; scale report) | `logos_sort_strings_mt`: 2.4–24× over `std::sort` with strcmp at one thread; against the same 8-byte-prefix scheme on x86-simd-sort's key-value sort 0.84–1.40 (log lines 2.09× at less scratch, urls 1.40×, uuids 0.96, words 0.84), at 24 bytes per string against 8 |
+| E2 | addressing vs vectorized comparison on unstructured data | MEASURED: parity, not a win | the strong form stays false (no route here beats a vector quicksort on random doubles); the weak form is new: level at one thread, ahead at fourteen |
+| E5 | distribution-awareness as the product beats SOTA | still INFERRED | the lazy view (`logos_view.h`, `make viewbench`) measures median / rank / top-k 1.5–2.9× over sort-then-look, which is the unfair baseline this row asked to replace; no `querybench` against `nth_element`-class baselines exists |
+
+### S2. What section C's ledger has gained
+
+Section C is the ledger as of 2026-09-11; CLAUDE.md's is the live one, 175 rows on 2026-11-06. The entries that would
+change a reader's plan here: non-temporal stores and huge pages both fired and measured zero on the scatter (it is
+per-core latency bound), the counting routes' serial merge done in parallel measured 1.02–1.12× SLOWER, the knot
+route as a literal linked list 0.40–0.57, every outside proposal that was a merge sort in disguise (the edge sort,
+the weld, the Moebius handoff, the DLL sort) 2× to 16,000× behind, counting by hashing past L2 a loss, placing X+Y by
+its structure 0.86, a format-aware sort of numeric dates 0.24–0.77. Each row names the mechanism.
+
+### S3. The avenues of H, J and M, as they stand
+
+| avenue | status 2026-11-06 |
+|---|---|
+| H1 partition-then-count (65k–1M distinct) | not built as such. The band narrowed from two sides: the lattice entry takes lattices of 10k–250k values at 1–4 threads (3br, 1.18–4.01×), and the hash route's gate is Chao1 ≤ 3300 at 8+ threads because its serial merge loses above that (3aa). Counting arbitrary doubles by hashing past L2 measured a LOSS (3br): a lookup into a table past L2 is a miss per element, and the vector quicksort is already on the multiset bound |
+| H2 exception extraction for near-sorted data | DONE by other mechanisms: the near-sorted route rebuilt (D28), strays lifted by the run detector (3am), kinks swapped back where they stand (3ai), the short-reach route for bounded displacement (D47), the strand gate (3bw). near_sorted 1T 3.65× over x86-simd-sort |
+| H3 histogram-only select / quantiles | PARTLY: the lazy view (`logos_view.h`: at, range, topk, rank, ranks, quantiles, count_in_range; 1.5–2.9× over sort-then-look). The fair `querybench` is still owed (open direction 1) |
+| H4 equi-depth bucketing from the sample CDF | DONE in the partition in two forms: the key grid for heavy tails (3ab, 1.3–1.8× at 14T) and the per-mode certificate (3s). Equi-depth LEAF classes measured a ceiling of ~3% and were not built (M1); curvature-placed CDF knots measured neutral |
+| H5 bucket-relative key narrowing (int) | built, MIXED, opt-in `-DLOGOS_INT_NARROW`; the in-cache radix for int32-valued doubles measured 1.02–1.03 and was reverted (3bm). int_wide at one thread is the engine's one unstructured loss (0.86) |
+| H6 branchless network at the leaf | DONE at the small end: Batcher networks for 4–16 elements, 1.03× at n = 4 to 1.58× at n = 16 (3ax); the 64-element AVX2 base case now reads and writes the range directly (3bh). On big buckets the lever measured mixed (line repair, opt-in) |
+| H7 one global decision, one fused pass | PARTLY: the top histogram pass no longer EXISTS (the histogram-free partition, 3m, 1.14–1.45×), and the leaf's profile phase rides on the kernel's first partition (3bi, 1.09–1.14× at 1T). A fused two-level scatter was not built; hub-and-spoke at one thread (one L2-sized scatter, then the kernel) measured 0.58–0.91 (3bo) |
+| H8 huge pages | built, fired (98 MB AnonHugePages), NEUTRAL 0.97–1.02: the scatter's TLB misses follow the burst size, which write-combining had already fixed |
+| H9 structure router | BUILT for one and two threads as the hybrid (`-DLOGOS_XSS_LEAF`, 3be–3bi), off by default (a dependency); at one thread the in-house engine is itself level with the library, so the router is the shipped engine. From four threads up: the partition, where the library's parallel quicksort loses on structured buckets |
+| H10 direct key-payload pair sort | NOT built; the largest gap a buyer meets (bizdev GAPS 4). argsort + gather measured 8.5× over `std::sort` on ISO date text (3az) |
+| J1 NaN detection in the prescan | DONE (3bi: one AVX2 profile pass whose verdict the kernel trusts; the kernel's first partition carries the NaN / -0.0 flag) |
+| J2 per-bucket statistics from the histogram | moot: the histogram is gone (3m). The leaf's own profile is one vector pass over a 64-element prefix plus founder windows (3bi, 3bo) |
+| J3 non-temporal stores | the scatter: NEUTRAL. The counting routes' EMIT, which only writes: 1.21–1.36× at one thread, shipped (3bj) |
+| J4 reuse the top sample in the buckets | not measured as such; the one shared sample answers every dispatcher gate and the partition reuses it (3n) |
+| J5 relocation | DONE; the knot route (3ac), the twist (3ag) and the vector merges (3bc, 3bo) built on it |
+| J6 bounded displacement | DONE by the short-reach route (D47) |
+| J7 heavy-hitter split | the one-hitter case is DONE: the dominant-value route (3bp: 2.7–9.9× at 14T at shares 0.25–0.9, 2.1× at one thread at 0.9). Many hitters still meet the hash route's gate |
+| J8 learned placement with a spill bucket | not built as a leaf; the histogram-free partition IS a single-pass predicted placement at bucket granularity with a spill list (3m) |
+| J9 lazy bucket materialisation | DONE: the view (`logos_view.h`) |
+| J10 parallel strict in-place | DONE (3ae: 2.5–2.85× over its own one-thread form; still 6–24× behind the buffered sort) |
+| J11 f32 / i64 engines | f32 NARROWING inside the f64 path at one thread (3bk: 1.20–1.68× when every value is exactly a float); no f32 or i64 API |
+| J12 warm-start across calls | not built; the persistent worker pool and context bundles are the warm part (3bk, 3o) |
+| J13 sort-free distinct / group-by | not built |
+| J14, J15, J16 | DONE (H0b; the trial-and-commit tables; 12 buckets per thread) |
+| M6 quorum trial | not built |
+| M8 ping-pong winnow in the AVX2 leaf | superseded by the bridge (3bh): the kernel's base case and pivot were what the gap was made of |
+| M9 plan cache | not built (J12) |
+| M10 incommensurate class widths | not built; the low-discrepancy probe's coverage band (3bo) took that shape elsewhere |
 
 ---
 
@@ -328,16 +413,16 @@ Status legend
 
 | # | fact | status |
 |---|---|---|
-| F1 | Types: f64 and i32 only; no i64/u64/f32/u32; no key-payload pair sort | known |
+| F1 | Types: f64 and i32 only (f32 is narrowed INSIDE the f64 path when every value is exactly a float, one thread); no i64/u64/f32/u32 API; no key-payload pair sort (argsort + gather is the route); C strings through `logos_sort_strings(_mt)` (NUL-terminated, strcmp order); many arrays in one call through `logos_sort_f64_batch` | known; bizdev GAPS 4–5 |
 | F2 | Not stable (argSort is stable). ±0 kept distinct and bit-exact on counting paths. With a NaN present the ORDER is unspecified, of the other values too (measured: out of order in 246 of 672 probe runs), but the call returns (it did not always: B69), nothing crashes and the output is a permutation of the input's bit patterns; `logos_sort_f64_nan_last` defines the order | MEASURED (432 checks, and 150 sorts under a watchdog) |
 | F3 | Output identical for any thread count | MEASURED at 1/2/4/8 |
-| F4 | Scratch, MEASURED (`make memprobe`, one cold call): f64 15.5 bytes per element at 1 thread, ~23 at 14 on the partition, ~9 on relocation and knot, under 1 on the counting routes; int32 11.5 per 4-byte element at 1 thread, ~6.5 at 14; in-place variants 0 (a fixed 96 KB in parallel). `logos_release_buffers()` returns all of it | MEASURED |
+| F4 | Scratch, two figures. ASKED FOR (`make memprobe`, peak traced heap of one cold call): f64 ~16 bytes per element at one thread on the partition path, 14–17 at fourteen; ~9 on relocation and knot; under 1 on the counting routes; strings ~24 per string; int32 11.5 / 6.5; in-place variants 0 (a fixed 96 KB in parallel). RESIDENT (`make rssprobe`, `make mixprobe`, 4M): one thread 0.1–0.6 on the sorting kernels and at most 4.4 on the routes that place or merge (half a scratch, 3bq); 14 threads ~8.8 on the partition; ~14 kept between calls after ten mixed sorts. `logos_release_buffers()` returns all of it, `malloc_trim` included; `LOGOS_LOWMEM=1` trades 1.25–2.5× of time for a 14-thread peak of 1.5–2.6 | MEASURED |
 | F5 | Worst case bounded: coarse depth cap → heapsort; dual-pivot introsort. A failed allocation or thread creation costs speed, never correctness | MEASURED (`make faultprobe`; about 2,150 harness checks) |
 | F6 | Every speculative path has an abort budget: momentum (8n displacement), lattice (second distinct value on a slot), modcard (65 536 cap), lowcard (1024 cap), near-sorted (inversion sample) | known |
-| F7 | Cardinality coverage: ≤1024 lowcard, ≤65 536 modcard/lattice, above that the full unstructured path | known; **65k–~1M distinct is a measured gap in no table** |
-| F8 | About 22,322 harness checks (the resource section's count moves by a few with thread timing), threads 1/2/4/8; clean under ASan + UBSan + float-cast-overflow and under TSan; parbench verifies every output vs `std::sort` | MEASURED |
+| F7 | Cardinality coverage: up to 8 values counted in vector registers, ≤256 lowcard (a verified perfect hash), the lattice route for any lattice the sample certifies (to ~250k values at 1–4 threads since 3br, the last n/32 off it spilled), the hash route to Chao1 ≈ 3300 at 8+ threads (its serial merge, 3aa) and by the leaf-fallback test below that, dense integers by bitmap (sequential, spans to 16n), a dominant value at a 20% share (P > 1); above those the partition or the leaf | known; the 65k–1M-distinct band is partly covered now, and hashing past L2 measured a loss (3br) |
+| F8 | 54,832 harness checks in 48 sections on 2026-11-06 (22,322 when this table was compiled; the resource section's count moves with thread timing), threads 1/2/4/8, every route's section asserting the path it expects; under ASan + UBSan + float-cast-overflow (4 known reports: the clamped NaN-to-index casts of open item 0h (e)) and under TSan (0 races); `make faultprobe` 7,894 injected failures, 0 bad; three invariant probes (order, isomorphs, edges); every bench verifies every output | MEASURED |
 | F9 | Permutation indices are u32 (n < 2³²) | known |
-| F10 | Rust: v2 numerics only; JS: full string engine, single-threaded; Python: reference | PARITY.md |
+| F10 | Rust: v2 numerics only; JS: its own string engine, single-threaded, the only `sortWithProxy`; C: the fastest string sort of the three (8-byte prefix keys, 3bl); Python: reference | PARITY.md |
 | F11 | No streaming sketch anywhere (no KLL, t-digest, HyperLogLog). Top-level splitters come from one strided 2560-sample; per-bucket classes are equi-width over a prescanned min/max; probes are fixed samples or capped passes | known |
 | F12 | Boundaries are guessed once and never narrowed: the histogram computes exact per-bucket counts but uses them only for offsets, never to re-balance | known; the regroup avenue (J16) is the fix |
 | F13 | `n` is a `size_t`, the buffered engine counts in 32 bits: above 2³² − 1 elements the sort and partition entries hand the array to the strict in-place sort, which counts in `size_t` | read, not run: no machine here holds 34 GB of doubles |
@@ -347,11 +432,11 @@ Status legend
 
 | # | fact |
 |---|---|
-| G1 | The workspace root holds a second copy: CLAUDE.md, FINDINGS.md, README.md are byte-identical to the nested logos-sort-repo/ versions, and the root experiments/paradigm/ is empty. The nested directory is the real project. |
-| G2 | Not a git repository; no history to check claims against. |
-| G3 | `LOGOS_PSORT_VERSION` is 3.6.0 while CHANGELOG carries five "(unreleased)" sections with shipped additions (extras, in-place, SIMD hooks, IPS4o). Real features are unversioned. |
-| G4 | Build is POSIX (pthreads, make, g++ + OpenMP); on this Windows box that means WSL2. The AVX-512 kernels are pragma-pinned for WSL2. |
-| G5 | Opponents (x86-simd-sort, IPS4o, TBB) are external clones, not vendored. |
+| G1 | A second, hand-synchronised copy of CLAUDE.md sits one level up (`logos-sort-repo/CLAUDE.md`, outside git); the nested `logos-sort/` directory is the project. (2026-09-10: the root also held FINDINGS.md and README.md copies and an empty experiments/paradigm/.) |
+| G2 | A git repository since 2026-09-14: five commits, one author, the last on 2026-11-06 carrying FINDINGS 3bd–3bw, the probes and `bizdev/`; working tree clean on 2026-11-06. |
+| G3 | `LOGOS_PSORT_VERSION` is still 3.6.0 while CHANGELOG carries about thirty-five "(unreleased)" sections of shipped, A/B'd changes. Cutting 3.7.0 is a decision the author has not taken. |
+| G4 | Build is POSIX (pthreads, make, g++ + OpenMP for the benches); on this Windows box that means WSL2. The AVX2 kernels are `#pragma GCC target` regions selected at run time (no `-march`); the AVX-512 kernels live only in the optional `logos_simd.cpp`. Built and run only with GCC 13 on x86-64 Linux (F14). |
+| G5 | Opponents (x86-simd-sort, IPS⁴o + TBB, Highway / VQSort) are external clones under `engines/`, ignored by git; `make libvqsort.a` builds the VQSort objects without cmake. |
 
 ---
 

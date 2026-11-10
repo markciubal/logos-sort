@@ -145,3 +145,7 @@ fieldprobe
 fieldprobe_trace
 twinbatch_a
 twinbatch_b
+strceil
+gateprobe
+gateprobe_trace
+argceil

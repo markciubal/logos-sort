@@ -256,11 +256,31 @@ static __attribute__((unused)) size_t g_seam_count = 0, g_reach_seam = 0;   /* g
 #ifndef MIN_ELEMS_PER_THREAD
 #define MIN_ELEMS_PER_THREAD     100000
 #endif
+#ifndef BOOST_PER
+#define BOOST_PER 25000                   /* the unstructured partition: one thread per 25k elements (0 = off). 50k measured 1.07-1.59x, 25k 1.08-1.92x */
+#endif
+#ifndef BOOST_MIN_N
+#define BOOST_MIN_N 300000
+#endif
+/* LOGOS_MIN_PER_THREAD=<k>: the A/B knob for the floor (read only for parallel requests of 32768 elements and up, out of line). */
+static __attribute__((noinline, unused)) size_t min_per_thread_env(void) {
+    const char *e = getenv("LOGOS_MIN_PER_THREAD"); size_t v = e ? (size_t)strtoull(e, NULL, 10) : 0;
+    return v >= 1000 ? v : (size_t)MIN_ELEMS_PER_THREAD;
+}
+/* LOGOS_BOOST_PER=<k> [LOGOS_BOOST_MIN=<n>]: the thread count the UNSTRUCTURED partition may take, one per k elements from n. */
+static __attribute__((noinline, unused)) int boost_threads(size_t n, int P, int Preq) {
+    const char *e = getenv("LOGOS_BOOST_PER"), *m = getenv("LOGOS_BOOST_MIN");
+    size_t per = e ? (size_t)strtoull(e, NULL, 10) : (size_t)BOOST_PER, mn = m ? (size_t)strtoull(m, NULL, 10) : (size_t)BOOST_MIN_N;
+    if (per < 1000 || n < mn) return P;
+    size_t pb = n / per; if (pb > (size_t)Preq) pb = (size_t)Preq;
+    return pb > (size_t)P ? (int)pb : P;
+}
 static inline int effective_threads(size_t n, int P) {
 #ifdef LOGOS_NO_THREAD_POLICY
     (void)n; return P;
 #else
-    size_t pmax = n / MIN_ELEMS_PER_THREAD; if (pmax < 1) pmax = 1;
+    size_t per = MIN_ELEMS_PER_THREAD; if (P > 1 && n >= 32768) per = min_per_thread_env();
+    size_t pmax = n / per; if (pmax < 1) pmax = 1;
     return (size_t)P > pmax ? (int)pmax : P;
 #endif
 }
@@ -3657,6 +3677,7 @@ typedef struct {
     int ex_ok; uint64_t ex_e0; double dup_frac; ex_ent_t ex[256];   /* exponent map (ex_e0 = the lowest binade sampled) and the largest single-value share */
     int md_ok, md_nm, md_first[8], md_last[8]; double md_lo[8], md_hi[8], md_scale[8];   /* per-mode linear map: certified uniform INSIDE each mode */
     struct mdx_s *mdx;                    /* the same map past MD_LIN_MAX modes, with an O(1) mode grid (heap: this struct is on the dispatcher's stack) */
+    struct hv_s *hv;                      /* heavy values the histogram-free scatter counts instead of moving (heap, for the same reason) */
 #ifndef LOGOS_NO_KGRID
     int kg_ok, kg_shift; uint64_t kg_lo; uint32_t kg_cells; uint8_t kg_tab[1u << KG_BITS];   /* key grid: bucket per key-space cell */
 #endif
@@ -3874,6 +3895,65 @@ static int pool_acquire(size_t buf_bytes, size_t bidx_bytes, void **buf, uint8_t
 static double *hf_buf = NULL; static size_t hf_buf_cap = 0;          /* persistent, like the pool: page faults once */
 static atomic_size_t g_hf_pooled;      /* logos_twist_last(35): partitions whose regions were the pool's block; reading clears it */
 static trim_t hf_trim;                                                  /* and trimmed like it (trim_note) */
+/* HEAVY VALUES ARE COUNTED, NOT MOVED (2026-11-10, FINDINGS 3ca). A value holding more than a region (one bucket of n / ~170 plus
+ * slack) made the partition decline up front: the histogram path then cost a counting pass and a scatter where this one costs
+ * a scatter, and gave every copy of the value to ONE bucket and one thread. A Zipf key column lives there (US ZIP codes by
+ * population, a foreign key by customer: the top value 6%, the top sixty-four 45%, none near the dominant route's 20%). The sorted
+ * sample names the values: every run of bit-equal points at least a quarter of a bucket's share, the HV_MAX longest. The scatter
+ * looks a value up as before and, in a bucket that holds a heavy value, compares bits: a match is counted per thread and not
+ * staged, not written, not sorted. A bucket's output is then its other elements, sorted by the leaf, with each heavy run filled
+ * in by arithmetic where it belongs. What the decline test reads afterwards is the largest share among the values NOT taken.
+ * Bits decide, as in the dominant route: -0.0 beside a heavy +0.0 stays an ordinary element and lands next to the run, equal
+ * under <. LOGOS_NO_HFHEAVY=1: off (the old decline). logos_twist_last(41): partitions that counted heavy values. */
+#ifndef HV_MAX
+#define HV_MAX 64
+#endif
+typedef struct hv_s { int n; double rest; double v[HV_MAX]; uint64_t b[HV_MAX]; size_t tot[HV_MAX]; uint8_t lo[MAX_BUCKETS], hi[MAX_BUCKETS]; } hv_t;
+static atomic_size_t g_hf_heavy;
+static inline size_t hv_runlen(const double *samp, size_t m, size_t i) {
+    uint64_t x, y; memcpy(&x, samp + i, 8); size_t e = i + 1;
+    while (e < m) { memcpy(&y, samp + e, 8); if (y != x) break; e++; }
+    return e - i;
+}
+/* the heavy values of a sorted sample, in value order; *maskp marks their sample points (for the balance check). NULL: none. */
+static __attribute__((noinline, unused)) hv_t *hv_build(const double *samp, size_t m, int nbk, uint8_t **maskp) {
+    *maskp = NULL;
+    if (m < 256 || nbk < 2 || nbk > MAX_BUCKETS || getenv("LOGOS_NO_HFHEAVY")) return NULL;
+    size_t cut = m / (4 * (size_t)nbk); if (cut < 6) cut = 6;
+    for (;;) {                                                        /* at most HV_MAX values: raise the cut until they fit */
+        size_t nr = 0;
+        for (size_t i = 0; i < m;) { size_t L = hv_runlen(samp, m, i); if (L >= cut && samp[i] == samp[i]) nr++; i += L; }
+        if (!nr) return NULL;
+        if (nr <= HV_MAX) break;
+        cut += 1 + cut / 8;
+    }
+    hv_t *hv = calloc(1, sizeof *hv); uint8_t *mask = calloc(m, 1);
+    if (!hv || !mask) { free(hv); free(mask); return NULL; }
+    size_t rest = 1;
+    for (size_t i = 0; i < m;) {
+        size_t L = hv_runlen(samp, m, i);
+        if (L >= cut && samp[i] == samp[i] && hv->n < HV_MAX) { hv->v[hv->n] = samp[i]; memcpy(&hv->b[hv->n], samp + i, 8); hv->n++; memset(mask + i, 1, L); }
+        else if (L > rest) rest = L;
+        i += L;
+    }
+    hv->rest = (double)rest / (double)m;
+    *maskp = mask;
+    return hv;
+}
+/* out[0 .. no) holds a bucket's other elements, sorted; its heavy values q in [lo, hi) go in where they belong, from the top down */
+static void hv_insert(double *out, size_t no, const hv_t *hv, int lo, int hi) {
+    size_t w = no; for (int q = lo; q < hi; q++) w += hv->tot[q];
+    size_t e = no;
+    for (int q = hi - 1; q >= lo; q--) {
+        double v = hv->v[q]; size_t c = hv->tot[q];
+        size_t a = 0, b = e; while (a < b) { size_t mid = (a + b) >> 1; if (out[mid] <= v) a = mid + 1; else b = mid; }   /* first element above v */
+        size_t up = e - a;
+        if (up && w != e) memmove(out + w - up, out + a, up * sizeof(double));
+        w -= up; e = a;
+        for (size_t i = w - c; i < w; i++) out[i] = v;
+        w -= c;
+    }
+}
 typedef struct { double v; uint16_t b; } hf_spill_t;
 typedef struct {
     job_t *j; int P; size_t cap, region; double *rb;                             /* region = cap rounded so buckets start 64-byte aligned */
@@ -3884,8 +3964,9 @@ typedef struct {
     int *order;                  /* leaf dispatch order; identity, or largest-first when LPT is on */
     int lazy;                    /* 1: place the buckets but do not sort them (logos_partition_f64) */
     double *vmin, *vmax;         /* lazy: per-bucket extremes, computed while the bucket is copied */
+    hv_t *hv;                    /* heavy values counted in the scatter (NULL: none) */
 } hf_t;
-typedef struct { hf_t *h; int t; ctx_t *ctx; hf_spill_t *sp; size_t spn, spcap; } hf_arg_t;
+typedef struct { hf_t *h; int t; ctx_t *ctx; hf_spill_t *sp; size_t spn, spcap; size_t hvc[HV_MAX]; } hf_arg_t;
 
 static inline int hf_lpt_on(void) { return getenv("LOGOS_LPT") != NULL; }   /* OFF by default: measured neutral, see hf_order. Uncached so one binary can A/B both orders. */
 static inline __attribute__((always_inline)) int hf_lookup(const job_t *j, double x, int mode, int style) {
@@ -4021,13 +4102,20 @@ static void hf_flush(hf_arg_t *w, int b, const double *blk, size_t k) {
     for (size_t i = 0; i < k; i++) hf_spill_push(w, blk[i], b);
 }
 static void hf_scatter(hf_arg_t *w) {
-    hf_t *h = w->h; job_t *j = h->j; int nb = j->nbk, mode = h->mode, style = h->style;
+    hf_t *h = w->h; job_t *j = h->j; int nb = j->nbk, mode = h->mode, style = h->style; const hv_t *hv = h->hv;
     double *st = malloc((size_t)nb * HF_BLOCK * sizeof(double)); uint16_t *sc = calloc(nb, sizeof(uint16_t));
     if (!st || !sc) { free(st); free(sc); h->declined = 1; return; }
     size_t ch;
     while ((ch = atomic_fetch_add(&h->next, 1)) < j->nchunk && !h->declined) {
         size_t lo = ch * j->csize, hi = lo + j->csize; if (hi > j->n) hi = j->n; const double *src = j->src;
-        for (size_t i = lo; i < hi; i++) {
+        if (hv) for (size_t i = lo; i < hi; i++) {                     /* a bucket that holds a heavy value: its copies are counted here and never staged */
+            double x = src[i]; int b = hf_lookup(j, x, mode, style);
+            unsigned q = hv->lo[b], qe = hv->hi[b];
+            if (q != qe) { uint64_t xb; memcpy(&xb, &x, 8); for (; q < qe; q++) if (hv->b[q] == xb) break; if (q < qe) { w->hvc[q]++; continue; } }
+            st[(size_t)b * HF_BLOCK + sc[b]] = x;
+            if (++sc[b] == HF_BLOCK) { hf_flush(w, b, st + (size_t)b * HF_BLOCK, HF_BLOCK); sc[b] = 0; }
+        }
+        else for (size_t i = lo; i < hi; i++) {
             double x = src[i]; int b = hf_lookup(j, x, mode, style);
             st[(size_t)b * HF_BLOCK + sc[b]] = x;
             if (++sc[b] == HF_BLOCK) { hf_flush(w, b, st + (size_t)b * HF_BLOCK, HF_BLOCK); sc[b] = 0; }
@@ -4090,6 +4178,7 @@ static void hf_leaves(hf_arg_t *w) {
     while ((bi = atomic_fetch_add(&h->bnext, 1)) < (size_t)j->nbk) {
         size_t b = (size_t)h->order[bi];
         double *reg = h->rb + b * h->region, *out = j->src + h->bstart[b]; size_t nb = h->cnt[b], ns = h->spc[b];
+        const hv_t *hv = h->hv; int hq0 = hv ? hv->lo[b] : 0, hq1 = hv ? hv->hi[b] : 0;
         PROF(prof_stamp_t s0 = prof_stamp(); w->ctx->path = LOGOS_PATH_NONE;)
         if (h->lazy) {
             /* A view only needs the buckets PLACED, not ordered inside. Copy the region and append the
@@ -4103,10 +4192,12 @@ static void hf_leaves(hf_arg_t *w) {
                 double mn = INFINITY, mx = -INFINITY;
                 for (size_t i = 0; i < nb; i++) { double x = reg[i]; out[i] = x; mn = x < mn ? x : mn; mx = x > mx ? x : mx; }
                 for (size_t i = 0; i < ns; i++) { double x = h->spv[h->spo[b] + i].v; out[nb + i] = x; mn = x < mn ? x : mn; mx = x > mx ? x : mx; }
+                { size_t o = nb + ns; for (int q = hq0; q < hq1; q++) { double v = hv->v[q]; size_t c = hv->tot[q]; for (size_t i = 0; i < c; i++) out[o + i] = v; o += c; if (c) { mn = v < mn ? v : mn; mx = v > mx ? v : mx; } } }
                 h->vmin[b] = mn; h->vmax[b] = mx;
             } else {
                 memcpy(out, reg, nb * sizeof(double));
                 for (size_t i = 0; i < ns; i++) out[nb + i] = h->spv[h->spo[b] + i].v;
+                { size_t o = nb + ns; for (int q = hq0; q < hq1; q++) { double v = hv->v[q]; size_t c = hv->tot[q]; for (size_t i = 0; i < c; i++) out[o + i] = v; o += c; } }
             }
             PROF(double mz = prof_busy_since(w->ctx->tid, LOGOS_PH_BUCKETS, s0); prof_path(w->ctx->tid, w->ctx->path, nb + ns, mz);)
             continue;
@@ -4114,11 +4205,13 @@ static void hf_leaves(hf_arg_t *w) {
         if (ns == 0) {
             double *r = nb > 1 ? leaf_f64(reg, nb, out, w->ctx) : reg;
             if (r != out) memcpy(out, r, nb * sizeof(double));
+            if (hq0 != hq1) hv_insert(out, nb, hv, hq0, hq1);
         } else {
             double *sv = malloc((ns ? ns : 1) * sizeof(double));
             if (!sv) {            /* unchecked until 2026-09-20. No room for the spill list: lay both parts down and sort the bucket where it lies */
                 memcpy(out, reg, nb * sizeof(double)); for (size_t i = 0; i < ns; i++) out[nb + i] = h->spv[h->spo[b] + i].v;
                 quicksort(out, 0, (long)(nb + ns) - 1, 2 * log2i(nb + ns));
+                if (hq0 != hq1) hv_insert(out, nb + ns, hv, hq0, hq1);
                 PROF(double mq = prof_busy_since(w->ctx->tid, LOGOS_PH_BUCKETS, s0); prof_path(w->ctx->tid, w->ctx->path, nb + ns, mq);)
                 continue;
             }
@@ -4131,6 +4224,7 @@ static void hf_leaves(hf_arg_t *w) {
             if (x < xe) { memcpy(o, x, (size_t)(xe - x) * sizeof(double)); o += xe - x; }
             if (y < ye) memcpy(o, y, (size_t)(ye - y) * sizeof(double));
             free(sv);
+            if (hq0 != hq1) hv_insert(out, nb + ns, hv, hq0, hq1);
         }
         PROF(double ms = prof_busy_since(w->ctx->tid, LOGOS_PH_BUCKETS, s0); prof_path(w->ctx->tid, w->ctx->path, nb + ns, ms);)
     }
@@ -4381,7 +4475,9 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
     /* One value holding more than a region can hold overflows it however the splitters fall, and the
      * spill test would then fail after a whole pass over the data. The sample already knows the largest
      * share any single value has, so decline here instead. */
-    if (j->dup_frac * (double)nbk > 1.0 + HF_SLACK) { TRACE("hf: declined up front, one value is %.1f%% of the data", j->dup_frac * 100.0); return 0; }
+    hv_t *hv = (!lazy && g_part_inplace) ? NULL : j->hv;                /* the in-place partition moves every element */
+    double dupf = hv ? hv->rest : j->dup_frac;
+    if (dupf * (double)nbk > 1.0 + HF_SLACK) { TRACE("hf: declined up front, one value is %.1f%% of the data", dupf * 100.0); return 0; }
     hf_t h; memset(&h, 0, sizeof h); h.j = j; h.P = P;
     if (!lazy && g_part_inplace) {                                     /* no region buffer: the block permutation (ipp_partition) */
         hf_trial(&h);
@@ -4437,6 +4533,12 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
         h.lazy = lazy; h.vmin = lazy ? vmin : NULL; h.vmax = lazy ? vmax : NULL;
         hf_trial(&h);
         TRACE("hf: trial mode %d style %d, cap %zu per bucket", h.mode, h.style, h.cap);
+        if (hv) {                                                     /* each heavy value's bucket under the map just chosen; the maps are monotone, so value order is bucket order */
+            memset(hv->lo, 0, sizeof hv->lo); memset(hv->hi, 0, sizeof hv->hi); int pb = -1, okm = 1;
+            for (int q = 0; q < hv->n; q++) { int b = hf_lookup(j, hv->v[q], h.mode, h.style); if (b < pb || b < 0 || b >= nbk) { okm = 0; break; } if (b != pb) hv->lo[b] = (uint8_t)q; hv->hi[b] = (uint8_t)(q + 1); pb = b; hv->tot[q] = 0; }
+            if (okm) { h.hv = hv; atomic_fetch_add_explicit(&g_hf_heavy, 1, memory_order_relaxed); TRACE("hf: %d heavy values counted in the scatter, the largest left is %.2f%% of the sample", hv->n, hv->rest * 100.0); }
+            else if (j->dup_frac * (double)nbk > 1.0 + HF_SLACK) h.declined = 1;   /* a map that is not monotone: cannot happen; never count on it */
+        }
         if (h.mode == 9 && j->mdx) atomic_fetch_add_explicit(&g_mdgrid_scatters, 1, memory_order_relaxed);   /* logos_twist_last(18) */
 #if defined(LOGOS_TRACE) && defined(LOGOS_STREAM)
         atomic_store(&g_streamed, 0);
@@ -4462,7 +4564,9 @@ static int hf_partition(job_t *j, int P, ctx_t *ctxs, pthread_t *th, int lazy, s
                   if (!fill) h.declined = 1;                  /* unchecked until 2026-09-20; a[] is untouched here, so declining is free */
                   else { for (int t = 0; t < P; t++) for (size_t i = 0; i < wa[t].spn; i++) { int b = wa[t].sp[i].b; h.spv[h.spo[b] + fill[b]++] = wa[t].sp[i]; } free(fill); } }
                 size_t maxb = 1, lsz[MAX_BUCKETS];
-                for (int b = 0; b < nbk; b++) { size_t z = h.cnt[b] + h.spc[b]; lsz[b] = z; h.bstart[b + 1] = h.bstart[b] + z; if (z > maxb) maxb = z; }
+                if (h.hv) for (int q = 0; q < h.hv->n; q++) { size_t c = 0; for (int t = 0; t < P; t++) c += wa[t].hvc[q]; h.hv->tot[q] = c; }
+                for (int b = 0; b < nbk; b++) { size_t z = h.cnt[b] + h.spc[b], hz = 0; if (h.hv) for (int q = h.hv->lo[b]; q < h.hv->hi[b]; q++) hz += h.hv->tot[q];
+                    lsz[b] = z; h.bstart[b + 1] = h.bstart[b] + z + hz; if (z > maxb) maxb = z; }   /* a leaf sorts the others; the heavy runs are filled in */
                 hf_order(h.order, lsz, nbk);                          /* biggest leaf first: the last one picked up sets the finish time */
                 TRACE("par: leaf sizes max %zu mean %zu -> imbalance %.2fx", lsz[h.order[0]], n / (size_t)nbk, (double)lsz[h.order[0]] * (double)nbk / (double)n);
                 if (h.bstart[nbk] != n) h.declined = 1;
@@ -4844,6 +4948,13 @@ static int lowcard_try_f64(double *a, size_t n, int P, const double *ext, size_t
 #ifndef MC_HASH_CHAO1_RADIX
 #define MC_HASH_CHAO1_RADIX 3300
 #endif
+/* What the sequential map may HOLD when it was let in on an estimate above MC_HASH_CHAO1_SEQ (2026-11-10, FINDINGS 3ca). Chao1 is a
+   lower bound and a long tail hides from 384 sample points: US ZIP codes read 1,519 and the map then met 18,923 distinct values in
+   100,000 elements, a table past L2 and 2.4x the leaf's time. The gate admits an estimate of at most 3,300, so a map past a small
+   multiple of that was let in on a wrong estimate and gives up there. LOGOS_MC_SEQCAP=<k> moves it (0 = no cap, the old engine). */
+#ifndef MC_HASH_SEQ_CAP
+#define MC_HASH_SEQ_CAP 8192
+#endif
 #ifndef LATTICE_MT_MAX_SLOTS
 #define LATTICE_MT_MAX_SLOTS 65536
 #endif
@@ -4882,14 +4993,15 @@ static int hmap_add(hmap_t *h, uint64_t k, double v, size_t c, size_t maxd) {
         if (!hmap_grow(h)) return 0;
     }
 }
-typedef struct { const double *a; size_t lo, hi; hmap_t h; int abort; int tid; } mcmap_t;
+typedef struct { const double *a; size_t lo, hi; hmap_t h; int abort; int tid; size_t cap; } mcmap_t;
+static atomic_size_t g_mc_capped;                              /* logos_twist_last(40): sequential hash maps that gave up at MC_HASH_SEQ_CAP */
 static void *mc_map_body(void *p);
 static void *mc_map(void *p) { PROF(prof_stamp_t s0 = prof_stamp();) void *r = mc_map_body(p); PROF(prof_busy_since(((mcmap_t *)p)->tid, g_prof_phase, s0);) return r; }
 static void *mc_map_body(void *p) {
     mcmap_t *m = p;
     for (size_t i = m->lo; i < m->hi; i++) {
         double x = m->a[i];
-        if (x != x || !hmap_add(&m->h, total_key(x), x, 1, MODCARD_CAP)) {
+        if (x != x || !hmap_add(&m->h, total_key(x), x, 1, m->cap)) {
             m->abort = 1;
             TRACE("modcard: thread gave up %zu of %zu elements in (%.0f%% scanned), %zu distinct so far",
                   i - m->lo, m->hi - m->lo, 100.0 * (double)(i - m->lo) / (double)(m->hi - m->lo ? m->hi - m->lo : 1), m->h.used);
@@ -5303,7 +5415,7 @@ static inline int mc_hash_allowed(double chao1, int P, size_t n, const double *s
     if (P >= WC_MIN_THREADS) return chao1 <= (double)MC_HASH_CHAO1_MT;
     if (chao1 <= (double)MC_HASH_CHAO1_SEQ) return 1;
     if (getenv("LOGOS_MCGATE_V1")) return 0;
-    return n >= TYPED_MIN_N && n <= RADIX64_MAX_N && chao1 <= (double)MC_HASH_CHAO1_RADIX && samp && m && sample_quant_passes(samp, m) <= QUANT_PROBE_MAX;
+    return n >= TYPED_MIN_N && n <= RADIX64_MAX_N && chao1 <= (double)MC_HASH_CHAO1_RADIX && samp && m && sample_quant_passes(samp, m) <= QUANT_PROBE_MAX ? 2 : 0;   /* 2: capped */
 }
 static int modcard_try_f64(double *a, size_t n, int P, const double *ext, size_t ext_m, int allow_hash) {
     P = count_threads(n, P);
@@ -5323,18 +5435,21 @@ static int modcard_try_f64(double *a, size_t n, int P, const double *ext, size_t
     if (!ext) free(samp);
     if (!allow_hash || getenv("LOGOS_MC_HASH_OFF")) return 0;  /* the Chao1 gate (mc_hash_allowed); the env var is a measurement toggle */
 
-    size_t chunk = (n + P - 1) / P;
+    size_t chunk = (n + P - 1) / P, mc_cap = MODCARD_CAP;
+    if (allow_hash == 2) { const char *e = getenv("LOGOS_MC_SEQCAP"); size_t v = e ? (size_t)strtoull(e, NULL, 10) : (size_t)MC_HASH_SEQ_CAP; if (v && v < mc_cap) mc_cap = v; }
     mcmap_t *mp = calloc((size_t)P, sizeof(mcmap_t)); pthread_t *th = malloc((size_t)P * sizeof(pthread_t));
     if (!mp || !th) { free(mp); free(th); return 0; }
     int ok = 1;
     for (int t = 0; t < P; t++) {
         mp[t].a = a; PROF(mp[t].tid = t;) mp[t].lo = (size_t)t * chunk; mp[t].hi = mp[t].lo + chunk; if (mp[t].hi > n) mp[t].hi = n;
+        mp[t].cap = mc_cap;
         if (!hmap_init(&mp[t].h, 4096)) ok = 0;                 /* small start; grows with the data, stays cache-resident */
     }
     int sorted = 0;
     if (ok) {
         par_run(th, P, mc_map, mp, sizeof mp[0], 1);
         int aborted = 0; size_t tot = 0; for (int t = 0; t < P; t++) { if (mp[t].abort) aborted = 1; tot += mp[t].h.used; }
+        if (aborted && mc_cap < MODCARD_CAP) atomic_fetch_add(&g_mc_capped, 1);
         TRACE("modcard: map phase done, %d threads, aborted=%d, %zu entries across the tables", P, aborted, tot);
         if (!aborted) {
             /* The merge used to build ONE global hash by re-inserting every entry of every thread's
@@ -8675,11 +8790,13 @@ static __attribute__((noinline, unused)) int lat1_gate(const double *s, size_t m
     return span >= 0 && (span + 1.0) * fill <= (double)n;
 }
 static __attribute__((unused)) atomic_size_t g_lat1_sorts;     /* logos_twist_last(36): sorts the lattice entry (lat1_gate) finished */
+static __attribute__((unused)) atomic_size_t g_boosts;         /* logos_twist_last(39): partitions that took the unstructured thread boost */
 static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, double *vmin, double *vmax) {
     if (vnbk) *vnbk = 0;
     if (P < 1) P = 1;
     if (n < 2) return;
     if ((size_t)P > n) P = (int)n;
+    int Preq = P;
     P = effective_threads(n, P);
     TRACE_START(); TRACE("psort_f64 n=%zu P=%d", n, P);
 #ifndef LOGOS_NO_REACH
@@ -8780,8 +8897,10 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     /* few distinct values: map+emit counting sort (parallel when P>1) instead of
        a partition that cannot split equal keys, or a span-sized count array */
     TRACE("prescan done");
+    int Pb = P; (void)Pb; (void)Preq;                 /* Pb: the thread count the unstructured partition may take (boost_threads) */
 #ifdef LOGOS_SODO
     sodo_t SO; int sodo_ok = 0;
+    Pb = P > 1 && Preq > P ? boost_threads(n, P, Preq) : P;          /* the unstructured partition's own floor (IDEAS_LOG 21 (a)) */
     { int nbk0 = P * BUCKETS_PER_THREAD; if (nbk0 > MAX_BUCKETS) nbk0 = P * (MAX_BUCKETS / P > 0 ? MAX_BUCKETS / P : 1);
       if (n >= 4096) sodo_ok = sodo_sample(a, n, (size_t)nbk0 * OVERSAMPLE, &SO); }
     if (sodo_ok) TRACE("sodo: m=%zu distinct=%zu chao1=%.0f inv=%.3f inv_all=%.3f reach=%zu ks=%.4f nan=%d", SO.m, SO.distinct, SO.chao1, SO.inv_rate, SO.inv_all, SO.reach, SO.ks, SO.has_nan);
@@ -9030,6 +9149,24 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     TRACE("par: relocation declined");
     PROF(prof_phase(LOGOS_PH_RELOCATE);)
 #endif
+#ifdef LOGOS_SODO
+    /* THE UNSTRUCTURED PARTITION'S OWN THREAD FLOOR (2026-11-09, IDEAS_LOG 21 (a), FINDINGS 3bz). Every structured route has
+       declined; if the sample is unstructured the partition takes one thread per BOOST_PER elements instead of the global one per
+       MIN_ELEMS_PER_THREAD, which was set from the cost of creating threads before the worker pool existed and which the
+       structured routes still need (a 25k or 50k floor for everything lost 3-5x on kinks and blocks at 100k).
+       THREADS, NOT BUCKETS: the bucket count stays the policy's, so the sample, the splitters and every map are exactly what the
+       unboosted sort builds. With the buckets doubled too, the first cuts lost wherever a map that balanced at the policy's count
+       did not at twice it (64 thin clusters' certified grid: spills, then the histogram path, 1.5-2.8x slower; a gaussian's key
+       grid rejected at 72 buckets and kept at 36: 1.16), and rebuilding the maps to go back cost 10-20% by itself.
+       LOGOS_BOOST_PER=<k> moves the floor (a value under 1000 turns the boost off), LOGOS_BOOST_MIN=<n> its smallest array. */
+    if (Pb > P && sodo_ok && !SO.has_nan && !vnbk && sample_unstructured(a, n, &SO)) {
+        TRACE("par: unstructured -> partition threads %d -> %d (buckets stay %d)", P, Pb, j.nbk);
+        P = Pb; j.P = P; atomic_fetch_add(&g_boosts, 1);
+        j.wc_on = (P >= WC_MIN_THREADS);
+        j.csize = (n + (size_t)P * 4 - 1) / ((size_t)P * 4); if (j.csize > CHUNK_MAX) j.csize = CHUNK_MAX; if (j.csize < 1) j.csize = 1;
+        j.nchunk = (n + j.csize - 1) / j.csize;
+    }
+#endif
 #if defined(LOGOS_XSS_LEAF) && defined(LOGOS_AVX2_LEAF)
     if (P <= XSS_PAR_MAX && avx2_leaf_on() && !getenv("LOGOS_NO_XSS_PAR") && avx2_qsort_f64_p(a, n, P)) {
         TRACE("par: no structure found at P=%d -> x86-simd-sort, parallel", P);
@@ -9109,6 +9246,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
         TRACE("par: KS distance in key space %.4f -> %s", D, j.ks_key_ok ? "log-uniform" : "not log-uniform");
     }
 #endif
+    uint8_t *hvmask = NULL;                                           /* sample points that are heavy values: the balance check leaves them out */
     /* exponent-histogram map, and the largest share a single value holds in the sample */
     {   size_t cnt[256]; memset(cnt, 0, sizeof cnt); size_t run = 1, maxrun = 1;
         j.ex_e0 = total_key(samp[0]) >> EX_SHIFT;                       /* entries are binades above the lowest sampled */
@@ -9119,6 +9257,9 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
             if (i && samp[i] == samp[i - 1]) { run++; if (run > maxrun) maxrun = run; } else run = 1;
         }
         j.dup_frac = (double)maxrun / (double)m;
+#ifdef LOGOS_HISTFREE
+        j.hv = hv_build(samp, m, j.nbk, &hvmask);
+#endif
         size_t cum = 0; uint32_t prev = 0; int nonempty = 0;
         for (int e = 0; e < 256; e++) {
             uint32_t base = (uint32_t)((double)j.nbk * (double)cum / (double)m);
@@ -9212,7 +9353,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     {   uint32_t load[MAX_BUCKETS]; double lim = HF_BAL_MAX * (double)m / (double)j.nbk;
 #define BAL_OK(EXPR, FLAG) do { if (FLAG) { \
             memset(load, 0, (size_t)j.nbk * sizeof(uint32_t)); \
-            for (size_t i = 0; i < m; i++) { int b_ = (EXPR); if (b_ >= 0 && b_ < j.nbk) load[b_]++; } \
+            for (size_t i = 0; i < m; i++) { if (hvmask && hvmask[i]) continue; int b_ = (EXPR); if (b_ >= 0 && b_ < j.nbk) load[b_]++; } \
             uint32_t mx_ = 0; for (int b_ = 0; b_ < j.nbk; b_++) if (load[b_] > mx_) mx_ = load[b_]; \
             if ((double)mx_ > lim) { FLAG = 0; TRACE("par: a map was rejected, one bucket would take %.1fx its share", (double)mx_ * (double)j.nbk / (double)m); } } } while (0)
 #ifdef LOGOS_HISTFREE
@@ -9226,6 +9367,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
 #endif
 #undef BAL_OK
     }
+    free(hvmask);
     free(samp); j.sp = sp;
     PROF(prof_phase(LOGOS_PH_SAMPLE);)
 #if defined(LOGOS_AVX2_LEAF) && !defined(LOGOS_ZERO_SIGN_UNSAFE) && defined(LOGOS_SODO)
@@ -9250,6 +9392,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
         bt_free(&j.bt);
 #endif
         free(j.mdx); j.mdx = NULL;                        /* the mode grid (mdx_t), outside the table's #ifndef */
+    free(j.hv); j.hv = NULL;
         free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
         PROF(prof_phase(LOGOS_PH_OTHER); prof_finish(LOGOS_ROUTE_PARTITION, t_start);)
         return;
@@ -9296,6 +9439,7 @@ static void psort_f64(double *a, size_t n, int P, size_t *vstart, int *vnbk, dou
     bt_free(&j.bt);
 #endif
     free(j.mdx); j.mdx = NULL;                        /* the mode grid (mdx_t), outside the table's #ifndef */
+    free(j.hv); j.hv = NULL;
     free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
     PROF(prof_phase(LOGOS_PH_OTHER); prof_finish(LOGOS_ROUTE_PARTITION, t_start);)
     return;
@@ -9308,6 +9452,7 @@ fallback:
     bt_free(&j.bt);
 #endif
     free(j.mdx); j.mdx = NULL;                        /* the mode grid (mdx_t), outside the table's #ifndef */
+    free(j.hv); j.hv = NULL;
     free(sp); free(j.counts); free(j.offs); free(j.bsize); free(j.bstart); free(wa); free(th); free(ctxs);
     qsort(a, n, sizeof(double), cmp_d);
 }
@@ -9953,6 +10098,7 @@ void logos_sort_buckets_f64(double *a, const size_t *starts, int nbk, unsigned c
    on the calling thread inside relocate_try_f64 only (never on a small sort's path), one sort at a time like the pool. */
 static size_t g_twist_knot = 0, g_twist_reloc = 0;
 static size_t g_str_sorts;    /* logos_twist_last(25): defined with the string sort, below */
+static atomic_size_t g_argsort_par;  /* logos_twist_last(42): defined with logos_argsort_f64_mt, at the end of the file */
 static size_t g_str_ns, g_str_ns_gate; static int g_str_ns_last;   /* logos_twist_last(27), (-10), (-9): the log-line route, below */
 static size_t g_thin_calls;   /* logos_twist_last(20): calls the thin front answered (plain: logos_sort_f64 is not reentrant anyway) */
 static size_t thin_ceiling(void);     /* THIN_MAX_N, defined with the thin front below; 0 without it */
@@ -9994,7 +10140,13 @@ size_t logos_twist_last(int which) {
     if (which == 36) return atomic_exchange(&g_lat1_sorts, 0);                        /* lattice sorts whose sample showed no repeats (lat1_gate) */
 #endif
     if (which == 37) return atomic_exchange(&g_lat_spilled, 0);                       /* elements the lattice route spilled and merged back (lat_spill) */
-    if (which == 38) return atomic_exchange(&g_ns_strand, 0);                         /* parallel sorts the near-sorted route's STRAND gate turned away (strands, not strays) */
+#ifndef LOGOS_NO_HISTFREE
+    if (which == 41) return atomic_exchange(&g_hf_heavy, 0);                          /* histogram-free partitions that counted heavy values instead of moving them */
+#endif
+    if (which == 42) return atomic_exchange(&g_argsort_par, 0);                       /* argsorts that took the parallel partition (logos_argsort_f64_mt) */
+    if (which == 40) return atomic_exchange(&g_mc_capped, 0);                         /* sequential hash maps that gave up at their cap (MC_HASH_SEQ_CAP) */
+    if (which == 39) return atomic_exchange(&g_boosts, 0);                            /* partitions that took the unstructured thread boost (BOOST_PER) */
+    if (which == 38) return atomic_exchange(&g_ns_strand, 0);                        /* parallel sorts the near-sorted route's STRAND gate turned away (strands, not strays) */
 #ifndef LOGOS_NO_RLE
     if (which == 28) return atomic_exchange(&g_rle_sorts, 0);                         /* f64 sorts the runs-of-equal-values route finished */
 #endif
@@ -10947,4 +11099,143 @@ void logos_sort_f64_inplace(double *a, size_t n, int nthreads) {
     { int P = effective_threads(n, nthreads < 1 ? 1 : nthreads);
       if (P > 1 && n >= IP_PAR_MIN && inplace_parallel(a, 1, n, shifts, ns, P)) return; }
     inplace_msd_f64(a, 0, n, shifts, 0, ns);
+}
+
+/* ===================== argsort with threads (2026-11-10, FINDINGS 3ca; make argceil, make argbench) =====================
+ * logos_argsort_f64 is an index-carrying LSD radix on one thread: up to eight passes over 12-byte pairs and 20 bytes of scratch per
+ * element, whatever the keys look like. Measured against told ceilings at 8.4M: sorted keys cost it 54 ns per element where one
+ * scan answers (0.6); a vector key-value quicksort beat it by only 1.2x at one thread (so the one-thread kernel stays), but 14
+ * threads were worth 4.4x. This entry:
+ *   1. keys already in order (by the total-order key, which is the order the radix defines): the identity, one pass;
+ *   2. one thread by the thread policy: the same one-thread radix;
+ *   3. else one STABLE parallel partition into up to 2^AS_BITS cells of equal width in key space (per-thread histograms, offsets in thread order),
+ *      then every bucket finished where it lies by a byte-skipping LSD radix on the bits below, buckets claimed from a counter.
+ * The pairs are written once by the partition, so the scratch is 12 bytes per element plus one bucket per worker (was 20).
+ * Stable, like logos_argsort_f64, and the same permutation bit for bit. A failed allocation falls back to it (a is never
+ * written, perm is rewritten whole). LOGOS_ARGSORT_SEQ=1: always the one-thread radix; logos_twist_last(42): parallel argsorts done. */
+#ifndef AS_BITS
+#define AS_BITS 12
+#endif
+typedef struct {
+    const double *a; size_t n, lo, hi; int sh, nb; uint64_t mask;      /* mask: the smallest key (the cells' origin) */
+    uint64_t orv, andv;                                               /* phase 0: this chunk's largest and smallest key */ size_t *cnt, *off; uint64_t *k1; uint32_t *i1, *perm;
+    atomic_size_t *next; const size_t *bstart; atomic_int *fail; int phase;
+} asw_t;
+static void as_bucket(asw_t *w, size_t s, size_t e, uint64_t **ksp, uint32_t **isp, size_t *cap) {
+    uint64_t *k = w->k1 + s; uint32_t *ix = w->i1 + s, *out = w->perm + s; size_t len = e - s;
+    if (len == 1) { out[0] = ix[0]; return; }
+    uint64_t orv = 0, andv = ~0ULL; for (size_t i = 0; i < len; i++) { orv |= k[i]; andv &= k[i]; }
+    uint64_t diff = orv ^ andv;
+    if (!diff) { memcpy(out, ix, len * sizeof(uint32_t)); return; }      /* one value: the partition already left its indices in order */
+    if (len <= 48) {                                                     /* stable insertion on the pairs */
+        for (size_t i = 1; i < len; i++) { uint64_t kk = k[i]; uint32_t ii = ix[i]; size_t q = i; while (q && k[q - 1] > kk) { k[q] = k[q - 1]; ix[q] = ix[q - 1]; q--; } k[q] = kk; ix[q] = ii; }
+        memcpy(out, ix, len * sizeof(uint32_t)); return;
+    }
+    if (*cap < len) {
+        free(*ksp); free(*isp); *cap = 0;
+        *ksp = malloc(len * sizeof(uint64_t)); *isp = malloc(len * sizeof(uint32_t));
+        if (!*ksp || !*isp) { free(*ksp); free(*isp); *ksp = NULL; *isp = NULL; atomic_store(w->fail, 1); return; }
+        *cap = len;
+    }
+    uint64_t *ks = k, *kd = *ksp; uint32_t *is = ix, *id = *isp;
+    for (int p = 0; p < 8; p++) {
+        int sh = p * 8; if (((diff >> sh) & 0xff) == 0) continue;
+        size_t c[257]; memset(c, 0, sizeof c);
+        for (size_t i = 0; i < len; i++) c[((ks[i] >> sh) & 0xff) + 1]++;
+        for (int b = 0; b < 256; b++) c[b + 1] += c[b];
+        for (size_t i = 0; i < len; i++) { size_t b = (ks[i] >> sh) & 0xff, pos = c[b]++; kd[pos] = ks[i]; id[pos] = is[i]; }
+        { uint64_t *t = ks; ks = kd; kd = t; } { uint32_t *t = is; is = id; id = t; }
+    }
+    memcpy(out, is, len * sizeof(uint32_t));
+}
+static void *as_worker(void *p) {
+    asw_t *w = p; const double *a = w->a;
+    if (w->phase == 0) {                                                 /* which key bits vary */
+        uint64_t mn = ~0ULL, mx = 0;
+        for (size_t i = w->lo; i < w->hi; i++) { uint64_t k = total_key(a[i]); mn = k < mn ? k : mn; mx = k > mx ? k : mx; }
+        w->orv = mx; w->andv = mn;
+    } else if (w->phase == 1) {                                          /* this chunk's histogram */
+        size_t *c = w->cnt; int sh = w->sh; uint64_t k0 = w->mask;
+        for (size_t i = w->lo; i < w->hi; i++) c[(total_key(a[i]) - k0) >> sh]++;
+    } else if (w->phase == 2) {                                          /* this chunk's pairs to their buckets, in order */
+        size_t *o = w->off; int sh = w->sh; uint64_t k0 = w->mask; uint64_t *k1 = w->k1; uint32_t *i1 = w->i1;
+        for (size_t i = w->lo; i < w->hi; i++) { uint64_t k = total_key(a[i]); size_t pos = o[(k - k0) >> sh]++; k1[pos] = k; i1[pos] = (uint32_t)i; }
+    } else {                                                             /* buckets, claimed 16 at a time */
+        uint64_t *ks = NULL; uint32_t *is = NULL; size_t cap = 0, b0;
+        while ((b0 = atomic_fetch_add(w->next, 16)) < (size_t)w->nb && !atomic_load_explicit(w->fail, memory_order_relaxed))
+            for (size_t b = b0; b < b0 + 16 && b < (size_t)w->nb; b++) { size_t s = w->bstart[b], e = w->bstart[b + 1]; if (e > s) as_bucket(w, s, e, &ks, &is, &cap); }
+        free(ks); free(is);
+    }
+    return NULL;
+}
+/* the one-thread radix, as logos_argsort_f64 (logos_extra.c) has it: kept here so that this file links on its own (the paired
+   benches link engine copies without logos_extra.c, and a call across broke every one of them the day this entry was added) */
+static const double *g_as_arr;
+static int as_cmp(const void *x, const void *y) {
+    uint32_t i = *(const uint32_t *)x, j = *(const uint32_t *)y; uint64_t a = total_key(g_as_arr[i]), b = total_key(g_as_arr[j]);
+    return a < b ? -1 : a > b ? 1 : i < j ? -1 : i > j;
+}
+static void as_seq(const double *a, size_t n, uint32_t *perm) {
+    for (size_t i = 0; i < n; i++) perm[i] = (uint32_t)i;
+    if (n < 2) return;
+    uint64_t *k0 = malloc(n * 8), *k1 = malloc(n * 8); uint32_t *i1 = malloc(n * 4);
+    if (!k0 || !k1 || !i1) { free(k0); free(k1); free(i1); g_as_arr = a; qsort(perm, n, 4, as_cmp); return; }   /* no memory: slow, and not reentrant, as the original */
+    uint64_t orv = 0, andv = ~0ULL;
+    for (size_t i = 0; i < n; i++) { uint64_t k = total_key(a[i]); k0[i] = k; orv |= k; andv &= k; }
+    uint64_t diff = orv ^ andv, *ks = k0, *kd = k1; uint32_t *is = perm, *id = i1;
+    for (int p = 0; p < 8; p++) {
+        int sh = p * 8; if (((diff >> sh) & 0xff) == 0) continue;
+        size_t c[257]; memset(c, 0, sizeof c);
+        for (size_t i = 0; i < n; i++) c[((ks[i] >> sh) & 0xff) + 1]++;
+        for (int b = 0; b < 256; b++) c[b + 1] += c[b];
+        for (size_t i = 0; i < n; i++) { size_t b = (ks[i] >> sh) & 0xff, pos = c[b]++; kd[pos] = ks[i]; id[pos] = is[i]; }
+        { uint64_t *t = ks; ks = kd; kd = t; } { uint32_t *t = is; is = id; id = t; }
+    }
+    if (is != perm) memcpy(perm, is, n * 4);
+    free(k0); free(k1); free(i1);
+}
+void logos_argsort_f64_mt(const double *a, size_t n, uint32_t *perm, int nthreads) {
+    if (!a || !perm || n == 0) return;
+    if (n < 2) { perm[0] = 0; return; }
+    {   size_t i = 1; uint64_t pk = total_key(a[0]);                     /* the prescan: in key order already -> the identity */
+        for (; i < n; i++) { uint64_t k = total_key(a[i]); if (k < pk) break; pk = k; }
+        if (i == n) { for (size_t q = 0; q < n; q++) perm[q] = (uint32_t)q; return; }
+    }
+    int P = effective_threads(n, nthreads < 1 ? 1 : nthreads);
+    if (P < 2 || n < 200000 || n > 0xFFFFFFFFull || getenv("LOGOS_ARGSORT_SEQ")) { as_seq(a, n, perm); return; }
+    asw_t *w = calloc((size_t)P, sizeof *w); pthread_t *th = malloc((size_t)P * sizeof *th);
+    uint64_t *k1 = malloc(n * sizeof(uint64_t)); uint32_t *i1 = malloc(n * sizeof(uint32_t));
+    size_t *cnt = NULL, *bstart = NULL; int done = 0;
+    if (w && th && k1 && i1) {
+        size_t chunk = (n + (size_t)P - 1) / (size_t)P; atomic_int fail; atomic_init(&fail, 0); atomic_size_t next; atomic_init(&next, 0);
+        for (int t = 0; t < P; t++) { w[t].a = a; w[t].n = n; w[t].lo = (size_t)t * chunk < n ? (size_t)t * chunk : n; w[t].hi = w[t].lo + chunk < n ? w[t].lo + chunk : n;
+            w[t].k1 = k1; w[t].i1 = i1; w[t].perm = perm; w[t].fail = &fail; w[t].next = &next; w[t].phase = 0; }
+        par_run(th, P, as_worker, w, sizeof w[0], 1);
+        uint64_t kmx = 0, kmn = ~0ULL; for (int t = 0; t < P; t++) { if (w[t].lo < w[t].hi) { kmx = w[t].orv > kmx ? w[t].orv : kmx; kmn = w[t].andv < kmn ? w[t].andv : kmn; } }
+        uint64_t diff = kmx - kmn;                                        /* cells of equal width in KEY space from the smallest key: raw key bits
+                                                                             put a column that straddles 1.0 (every exponent bit varies) into ~30 buckets */
+        if (!diff) { for (size_t q = 0; q < n; q++) perm[q] = (uint32_t)q; done = 1; }   /* cannot be reached past the prescan; kept for the arithmetic below */
+        else {
+            int asb = AS_BITS; { const char *e = getenv("LOGOS_AS_BITS"); if (e) { int v = atoi(e); if (v >= 4 && v <= 16) asb = v; } }
+            int h = 63 - __builtin_clzll(diff), bits = h + 1 < asb ? h + 1 : asb, sh = h + 1 - bits, nb = (int)(diff >> sh) + 1;
+            cnt = calloc((size_t)P * (size_t)nb, sizeof(size_t)); bstart = malloc(((size_t)nb + 1) * sizeof(size_t));
+            if (cnt && bstart) {
+                for (int t = 0; t < P; t++) { w[t].sh = sh; w[t].nb = nb; w[t].mask = kmn; w[t].cnt = cnt + (size_t)t * (size_t)nb; w[t].off = w[t].cnt; w[t].bstart = bstart; w[t].phase = 1; }
+                par_run(th, P, as_worker, w, sizeof w[0], 1);
+                size_t acc = 0;                                           /* bucket starts; each thread's counts become its write offsets, in thread order (stable) */
+                for (int b = 0; b < nb; b++) { bstart[b] = acc; for (int t = 0; t < P; t++) { size_t c = cnt[(size_t)t * (size_t)nb + (size_t)b]; cnt[(size_t)t * (size_t)nb + (size_t)b] = acc; acc += c; } }
+                bstart[nb] = acc;
+                if (acc == n) {
+                    for (int t = 0; t < P; t++) w[t].phase = 2;
+                    par_run(th, P, as_worker, w, sizeof w[0], 1);
+                    for (int t = 0; t < P; t++) w[t].phase = 3;
+                    par_run(th, P, as_worker, w, sizeof w[0], 1);
+                    if (!atomic_load(&fail)) { done = 1; atomic_fetch_add_explicit(&g_argsort_par, 1, memory_order_relaxed); }
+
+                }
+            }
+        }
+    }
+    free(w); free(th); free(k1); free(i1); free(cnt); free(bstart);
+    if (!done) as_seq(a, n, perm);                            /* no memory somewhere: the one-thread radix, which has its own fallback */
 }

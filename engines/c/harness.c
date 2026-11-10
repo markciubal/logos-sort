@@ -933,6 +933,248 @@ static int nsstrand_checks(void) {
     printf("  strand gate: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
     return fails;
 }
+/* ---- the unstructured partition's thread boost (2026-11-09, FINDINGS 3bz): from 300,000 elements an unstructured array that
+ * reaches the partition takes one thread per 25,000 elements instead of one per 100,000 (logos_twist_last(39) counts it); ordered
+ * and repeating data, one thread, a request the policy already grants, a smaller array and LOGOS_BOOST_PER=1 must not. ---- */
+enum { B_UNIFORM, B_HEAVY, B_GAUSS, B_CLUSTER, B_BLOCKS, B_SAW, B_FEW, B_NEAR, B_UNIFORM_NAN };
+static __attribute__((noinline)) int boost_gen(int kind, double *a, size_t n) {
+    switch (kind) {
+    case B_UNIFORM: case B_UNIFORM_NAN: for (size_t i = 0; i < n; i++) a[i] = frand(); break;
+    case B_HEAVY: for (size_t i = 0; i < n; i++) a[i] = exp(10.0 * frand()) * (frand() < 0.5 ? -1.0 : 1.0); break;
+    case B_GAUSS: for (size_t i = 0; i < n; i++) { double u = frand() + 1e-300, v = frand(); a[i] = sqrt(-2.0 * log(u)) * cos(6.283185307179586 * v); } break;
+    case B_CLUSTER: for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 64) * 100.0 + frand() * 0.01; break;
+    case B_BLOCKS: { size_t B = 64, L = n / B; for (size_t i = 0; i < n; i++) { size_t b = i / L < B ? i / L : B - 1; a[i] = (double)(((b * 37) % B) * L + (i - b * L)) + 0.25; } break; }
+    case B_SAW: { size_t L = n / 64; for (size_t i = 0; i < n; i++) a[i] = (double)(i % L) + (double)(i / L) * 1e-7; break; }
+    case B_FEW: for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 5); break;
+    default: for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.5;
+             for (size_t q = 0; q < n / 100; q++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; } break;
+    }
+    if (kind == B_UNIFORM_NAN) { a[n - 1] = NAN; return 1; }
+    return 0;
+}
+static int boost_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    struct { const char *what; int kind; size_t n; int P; const char *env; int e39; } rows[] = {   /* e39: 1 must fire, 0 must not, -1 either */
+        { "uniform, 8 threads asked, the policy gives 4", B_UNIFORM, 400003, 8, NULL, 1 },
+        { "uniform at 1M, 14 asked, the policy gives 10", B_UNIFORM, 1000003, 14, NULL, 1 },
+        { "heavy tail", B_HEAVY, 400003, 8, NULL, 1 },
+        { "gaussian", B_GAUSS, 400003, 8, NULL, 1 },
+        { "64 thin clusters", B_CLUSTER, 500003, 8, NULL, 1 },
+        { "uniform, LOGOS_BOOST_PER=1: off", B_UNIFORM, 400003, 8, "LOGOS_BOOST_PER", 0 },
+        { "uniform under the 300,000 floor", B_UNIFORM, 290003, 8, NULL, 0 },
+        { "uniform, 4 threads asked and granted: nothing to add", B_UNIFORM, 400003, 4, NULL, 0 },
+        { "uniform, one thread", B_UNIFORM, 400003, 1, NULL, 0 },
+        { "64 shuffled sorted blocks: a structured route", B_BLOCKS, 400003, 8, NULL, 0 },
+        { "a sawtooth: ordered, the partition without the boost", B_SAW, 400003, 8, NULL, 0 },
+        { "five values: a counting route", B_FEW, 400003, 8, NULL, 0 },
+        { "sorted + 1% swaps: the near-sorted route", B_NEAR, 400003, 8, NULL, 0 },
+        { "uniform with a NaN at the end: a permutation either way", B_UNIFORM_NAN, 400003, 8, NULL, -1 },
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n;
+        double *a = malloc(n * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!a || !bi || !bo) { free(a); free(bi); free(bo); printf("  thread boost: skipped a row (no memory)\n"); continue; }
+        seed(27100 + r);
+        int nan = boost_gen(rows[r].kind, a, n);
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "1", 1);
+        (void)logos_twist_last(39);
+        logos_sort_f64(a, n, rows[r].P);
+        size_t boosted = logos_twist_last(39);
+        if (rows[r].env) unsetenv(rows[r].env);
+        int ok = 1; if (!nan) for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  thread boost, %s (n=%zu, P=%d): not a sorted permutation of the input's bits\n", rows[r].what, n, rows[r].P); }
+#if !defined(LOGOS_NO_SODO) && !defined(LOGOS_NO_THREAD_POLICY)
+        if (rows[r].e39 >= 0) { checks++; asserted++;
+            if ((boosted > 0) != rows[r].e39) { fails++; printf("  FAIL  thread boost, %s (n=%zu, P=%d): the boost %s\n", rows[r].what, n, rows[r].P, boosted ? "fired" : "did not fire"); } }
+#else
+        (void)boosted;
+#endif
+        free(a); free(bi); free(bo);
+    }
+    printf("  thread boost: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- the sequential hash map's cap (2026-11-10, FINDINGS 3ca): a map let in on a Chao1 estimate above 128 gives up at
+ * MC_HASH_SEQ_CAP distinct values (logos_twist_last(40) counts it) and the sort goes on to the leaf; a map that stays under the
+ * cap finishes, and LOGOS_MC_SEQCAP=0 restores the uncapped map. Whole numbers with a long tail are the shape: the sample of
+ * 384 sees a few hundred values and the array holds tens of thousands. ---- */
+static size_t mccap_zipf(size_t V) { double k = exp(frand() * log((double)V + 1.0)) - 1.0; size_t z = (size_t)k; return z >= V ? V - 1 : z; }
+static int mccap_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    struct { const char *what; size_t V, n; int P; const char *env; int e40; double scale; } rows[] = {   /* e40: 1 must give up, 0 must not, -1 either */
+        { "42,000 codes, long tail, 100,000 elements (the estimate decides whether the map is tried)", 42000, 100003, 1, NULL, -1, 1.0 },
+        { "42,000 codes, 200,000 elements", 42000, 200003, 1, NULL, 1, 1.0 },
+        { "the same, LOGOS_MC_SEQCAP=0: the uncapped map", 42000, 100003, 1, "LOGOS_MC_SEQCAP", 0, 1.0 },
+        { "3,000 codes: the map stays under the cap", 3000, 100003, 1, NULL, 0, 1.0 },
+        { "3,000 half-integers", 3000, 150003, 1, NULL, 0, 0.5 },
+        { "42,000 codes at two threads", 42000, 250003, 2, NULL, -1, 1.0 },
+        { "42,000 codes at eight threads: the other gate", 42000, 900003, 8, NULL, 0, 1.0 },
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n, V = rows[r].V;
+        double *a = malloc(n * sizeof(double)), *tab = malloc(V * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!a || !tab || !bi || !bo) { free(a); free(tab); free(bi); free(bo); printf("  hash map cap: skipped a row (no memory)\n"); continue; }
+        seed(27300 + r);
+        for (size_t k = 0; k < V; k++) tab[k] = (double)(501 + (nextr() % 99450)) * rows[r].scale;
+        for (size_t i = 0; i < n; i++) a[i] = tab[mccap_zipf(V)];
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "0", 1);
+        (void)logos_twist_last(40);
+        logos_sort_f64(a, n, rows[r].P);
+        size_t capped = logos_twist_last(40);
+        if (rows[r].env) unsetenv(rows[r].env);
+        int ok = 1; for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  hash map cap, %s (n=%zu, P=%d): not a sorted permutation of the input's bits\n", rows[r].what, n, rows[r].P); }
+#if !defined(LOGOS_NO_SODO)
+        if (rows[r].e40 >= 0) { checks++; asserted++;
+            if ((capped > 0) != rows[r].e40) { fails++; printf("  FAIL  hash map cap, %s (n=%zu, P=%d): the map %s\n", rows[r].what, n, rows[r].P, capped ? "gave up at the cap" : "did not give up"); } }
+#else
+        (void)capped;
+#endif
+        free(a); free(tab); free(bi); free(bo);
+    }
+    printf("  hash map cap: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- heavy values counted in the histogram-free scatter (2026-11-10, FINDINGS 3ca): a value holding more than a bucket's region
+ * used to make the partition decline; now the sample's heavy values are counted per thread and filled in (logos_twist_last(41)
+ * counts the partitions that did). Rows: Zipf codes, one 10% value, a heavy +0.0 beside -0.0, a NaN, the switch, the view. ---- */
+enum { HV_ZIPF, HV_ONE10, HV_ZERO, HV_ZIPF_NAN, HV_UNIFORM, HV_TWO };
+static int hv_gen(int kind, double *a, size_t n) {
+    switch (kind) {
+    case HV_ZIPF: case HV_ZIPF_NAN: { enum { V = 42000 }; double *tab = malloc(V * sizeof(double)); if (!tab) { for (size_t i = 0; i < n; i++) a[i] = frand(); return 0; }
+        for (size_t k = 0; k < V; k++) tab[k] = floor(frand() * 2147483648.0);
+        for (size_t i = 0; i < n; i++) a[i] = tab[mccap_zipf(V)];
+        free(tab); if (kind == HV_ZIPF_NAN) { a[n / 3] = NAN; return 1; } return 0; }
+    case HV_ONE10: for (size_t i = 0; i < n; i++) a[i] = frand() < 0.10 ? 0.4375 : frand(); return 0;
+    case HV_ZERO: for (size_t i = 0; i < n; i++) { double u = frand(); a[i] = u < 0.08 ? 0.0 : u < 0.085 ? -0.0 : frand() * 2.0 - 1.0; } return 0;
+    case HV_TWO: for (size_t i = 0; i < n; i++) { double u = frand(); a[i] = u < 0.07 ? 1.0 : u < 0.14 ? nextafter(1.0, 2.0) : frand() * 2.0; } return 0;   /* two heavy values that share a bucket */
+    default: for (size_t i = 0; i < n; i++) a[i] = frand(); return 0;
+    }
+}
+static int heavy_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    struct { const char *what; int kind; size_t n; int P; const char *env; int e41; int view; } rows[] = {   /* e41: 1 must count heavy values, 0 must not, -1 either */
+        { "Zipf codes, 8 threads", HV_ZIPF, 3000003, 8, NULL, 1, 0 },
+        { "Zipf codes, 14 threads", HV_ZIPF, 5000003, 14, NULL, 1, 0 },
+        { "Zipf codes, LOGOS_NO_HFHEAVY=1: the old decline", HV_ZIPF, 3000003, 8, "LOGOS_NO_HFHEAVY", 0, 0 },
+        { "one value holding 10%", HV_ONE10, 2000003, 8, NULL, 1, 0 },
+        { "a heavy +0.0 beside -0.0", HV_ZERO, 2000003, 8, NULL, 1, 0 },
+        { "two heavy neighbours in one bucket", HV_TWO, 2000003, 8, NULL, 1, 0 },
+        { "Zipf codes with a NaN: a permutation", HV_ZIPF_NAN, 3000003, 8, NULL, -1, 0 },
+        { "uniform: nothing heavy", HV_UNIFORM, 2000003, 8, NULL, 0, 0 },
+        { "Zipf codes, one thread", HV_ZIPF, 1000003, 1, NULL, 0, 0 },
+        { "Zipf codes through the lazy view", HV_ZIPF, 3000003, 8, NULL, -1, 1 },
+        { "one 10% value through the lazy view", HV_ONE10, 2000003, 8, NULL, -1, 1 },
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        size_t n = rows[r].n;
+        double *a = malloc(n * sizeof(double)), *ref = malloc(n * sizeof(double)); uint64_t *bi = malloc(n * sizeof(uint64_t)), *bo = malloc(n * sizeof(uint64_t));
+        if (!a || !ref || !bi || !bo) { free(a); free(ref); free(bi); free(bo); printf("  heavy values: skipped a row (no memory)\n"); continue; }
+        seed(27500 + r);
+        int nan = hv_gen(rows[r].kind, a, n);
+        memcpy(bi, a, n * sizeof(double)); qsort(bi, n, sizeof(uint64_t), cmp_bits);
+        if (rows[r].env) setenv(rows[r].env, "1", 1);
+        (void)logos_twist_last(41);
+        int ok = 1;
+        if (rows[r].view) {
+            memcpy(ref, a, n * sizeof(double)); qsort(ref, n, sizeof(double), cmp_d);
+            logos_view *v = logos_view_create_f64(a, n, rows[r].P);
+            if (!v) ok = 0;
+            else {
+                size_t ks[6] = { 0, n / 7, n / 3, n / 2, (2 * n) / 3, n - 1 };
+                for (int i = 0; ok && i < 6; i++) ok = logos_view_at(v, ks[i]) == ref[ks[i]];
+                ok = ok && logos_view_rank(v, ref[n / 2]) == lb_d(ref, n, ref[n / 2]);
+                logos_view_all(v); logos_view_free(v);
+            }
+        } else logos_sort_f64(a, n, rows[r].P);
+        size_t heavy = logos_twist_last(41);
+        if (rows[r].env) unsetenv(rows[r].env);
+        if (!nan) for (size_t q = 1; q < n; q++) if (a[q] < a[q - 1]) { ok = 0; break; }
+        memcpy(bo, a, n * sizeof(double)); qsort(bo, n, sizeof(uint64_t), cmp_bits);
+        if (memcmp(bi, bo, n * sizeof(uint64_t))) ok = 0;
+        checks++; if (!ok) { fails++; printf("  FAIL  heavy values, %s (n=%zu, P=%d): not a sorted permutation of the input's bits\n", rows[r].what, n, rows[r].P); }
+#if !defined(LOGOS_NO_SODO) && !defined(LOGOS_NO_HISTFREE)
+        if (rows[r].e41 >= 0) { checks++; asserted++;
+            if ((heavy > 0) != rows[r].e41) { fails++; printf("  FAIL  heavy values, %s (n=%zu, P=%d): the scatter %s\n", rows[r].what, n, rows[r].P, heavy ? "counted heavy values" : "counted none"); } }
+#else
+        (void)heavy;
+#endif
+        free(a); free(ref); free(bi); free(bo);
+    }
+    printf("  heavy values: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
+
+/* ---- logos_argsort_f64_mt (2026-11-10, FINDINGS 3ca): the SAME permutation as the one-thread radix, bit for bit (it is stable),
+ * on every shape and thread count; logos_twist_last(42) says whether the parallel partition ran. A reference permutation by
+ * qsort on (key, index) checks the one-thread radix itself on the first row of each shape. ---- */
+static const double *g_asref;
+static int cmp_asref(const void *x, const void *y) {
+    uint32_t i = *(const uint32_t *)x, j = *(const uint32_t *)y; uint64_t a, b; memcpy(&a, g_asref + i, 8); memcpy(&b, g_asref + j, 8);
+    a = (a >> 63) ? ~a : (a | 0x8000000000000000ULL); b = (b >> 63) ? ~b : (b | 0x8000000000000000ULL);
+    return a < b ? -1 : a > b ? 1 : i < j ? -1 : i > j;
+}
+enum { AS_UNIFORM, AS_STRADDLE, AS_FEW, AS_ZIPF, AS_SORTED, AS_NEAR, AS_SPECIAL, AS_ONEFAR, AS_ALLEQ, AS_DESC };
+static void as_gen(int kind, double *a, size_t n) {
+    switch (kind) {
+    case AS_UNIFORM: for (size_t i = 0; i < n; i++) a[i] = frand(); break;
+    case AS_STRADDLE: for (size_t i = 0; i < n; i++) a[i] = exp(20.0 * frand() - 10.0) * (frand() < 0.3 ? -1.0 : 1.0); break;   /* both signs, 29 binades around 1.0 */
+    case AS_FEW: for (size_t i = 0; i < n; i++) a[i] = (double)(nextr() % 7) - 3.0; break;
+    case AS_ZIPF: for (size_t i = 0; i < n; i++) a[i] = (double)(mccap_zipf(50000) * 7919 % 1000003); break;
+    case AS_SORTED: for (size_t i = 0; i < n; i++) a[i] = (double)(i / 3); break;                                              /* ascending with ties */
+    case AS_NEAR: for (size_t i = 0; i < n; i++) a[i] = (double)i + 0.5; for (size_t q = 0; q < n / 100; q++) { size_t x = nextr() % n, y = nextr() % n; double t = a[x]; a[x] = a[y]; a[y] = t; } break;
+    case AS_SPECIAL: for (size_t i = 0; i < n; i++) { uint64_t r = nextr() % 100; a[i] = r < 2 ? NAN : r < 4 ? -NAN : r < 6 ? INFINITY : r < 8 ? -INFINITY : r < 14 ? 0.0 : r < 20 ? -0.0 : r < 24 ? 4.9e-324 * (double)(nextr() % 9) : frand() * 2.0 - 1.0; } break;
+    case AS_ONEFAR: for (size_t i = 0; i < n; i++) a[i] = frand(); a[n / 2] = 1e300; a[n / 3] = -1e300; break;                  /* two far values: nearly every element in one cell */
+    case AS_ALLEQ: for (size_t i = 0; i < n; i++) a[i] = 42.0; a[n - 1] = 41.0; break;
+    default: for (size_t i = 0; i < n; i++) a[i] = (double)(n - i); break;
+    }
+}
+static int argsort_mt_checks(void) {
+    int checks = 0, fails = 0, asserted = 0;
+    static const char *names[] = { "uniform", "both signs across 29 binades", "seven values", "Zipf whole numbers", "sorted with ties", "sorted + 1% swaps",
+                                   "NaNs, infinities, signed zeros, subnormals", "two far values", "one value and a smaller last", "descending" };
+    static const size_t ns[] = { 2, 3, 1000, 199999, 200000, 300007, 1500003 }; static const int Ps[] = { 1, 2, 8, 14 };
+    for (int kind = 0; kind < 10; kind++) for (size_t si = 0; si < sizeof ns / sizeof ns[0]; si++) {
+        size_t n = ns[si];
+        double *a = malloc(n * sizeof(double)), *keep = malloc(n * sizeof(double)); uint32_t *ref = malloc(n * 4), *p = malloc(n * 4), *q = malloc(n * 4);
+        if (!a || !keep || !ref || !p || !q) { free(a); free(keep); free(ref); free(p); free(q); printf("  argsort mt: skipped a row (no memory)\n"); continue; }
+        seed(27700 + (uint64_t)kind * 31 + si);
+        as_gen(kind, a, n); memcpy(keep, a, n * sizeof(double));
+        logos_argsort_f64(a, n, ref);
+        if (n <= 300007) {                                               /* the one-thread radix against a plain reference: (key, index) order */
+            for (size_t i = 0; i < n; i++) q[i] = (uint32_t)i;
+            g_asref = a; qsort(q, n, 4, cmp_asref);
+            checks++; if (memcmp(q, ref, n * 4)) { fails++; printf("  FAIL  argsort mt, %s (n=%zu): logos_argsort_f64 is not the stable key order\n", names[kind], n); }
+        }
+        for (size_t pi = 0; pi < sizeof Ps / sizeof Ps[0]; pi++) {
+            memset(p, 0xFF, n * 4);
+            (void)logos_twist_last(42);
+            logos_argsort_f64_mt(a, n, p, Ps[pi]);
+            size_t par = logos_twist_last(42);
+            checks++; if (memcmp(p, ref, n * 4) || memcmp(a, keep, n * sizeof(double))) { fails++; printf("  FAIL  argsort mt, %s (n=%zu, P=%d): not the one-thread radix's permutation, or the keys were written\n", names[kind], n, Ps[pi]); }
+            int must = -1;                                               /* the parallel partition: from 200,000 elements at two threads or more, unless the keys are in order */
+            if (Ps[pi] == 1 || n < 200000 || kind == AS_SORTED) must = 0;
+            else if (n >= 300007) must = 1;
+            if (must >= 0) { checks++; asserted++; if ((par > 0) != must) { fails++; printf("  FAIL  argsort mt, %s (n=%zu, P=%d): the parallel partition %s\n", names[kind], n, Ps[pi], par ? "ran" : "did not run"); } }
+        }
+        if (n == 300007) {                                               /* the switch, and a failed allocation's fallback */
+            setenv("LOGOS_ARGSORT_SEQ", "1", 1); (void)logos_twist_last(42); memset(p, 0xFF, n * 4); logos_argsort_f64_mt(a, n, p, 8); unsetenv("LOGOS_ARGSORT_SEQ");
+            checks += 2; if (memcmp(p, ref, n * 4)) { fails++; printf("  FAIL  argsort mt, %s: LOGOS_ARGSORT_SEQ=1 changed the permutation\n", names[kind]); }
+            if (logos_twist_last(42) && kind != AS_SORTED) { fails++; printf("  FAIL  argsort mt, %s: LOGOS_ARGSORT_SEQ=1 still took the parallel partition\n", names[kind]); }
+        }
+        free(a); free(keep); free(ref); free(p); free(q);
+    }
+    printf("  argsort mt: %d checks (%d of them name what must have happened), %d failures\n", checks, asserted, fails);
+    return fails;
+}
 static int tail_checks(void) {
     int checks = 0, fails = 0;
     const int threads[] = { 1, 4, 4 };              /* the third runs with LOGOS_TAIL_SEQ=1: parallel sorts decline the route */
@@ -3646,7 +3888,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);      /* redirected output is block-buffered: a crash used to eat the last 4 KB and point at the wrong section */
     printf("logos-sort C harness — reference oracle: stdlib qsort\n\n");
     static const section_t S[] = {
-        { "correctness: logos vs qsort", correctness }, { "parity extras", extras_checks }, { "sorted prefix + tail", tail_checks }, { "runs of equal values", rle_checks }, { "cuts: windows in order", cuts_checks }, { "other fields", other_fields_checks }, { "dominant-value route", domroute_checks }, { "half the scratch", half_checks }, { "lattice entry", lat1_checks }, { "strand gate", nsstrand_checks },
+        { "correctness: logos vs qsort", correctness }, { "parity extras", extras_checks }, { "sorted prefix + tail", tail_checks }, { "runs of equal values", rle_checks }, { "cuts: windows in order", cuts_checks }, { "other fields", other_fields_checks }, { "dominant-value route", domroute_checks }, { "half the scratch", half_checks }, { "lattice entry", lat1_checks }, { "strand gate", nsstrand_checks }, { "thread boost", boost_checks }, { "hash map cap", mccap_checks }, { "heavy values", heavy_checks }, { "argsort mt", argsort_mt_checks },
         { "interleaved streams", streams_checks }, { "knot route", knot_checks }, { "twist", twist_checks }, { "linked list", list_checks }, { "gallop", gallop_checks }, { "vector merge", vmerge_checks }, { "mirror", mirror_checks }, { "loop-back", loop_checks }, { "round six", round6_checks }, { "prescan in blocks", prescan_checks }, { "descending ties", desc_tie_checks }, { "short-reach route", reach_checks }, { "key grid", kgrid_checks },
         { "small networks", smallnet_checks }, { "thin front", thin_checks }, { "batch", batch_checks }, { "float32 and lattice vectors", f32lat_checks }, { "in-place partition", ipp_checks }, { "two halves", halves_checks }, { "strings on prefix keys", strings_checks }, { "log-line route", strns_checks }, { "first-partition scan", fuse_checks }, { "low-cardinality vector count", lcvec_checks }, { "parallel prescan", parprescan_checks }, { "mode grid", mdgrid_checks }, { "worker pool", pool_checks }, { "pool trim", trim_checks }, { "IEEE special values", ieee_checks }, { "NaN termination", nan_termination_checks }, { "infinities", infinity_checks }, { "dominant values", dominant_checks },
         { "strict in-place entries", inplace_checks }, { "boundaries", many_and_boundaries }, { "signed zeros", signed_zero_checks },

@@ -35,7 +35,7 @@ make sanitize        # the whole harness under ASan + UBSan + float-cast-overflo
 make tsan            # ... and under ThreadSanitizer
 make faultprobe      # every allocation and thread creation of a cold call failed in turn: 7,894 injected failures, 0 bad
 make scoreboard      # who is fastest: logos, x86-simd-sort, VQSort, IPS4o, std::sort / gnu_parallel; 17 shapes, 1 and 14 threads
-make scale-full      # time against n for every contender and 17 inputs -> ../../reports/scale-report.html
+make scale-full      # time against n for every contender and 33 inputs (26 numeric, 7 string) -> ../../reports/scale-report.html
 make dist            # logos-sort-c-3.6.0.tar.gz
 ```
 
@@ -474,6 +474,12 @@ Three thread policies, all measured (`make scale-full`, `make smallbench`):
 
 - **Global:** at most one thread per 100k elements (`MIN_ELEMS_PER_THREAD`).
   Below ~65k the parallel entry is not used at all.
+- **The unstructured partition (2026-11-09):** from 300k elements, data that no
+  structured route takes and whose sample looks unstructured runs one thread per
+  25k elements (`BOOST_PER`; `LOGOS_BOOST_PER=1` turns it off), with the bucket
+  count the global policy would have used. 1.6-2.0x at 316k, 1.3-1.4x at 500k,
+  1.1x at 1M with 14 threads asked. A lower floor for every route was measured
+  and lost by multiples on ordered data (FINDINGS 3bz).
 - **Relocation:** at most one thread per 500k (`RELOC_MIN_PER_THREAD`). Its
   parallel form has a serial plan and a spawn; at 3.16M six threads beat
   fourteen by 1.7×, at 1M four beat ten.
@@ -498,7 +504,15 @@ elements on the reference box. Results never depend on the thread count.
 ## Scaling: `make scale-full` → scale-report.html
 
 Nineteen sizes from 0 to 5e7 (0, 1, 3, 5, 10, then half-decades from 32, and the
-5e7 ceiling itself) for every shape: one panel per shape for the single-threaded
+5e7 ceiling itself; the default ceiling is 1e7 since 2026-09-23) for every shape — 26
+numeric shapes, thirteen of them (since 2026-11-08) practical columns generated the
+way the real thing comes about (event timestamps in arrival order, prices in cents,
+primary keys after deletions, foreign keys, ZIP codes, ages, a year of sensor
+readings, request latencies, latitudes, log batches appended in order, shard IDs,
+a sorted table with rows appended, order dates), and 7 string shapes (uuids, words,
+urls, logs, paths, emails, ISO-8601 dates); `SHAPE_DOCS` in scalebench.cpp describes
+each and the report's accordion shows it from its own generator. `LOGOS_SCALE_SHAPES=a,b,c`
+runs only the named shapes. One panel per shape for the single-threaded
 sorts (std::sort, logos, logos in-place, x86-simd-sort, IPS⁴o, LSD radix, timsort)
 and one for the parallel sorts (`__gnu_parallel::sort`, logos, logos in-place,
 x86-simd-sort OpenMP, IPS⁴o parallel), never mixing thread counts. Under each
@@ -959,6 +973,12 @@ one element across a size gate must not cost 10% more (`make edgeprobe`).
   `int_wide` is behind (0.86: the int32 radix against a vector quicksort). `sine_slope` at one thread is the worst
   numeric row of the scale report (0.54 at 1M, 0.92 at 10M): a per-level cost of in-place vector quicksort on locally
   ordered input, measured to be the same inside the library's kernel.
+- **At scale three inputs turn** (the 316M run of 2026-11-08, FINDINGS 3bx; none of it visible at 10M): uniform at one
+  thread 0.99 -> 0.87 of x86-simd-sort between 10M and 316M (the in-house kernel grows 25% per element over that range,
+  the library's 10%); reach_mirror 1.44 -> 0.62 (the short-reach gate's finest sample lag is 0.028% of n, 88k positions at
+  316M against a displacement of +-60, so the route cannot fire); strings: logs 2.26 -> 0.92 of the key-value sort at 100M
+  (the log-line route stops paying between 10M and 100M, untraced). IDEAS_LOG 18. The structured routes' cost per element
+  is flat over the same range (quantized 1.70 -> 1.72 ns, block_perm 1.36 -> 1.45), which is why the margins grow with n.
 - **Below 1M at 14 threads the engine loses to IPS4o on 5-8 of 13 shapes** (100k-316k): the thread policy runs one
   thread per 100,000 elements and the per-route caps were set at 1M-3M. The small end below 10k is settled (the thin
   front); the parallel middle is not.

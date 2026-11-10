@@ -1,9 +1,11 @@
 /* scalebench.cpp — time against n for every contender, every shape, at 1 thread and at P.
  *
  * Sizes 0, 1, 3, 5, 10, then half-decade steps 32, 100, ... up to LOGOS_MAX_N (default 1e7, and the ceiling is itself
- * a point), thirteen shapes (nine standard, four from the twist-and-knot rounds), and since 2026-10-11 four STRING shapes
- * (uuids, words, urls, logs: pointers to NUL-terminated strings in strcmp order, bench_strings.h; LOGOS_SCALE_STRINGS=0
- * skips them), each panel naming its own contenders: std::sort / __gnu_parallel::sort and IPS4o with strcmp, logos
+ * a point), twenty-six numeric shapes (nine standard, four from the twist-and-knot rounds, and since 2026-11-08 thirteen
+ * PRACTICAL ones: timestamps, prices, keys, ZIP codes, ages, sensor readings, latencies, coordinates, log batches, shard IDs,
+ * appended rows, order dates; LOGOS_SCALE_SHAPES=a,b,c runs only the named shapes), and since 2026-10-11 STRING shapes (uuids,
+ * words, urls, logs, and since 2026-11-08 paths, emails, dates: pointers to NUL-terminated strings in strcmp order,
+ * bench_strings.h; LOGOS_SCALE_STRINGS=0 skips them), each panel naming its own contenders: std::sort / __gnu_parallel::sort and IPS4o with strcmp, logos
  * (logos_sort_strings_mt), x86-simd-sort's key-value sort under the same 8-byte-prefix scheme, and the multikey quicksort
  * logos used before. Single-threaded section: std::sort, logos, logos in-place (no scratch at all), x86-simd-sort
  * (-DHAVE_XSS, OpenMP threads set to 1), Google's VQSort from the Highway library (-DHAVE_VQSORT, since 2026-11-05: one thread
@@ -25,7 +27,9 @@
  * Also: dashed O(n) and O(n log n) reference curves anchored at logos's largest visible point, each series'
  * empirical exponent (least-squares slope of log t vs log n over n >= 1e5), tables of both quantities, and
  * the calibration line. Build: make scalebench (no deps) or make scale-full (both opponents).
- * Overrides: LOGOS_MAX_N, LOGOS_MIN_N (10000 restores the old ladder), LOGOS_THREADS, LOGOS_MAX_SEC.
+ * Overrides: LOGOS_MAX_N, LOGOS_MIN_N (10000 restores the old ladder), LOGOS_THREADS, LOGOS_MAX_SEC (the per-sort budget, 20 s;
+ * a shape stops once std::sort at one thread passes half of it, so a ladder to 1e9 needs ~600), LOGOS_STR_MAX_N (the strings'
+ * own ceiling), LOGOS_SCALE_MEM_MAX_N (the cold-call memory pass's ceiling; both default to LOGOS_MAX_N).
  * LOGOS_SCALE_REUSE=<report.html> re-renders that report's measurements through the current template, measuring nothing. */
 #include "logos_psort.h"
 #include "uplot_embed.h"
@@ -64,6 +68,11 @@
 #include "bench_strings.h"            /* the string shapes and the prefix scheme, shared with stringbench */
 
 struct Rng { uint64_t s; uint64_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; } double f() { return (double)(next() >> 11) / 9007199254740992.0; } };
+static double gauss(Rng &r) { double u = r.f(), v = r.f(); if (u < 1e-300) u = 1e-300; return std::sqrt(-2.0 * std::log(u)) * std::cos(6.283185307179586 * v); }
+static double expo(Rng &r, double mean) { double u = r.f(); if (u > 1.0 - 1e-16) u = 1.0 - 1e-16; return -mean * std::log(1.0 - u); }
+/* a random index with P(k) proportional to 1/(k+1) over V items (Zipf with exponent 1, the usual popularity law): the rank is
+   log-uniform. Customers, ZIP codes, cities, words: the first few take most of the draws, most are drawn once or never. */
+static size_t zipf_rank(Rng &r, size_t V) { double k = std::exp(r.f() * std::log((double)V + 1.0)) - 1.0; size_t z = (size_t)k; return z >= V ? V - 1 : z; }
 static double nowms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 static void gen_blocks(std::vector<double> &a, Rng &r, size_t nb, int overlap_every) {
@@ -94,8 +103,69 @@ static std::vector<double> gen(const std::string &shape, size_t n, uint64_t seed
     else if (shape == "block_kinked") { gen_blocks(a, r, 64, 0); if (n >= 4) for (size_t k = 0; k < n / 100; k++) { size_t x = 2 * (r.next() % (n / 2)); if (x + 1 < n) std::swap(a[x], a[x + 1]); } }
     else if (shape == "sine_slope") { double T = (double)n / 32.0, A = 0.6 * T / 2.0; for (size_t i = 0; i < n; i++) a[i] = (double)i + A * std::sin(6.283185307179586 * (double)i / T) + (r.f() * 2.0 - 1.0) * 50.0; }
     else if (shape == "reach_mirror") { for (size_t i = 0; i < n; i++) a[i] = (double)i + (r.f() * 2.0 - 1.0) * 60.0; std::reverse(a.begin(), a.end()); }
+    /* 2026-11-08, THE PRACTICAL SHAPES: data people actually sort, each named for what it is and generated the way the real
+       thing comes about (a Poisson event stream with network latency, log-normal prices rounded to cents, a key column after
+       deletions, a population pyramid, a year of readings on a 0.1-degree gauge, batches appended as they close). Where the real
+       thing has an absolute scale (milliseconds of latency, a day of ZIP codes, 200 cities) the shape keeps it, so at small n it
+       is relatively noisier, as the report's shape notes say of the older absolute-unit shapes; where it is a proportion (10%
+       deleted, 5% appended, 64 batches) it scales with n. Every one is deterministic in (shape, n, seed). */
+    else if (shape == "event_times") {           /* a Poisson stream of about one event per ms, each carrying its own send time, in ARRIVAL order (latency ~ exp, mean 50 ms) */
+        std::vector<std::pair<double, double>> ev(n); double t = 0;
+        for (size_t i = 0; i < n; i++) { t += expo(r, 1.0); ev[i] = { t + expo(r, 50.0), t }; }
+        std::sort(ev.begin(), ev.end());
+        for (size_t i = 0; i < n; i++) a[i] = 1.7e12 + std::floor(ev[i].second);           /* epoch milliseconds, whole */
+    }
+    else if (shape == "prices_cents") for (auto &v : a) { double c = std::floor(std::exp(3.5 + 1.3 * gauss(r)) * 100.0 + 0.5); if (c < 1) c = 1; if (c > 1e7) c = 1e7; v = c / 100.0; }
+    else if (shape == "ids_dense") {             /* a table's primary keys after 10% deletions, rows in random order */
+        size_t M = n + n / 9 + 1; std::vector<uint32_t> ids(M); for (size_t k = 0; k < M; k++) ids[k] = (uint32_t)(k + 1);
+        for (size_t k = 0; k < n; k++) std::swap(ids[k], ids[k + r.next() % (M - k)]);
+        for (size_t i = 0; i < n; i++) a[i] = (double)ids[i];
+    }
+    else if (shape == "fk_zipf") {               /* a foreign key: 200,000 customers, popularity Zipf(1), random order */
+        std::vector<double> cust(200000); for (auto &v : cust) v = std::floor(r.f() * 2147483648.0);
+        for (auto &v : a) v = cust[zipf_rank(r, cust.size())];
+    }
+    else if (shape == "zip_codes") {             /* 42,000 of the 5-digit codes 00501..99950, population-ranked, random order */
+        const size_t Z = 42000; std::vector<uint32_t> all(99450); for (size_t k = 0; k < all.size(); k++) all[k] = (uint32_t)(501 + k);
+        for (size_t k = 0; k < Z; k++) std::swap(all[k], all[k + r.next() % (all.size() - k)]);
+        for (auto &v : a) v = (double)all[zipf_rank(r, Z)];
+    }
+    else if (shape == "ages") {                  /* 0..100 from a population pyramid: flat to 50, then thinning to 100 */
+        double cum[101]; double acc = 0; for (int k = 0; k <= 100; k++) { acc += k < 50 ? 1.0 : (101.0 - k) / 51.0; cum[k] = acc; }
+        for (auto &v : a) { double u = r.f() * acc; v = (double)(std::upper_bound(cum, cum + 101, u) - cum); if (v > 100) v = 100; }
+    }
+    else if (shape == "sensor_temps") {          /* a year of readings in time order: a seasonal cycle, 365 daily cycles, noise, a 0.1-degree gauge */
+        for (size_t i = 0; i < n; i++) { double t = (double)i / (double)(n ? n : 1);
+            double T = 12.0 - 10.0 * std::cos(6.283185307179586 * t) + 4.0 * std::sin(6.283185307179586 * 365.0 * t) + 0.7 * gauss(r);
+            a[i] = std::round(T * 10.0) / 10.0; }
+    }
+    else if (shape == "latencies_us") for (auto &v : a) { double x = std::floor(std::exp(7.6 + 1.0 * gauss(r))); if (x < 1) x = 1; if (x > 6e7) x = 6e7; v = x; }
+    else if (shape == "geo_lat") {               /* latitudes clustered around 200 cities of Zipf popularity, 5% scattered, to a millionth of a degree */
+        double cx[200], cw[200], cum[200]; double acc = 0;
+        for (int c = 0; c < 200; c++) { cx[c] = -60.0 + 130.0 * r.f(); cw[c] = 0.05 + 2.0 * r.f() * r.f(); acc += 1.0 / (c + 1); cum[c] = acc; }
+        for (auto &v : a) { double x;
+            if (r.f() < 0.05) x = -60.0 + 130.0 * r.f();
+            else { double u = r.f() * acc; int c = (int)(std::upper_bound(cum, cum + 200, u) - cum); if (c > 199) c = 199; x = cx[c] + cw[c] * gauss(r); }
+            if (x < -90) x = -90; if (x > 90) x = 90; v = std::floor(x * 1e6 + 0.5) / 1e6; }
+    }
+    else if (shape == "log_batches") {           /* 64 sorted batches appended IN ORDER as they closed, each overlapping the one before by 20% */
+        size_t nb = 64 > n ? (n ? n : 1) : 64, L = (n + nb - 1) / nb;
+        for (size_t i = 0; i < n; i++) { size_t b = i / L; a[i] = (double)b * (double)L * 0.8 + (double)(i % L) + r.f() * 0.5; }
+    }
+    else if (shape == "shard_ids") {             /* 8 shards allot IDs from disjoint ranges; the stream records them in arrival order, shard 0 busiest */
+        double cum[8]; double acc = 0; for (int s = 0; s < 8; s++) { acc += 1.0 / (s + 1); cum[s] = acc; } double ctr[8] = { 0 };
+        for (auto &v : a) { double u = r.f() * acc; int s = (int)(std::upper_bound(cum, cum + 8, u) - cum); if (s > 7) s = 7; v = (double)s * 1073741824.0 + ctr[s]; ctr[s] += 1.0; }
+    }
+    else if (shape == "appended_rows") {         /* a table sorted by its time key, then a day's new rows (5%) appended unsorted */
+        for (auto &v : a) v = 1.7e12 + std::floor(r.f() * 3.15e10);
+        size_t ns = n - n / 20; std::sort(a.begin(), a.begin() + (std::ptrdiff_t)ns);
+    }
+    else if (shape == "order_dates") {           /* order dates as day numbers over ten years (3,653 values), more recent more often, random order */
+        for (auto &v : a) { double d = std::floor(3653.0 * std::sqrt(r.f())); if (d > 3652) d = 3652; v = 16801.0 + d; }
+    }
     return a;
 }
+static bool ylog_shape(const char *s) { return !strcmp(s, "heavy_tail") || !strcmp(s, "latencies_us") || !strcmp(s, "prices_cents"); }
 /* ---- "the shapes": every shape described, and shown from its OWN generator ----
    Built when the report is written, so a LOGOS_SCALE_REUSE re-render carries it too, from the same gen() / gen_strings()
    the timing used (seed 7) at DEMO_N elements: the whole array at DEMO_OV evenly spaced positions, DEMO_W consecutive
@@ -157,6 +227,70 @@ static const ShapeDoc SHAPE_DOCS[] = {
       "a[i] = i + noise uniform in ±60, then the whole array reversed: every element is within about 120 positions of its "
       "place, but the array runs from high to low. Models a newest-first log whose records arrived slightly out of order; a "
       "sort that reads order in one direction only sees chaos." },
+    /* the practical shapes (2026-11-08) */
+    { "event_times", "event timestamps in arrival order: Poisson stream, network latency",
+      "Events are generated as a Poisson stream at about one per millisecond; each is stamped with its own send time (epoch "
+      "milliseconds, 1.7e12 + …) and reaches the log after a latency drawn from an exponential with mean 50 ms, so the array is "
+      "in ARRIVAL order and the values are the send times. Nearly in time order, with every element within a few hundred "
+      "positions of its place; whole milliseconds, so about a third of the values repeat a neighbour's. Sorting a day's "
+      "events by their own timestamp, the most common sort in a log pipeline." },
+    { "prices_cents", "retail prices in dollars and cents, log-normal",
+      "Prices drawn log-normally (median about $33, a long tail to $100,000), rounded to the cent and stored as dollars with "
+      "two decimals (19.99), in random order. A price column of an orders table. Every value lies on a grid of 0.01, which "
+      "a double cannot hold exactly, with roughly a hundred thousand distinct prices; the distribution is skewed, so an even "
+      "division of the value range leaves most of the array in the first few buckets." },
+    { "ids_dense", "primary keys after 10% deletions, rows in random order",
+      "The integers 1 … 1.11n with a random 10% of them missing (deleted rows), one per element, in random order: a table's "
+      "primary key column read in storage order rather than key order. Every value is a distinct integer and the keys span "
+      "barely more than the array's length, so a sort can mark which keys are present and read them back in order without "
+      "comparing anything." },
+    { "fk_zipf", "foreign keys to 200k customers, Zipf popularity",
+      "Each element is a customer ID (a random 31-bit integer) chosen from 200,000 customers with Zipf popularity: the top "
+      "customer appears in about 8% of the rows, the top hundred in two of every five, and most customers appear once or never. "
+      "An orders table's customer_id column in random order: a join key, the most common grouping column in analytics. "
+      "Too many distinct values to count in a small table, heavy repeats, no order." },
+    { "zip_codes", "US ZIP codes, population-weighted, random order",
+      "Five-digit ZIP codes, 42,000 distinct values out of 00501 … 99950, each drawn with Zipf popularity (a few dense urban "
+      "codes dominate), in random order. An address table's postal code column. All integers on a span of 100,000, so a "
+      "sort that counts occurrences of each code in a table of that size finishes in two passes." },
+    { "ages", "ages 0 to 100 from a population pyramid",
+      "Ages in whole years from a population pyramid: flat from 0 to 49, then thinning linearly to 100, in random order. "
+      "101 distinct values, each repeated n/100 times on average: a demographic column that a counting sort finishes in one "
+      "pass, and a comparison sort has to work through ties on." },
+    { "sensor_temps", "a year of temperature readings in time order, 0.1 °C",
+      "T = 12 − 10·cos(seasonal) + 4·sin(daily) + noise, with one seasonal cycle and 365 daily cycles over the array, read on a "
+      "gauge of 0.1 °C and kept in time order. A sensor's history sorted by VALUE, to find percentiles: the values run from "
+      "about −2 to 30 in steps of a tenth, some 330 distinct, and the time order is a wave with hundreds of cycles, which "
+      "looks like noise to a run detector but is an exact grid to a quantization probe." },
+    { "latencies_us", "request latencies in whole microseconds, log-normal",
+      "Request latencies drawn log-normally (median 2 ms, 1% above 20 ms, capped at 60 s), rounded down to whole "
+      "microseconds, in random order. A latency column from a tracing system, the input to every p50 / p99 computation. "
+      "Integers with a heavy tail and over a million distinct values: nothing to count, and an even division of the range "
+      "puts nearly everything in the first bucket." },
+    { "geo_lat", "latitudes clustered around 200 cities",
+      "Latitudes of points: 95% fall around one of 200 cities (centres uniform in −60 … 70, spreads from 0.05 to 2 degrees, "
+      "popularity Zipf), 5% are scattered anywhere, and every value is rounded to a millionth of a degree as a GPS fix is "
+      "written. A location table's latitude column in random order: dense clusters with empty stretches between them, so the "
+      "distribution is lumpy at every scale." },
+    { "log_batches", "64 sorted batches appended in order, each overlapping the last by 20%",
+      "The array is 64 batches of length L = n/64 laid out IN ORDER. Batch b holds the values 0.8·b·L + 0, 1, 2, … plus a "
+      "jitter under 0.5, so every batch is sorted and its value range overlaps the next batch's by a fifth of its length. "
+      "Log segments appended as they close, where each segment's timestamps overlap the next's because writers flush late: "
+      "sorted runs lying in the right order whose seams need merging, nothing else." },
+    { "shard_ids", "IDs allotted by 8 shards from disjoint ranges, in arrival order",
+      "Eight shards each allot IDs in increasing order from their own range (shard s uses s·2³⁰ + 0, 1, 2, …); the array is "
+      "the stream of IDs as they arrived, shard s contributing in proportion to 1/(s+1), so shard 0 is busiest. Eight "
+      "ascending streams interleaved at random, their value ranges disjoint: sorting it is a stable split by shard, with "
+      "nothing to compare inside a shard." },
+    { "appended_rows", "a sorted table with 5% new rows appended unsorted",
+      "Epoch-millisecond timestamps over one year; the first 95% of the array is sorted and the last 5% are new rows "
+      "appended in random order. A table kept sorted by its time key that has taken a day's inserts since it was last sorted: "
+      "the long sorted prefix is already in place, and only the tail needs sorting and merging in." },
+    { "order_dates", "order dates over ten years, recent ones more often",
+      "Order dates as day numbers (days since 1970, 16801 … 20453: 2016 to 2025), drawn with a density that rises linearly "
+      "toward the present, in random order. A date column of an orders table: 3,653 distinct integers, each repeated about "
+      "n/3653 times on average and more often toward the end of the range, so a counting sort over the span finishes in two "
+      "passes." },
     { "strings: uuids", "random UUIDs: all distinct, all 36 characters",
       "UUID-formatted strings, 32 random hex digits in groups of 8-4-4-4-12. Every string is distinct, all have the same "
       "length and the first bytes are already random, so the first 8 bytes nearly settle the order: the easy case for a "
@@ -173,6 +307,20 @@ static const ShapeDoc SHAPE_DOCS[] = {
       "Lines of the form 2026-10-09T14:03:27.512Z host-07 [INFO] word word. Time advances about 1 ms per line, and 5% of the "
       "lines carry a timestamp up to 500 ms older than their neighbours' (late arrivals), so the array is nearly sorted "
       "behind a long shared prefix, the date. Models a server log written from a buffer." },
+    { "strings: paths", "file paths under /home: 20 users, skewed projects and names",
+      "/home/userNN/projects/projNNN/src/<dir>/<name>.c, with the user uniform over 20, the project and directory drawn with "
+      "a heavy head and the file name from 20,000 words. A file index sorted by path. Every string shares the first 10 bytes, "
+      "the next segments repeat heavily, and the order is settled late in the string." },
+    { "strings: emails", "email addresses: skewed local parts, seven webmail domains and a long tail",
+      "Addresses like kari.melto42@gmail.com: a local part from a skewed vocabulary, four in ten dotted and three in ten "
+      "numbered, at a domain drawn with a heavy head (seven webmail providers take most of the rows, then thousands of company "
+      "domains). A user table sorted by address, in random order. The first bytes are the local part, so an 8-byte prefix "
+      "settles most of the order, and the domain hardly matters." },
+    { "strings: dates", "ISO-8601 timestamps as text, random order",
+      "Timestamps written as text, 2021-07-14T09:26:53.589Z, random instants over the ten years from 2016, in random order. "
+      "A date column that was never parsed: fixed width, and because the fields run from year to millisecond its lexicographic "
+      "order IS chronological order. The first 8 bytes (2021-07-) hold only the year and month, 120 distinct values over ten "
+      "years, so a sort on prefixes must go three levels deep." },
 };
 static std::string jstr(const char *s) {          /* a JSON string that is also safe inside a <script> element */
     std::string o = "\"";
@@ -212,6 +360,10 @@ static std::string shape_demos_json() {
             else if (sh == "block_kinked") { for (size_t i = 0; i + 1 < N; i++) if (a[i] > a[i + 1] && (i + 1) % blk) { c = i; hl = { i, i + 1 }; break; } }
             else if (sh == "sine_slope") c = N / 64;          /* half a cycle in: the wave's steepest fall */
             else if (sh == "reach_mirror") c = N / 2;
+            else if (sh == "event_times") { for (size_t i = 0; i + 1 < N; i++) if (a[i] > a[i + 1]) { c = i + 1; hl = { i + 1 }; break; } }   /* the first late arrival */
+            else if (sh == "log_batches") { c = blk; hl = { blk - 1, blk }; }                                                            /* the first seam */
+            else if (sh == "appended_rows") { c = N - N / 20; hl = { c }; }                                                              /* where the tail begins */
+            else if (sh == "sensor_temps") c = N / 730;                                                                                /* midday of day one */
             for (size_t k = 0; k < DEMO_OV; k++) ov[k] = a[k * N / DEMO_OV];
             size_t w0 = c == NONE ? 0 : c >= DEMO_W / 2 ? c - DEMO_W / 2 : 0; if (w0 + DEMO_W > N) w0 = N - DEMO_W;
             win.assign(a.begin() + (std::ptrdiff_t)w0, a.begin() + (std::ptrdiff_t)(w0 + DEMO_W));
@@ -240,7 +392,7 @@ static std::string shape_demos_json() {
         }
         if (o.size() > 1) o += ",";
         o += "{\"shape\":" + jstr(d.shape) + ",\"kind\":\"" + (is_str ? "str" : "num") + "\",\"brief\":" + jstr(d.brief) + ",\"desc\":" + jstr(d.desc);
-        snprintf(t, sizeof t, ",\"n\":%zu,\"step\":%zu,\"ylog\":%s,\"stats\":", N, N / DEMO_OV, !strcmp(d.shape, "heavy_tail") ? "true" : "false");
+        snprintf(t, sizeof t, ",\"n\":%zu,\"step\":%zu,\"ylog\":%s,\"stats\":", N, N / DEMO_OV, ylog_shape(d.shape) ? "true" : "false");
         o += t; o += stats; o += text;
         o += ",\"ov\":" + jnums(ov, is_str ? "%.0f" : "%.6g") + ",\"win\":" + jnums(win, is_str ? "%.0f" : "%.17g") + ",\"hl\":[";
         for (size_t k = 0; k < hl.size(); k++) { snprintf(t, sizeof t, "%s%zu", k ? "," : "", hl[k]); o += t; }
@@ -379,7 +531,25 @@ int main() {
        the cold-call memory pass. LOGOS_MAX_N=5e7 restores the old ceiling when the top of the curve is the point. */
     double max_n = 1e7; if (const char *e = getenv("LOGOS_MAX_N")) { double v = atof(e); if (v >= 1e4) max_n = v; }
     double max_sec = 20; if (const char *e = getenv("LOGOS_MAX_SEC")) { double v = atof(e); if (v > 0) max_sec = v; }
-    const char *shapes[] = { "uniform", "near_sorted", "few_distinct", "heavy_tail", "bimodal", "quantized", "int_wide", "block_perm", "block_overlap", "block_twist", "block_kinked", "sine_slope", "reach_mirror" };
+    /* 2026-11-08, for the run to 1e9: the strings stop at their own ceiling (a string costs ~48 bytes to hold against 8 for a
+       double, and the pool, the pointers, a reference and a copy of 1e9 strings would be ~70 GB), and the cold-call memory
+       pass, which runs EVERY contender once more at every size, stops at its own: per element the figures are flat from
+       10M up, and at 1e9 that pass alone would repeat the three slowest sorts for hours. Both default to the ladder's top. */
+    double str_max_n = max_n; if (const char *e = getenv("LOGOS_STR_MAX_N")) { double v = atof(e); if (v >= 1e4) str_max_n = v; }
+    double mem_max_n = max_n; if (const char *e = getenv("LOGOS_SCALE_MEM_MAX_N")) { double v = atof(e); if (v >= 1e4) mem_max_n = v; }
+    const char *all_shapes[] = { "uniform", "near_sorted", "few_distinct", "heavy_tail", "bimodal", "quantized", "int_wide", "block_perm", "block_overlap", "block_twist", "block_kinked", "sine_slope", "reach_mirror",
+                                 /* the practical shapes, 2026-11-08 (SHAPE_DOCS says what each is) */
+                                 "event_times", "prices_cents", "ids_dense", "fk_zipf", "zip_codes", "ages", "sensor_temps", "latencies_us", "geo_lat", "log_batches", "shard_ids", "appended_rows", "order_dates" };
+    /* LOGOS_SCALE_SHAPES=a,b,c (2026-11-08): only the named shapes, numeric or string ("logs" or "strings: logs"), for a re-run of a
+       few rows or a trace build; unset = all of them */
+    auto wanted = [](const char *name) {
+        const char *e = getenv("LOGOS_SCALE_SHAPES"); if (!e || !*e) return true;
+        const char *nm = strncmp(name, "strings: ", 9) ? name : name + 9; size_t L = strlen(nm);
+        for (const char *p = e; *p; ) { const char *q = strchr(p, ','); size_t l = q ? (size_t)(q - p) : strlen(p);
+            if (l == L && !strncmp(p, nm, L)) return true; if (!q) break; p = q + 1; }
+        return false;
+    };
+    std::vector<const char *> shapes; for (const char *sh : all_shapes) if (wanted(sh)) shapes.push_back(sh);
     double min_n = 0; if (const char *e = getenv("LOGOS_MIN_N")) { double v = atof(e); if (v >= 0) min_n = v; }
     /* 0, 1, 3, 5 and 10 were asked for by hand: the empty call, the single element, and the sizes at which a sort is all
        fixed cost. 32 .. 3162 continue in the ladder's own half-decade steps so that the ns/element curves have no
@@ -389,7 +559,9 @@ int main() {
     for (double n = 1e4; n <= max_n + 1; n *= 3.1622776601683795) { size_t v = (size_t)std::llround(n / 1e3) * 1000; if ((double)v >= min_n) sizes.push_back(v); }
     /* the ceiling is itself a point when the half-decade ladder stops well short of it. At the 1e7 default the ladder
        lands exactly on it (.., 3.16M, 10M) so nothing is appended; at LOGOS_MAX_N=5e7 it adds 50M after 31.6M. */
-    if (!sizes.empty() && (double)sizes.back() < max_n * 0.9 && max_n >= min_n) sizes.push_back((size_t)max_n);
+    /* (and when LOGOS_MIN_N = LOGOS_MAX_N names a size off the ladder, such as 5e7 alone for a trace, the ceiling is the only point:
+       until 2026-11-08 that combination produced "no sizes" and exit 1) */
+    if ((sizes.empty() || (double)sizes.back() < max_n * 0.9) && max_n >= min_n) sizes.push_back((size_t)max_n);
     if (sizes.empty()) { fprintf(stderr, "no sizes between LOGOS_MIN_N and LOGOS_MAX_N\n"); return 1; }
     const char *xss_isa =
 #if defined(HAVE_XSS) && defined(__AVX512F__)
@@ -442,6 +614,9 @@ int main() {
                other output is compared with it. Small n: the batch carries its own per-instance reference. */
             auto T = [&](auto f, bool &ok, bool is_ref) -> double {
                 if (small) return best_small(sm, f, ok, budget);
+                /* the previous contender's output was compared when it returned; holding it through the next copy made the
+                   peak FOUR arrays of n (base, ref, the old output, the fresh copy) where three are needed: 32 GB against 24 at 1e9 */
+                std::vector<double>().swap(o);
                 double t = best_of(base, reps, f, o, budget);
                 if (is_ref) ref.swap(o); else ok &= same(o, ref);
                 return t;
@@ -495,15 +670,17 @@ int main() {
     }
 
     /* ---- strings (2026-10-11): pointers to NUL-terminated strings in strcmp order, the four shapes that span the cases --
-       high-entropy keys (uuids), short keys with heavy duplicates (words), long shared prefixes (urls), nearly in order (logs).
+       high-entropy keys (uuids), short keys with heavy duplicates (words), long shared prefixes (urls), nearly in order (logs) --
+       and since 2026-11-08 three practical columns: file paths, email addresses, ISO-8601 timestamps as text (bench_strings.h).
        Same ladder, same batching below SMALL_N, same verification (std::sort's output, compared as STRINGS). The columns keep
        their colours and take their names from the series: x86-simd-sort cannot sort strings, so its column is its key-value
        sort under the same 8-byte-prefix scheme logos uses (bench_strings.h); the radix column is the multikey quicksort
        logos_sort_strings was until 2026-10-09; timsort and the in-place entry have no string form. LOGOS_SCALE_STRINGS=0 skips. */
-    static const char *sshapes[] = { "uuids", "words", "urls", "logs" };
+    static const char *sshapes[] = { "uuids", "words", "urls", "logs", "paths", "emails", "dates" };
     const bool do_str = !getenv("LOGOS_SCALE_STRINGS") || atoi(getenv("LOGOS_SCALE_STRINGS")) != 0;
     for (const char *ssh : sshapes) {
         if (!do_str) break;
+        if (!wanted(ssh)) continue;
         Series s1{std::string("strings: ") + ssh, 1, {}}, sp{std::string("strings: ") + ssh, P, {}};
         s1.str = sp.str = ssh;
         s1.names = { "std::sort (strcmp)", "logos", std::string("x86-simd-sort ") + xss_isa + " key-value, on 8-byte prefixes", "IPS\\u2074o (strcmp)", "multikey quicksort (logos before 2026-10-09)", "", "", "VQSort (Google) key-value, on 8-byte prefixes" };
@@ -515,7 +692,7 @@ int main() {
                             "std::sort, __gnu_parallel::sort and IPS\\u2074o compare with strcmp. Every output is checked against std::sort's as strings. FINDINGS 3bl.";
         bool over = false;
         for (size_t n : sizes) {
-            if (over) break;
+            if (over || (double)n > str_max_n) break;
             const bool small = n < SMALL_N;
             SmallT<const char *> sm; StrSet S; std::vector<const char *> base;
             if (small) sm = make_small_str(ssh, n); else { S = gen_strings(ssh, n); base = S.p; }
@@ -523,6 +700,7 @@ int main() {
             std::vector<const char *> ref, o;
             auto T = [&](auto f, bool &ok, bool is_ref) -> double {
                 if (small) return best_small(sm, f, ok, budget);
+                std::vector<const char *>().swap(o);   /* as in the numeric loop: three arrays of n at the peak, not four */
                 double t = best_of(base, reps, f, o, budget);
                 if (is_ref) ref.swap(o); else ok &= same(o, ref);
                 return t;
@@ -656,7 +834,7 @@ int main() {
             omp_set_num_threads(s.threads);
             for (size_t ri = 0; ri < s.rows.size(); ri++) {
                 Row &r = s.rows[ri];
-                if (r.n < (size_t)SMALL_N) continue;
+                if (r.n < (size_t)SMALL_N || (double)r.n > mem_max_n) continue;
                 const int P2 = s.threads;
                 if (s.str) {                                 /* bytes per STRING: the pointer array is filled before arming, the pool too */
                     StrSet S = gen_strings(s.str, r.n); std::vector<const char *> sw(r.n);
@@ -721,7 +899,7 @@ int main() {
 #else
         "";
 #endif
-    char meta[600]; snprintf(meta, sizeof meta, "{\"threads\":%d,\"memcpyMs\":%.3f,\"std1mMs\":%.2f,\"maxN\":%.0f,\"xss\":%s,\"xssIsa\":\"%s\",\"vqsort\":%s,\"vqIsa\":\"%s\",\"ips4o\":%s,\"ncpus\":%d,\"smallBelow\":%d,\"measuredAt\":%.0f}", P, memcpy_ms, std1m_ms, max_n,
+    char meta[600]; snprintf(meta, sizeof meta, "{\"threads\":%d,\"memcpyMs\":%.3f,\"std1mMs\":%.2f,\"maxN\":%.0f,\"xss\":%s,\"xssIsa\":\"%s\",\"vqsort\":%s,\"vqIsa\":\"%s\",\"ips4o\":%s,\"ncpus\":%d,\"smallBelow\":%d,\"measuredAt\":%.0f,\"strMaxN\":%.0f,\"memMaxN\":%.0f}", P, memcpy_ms, std1m_ms, max_n,
 #ifdef HAVE_XSS
              "true",
 #else
@@ -739,7 +917,7 @@ int main() {
 #else
              "false",
 #endif
-             logos_num_cpus(), (int)SMALL_N, (double)time(NULL) * 1000.0);
+             logos_num_cpus(), (int)SMALL_N, (double)time(NULL) * 1000.0, str_max_n, mem_max_n);
     meta_s = meta;
     /* WHAT it was measured on, for a reader outside the project: the CPU's model name, the compiler, and the version of each
        opponent that carries one in its headers. Read at measuring time, so a LOGOS_SCALE_REUSE re-render keeps the original's. */
@@ -872,7 +1050,7 @@ pre.cmd{background:var(--surface);border:1px solid var(--grid);border-radius:8px
 <section class="front prose" aria-labelledby="h-why">
 <h2 id="h-why">Where the speed comes from</h2>
 <p>Most of the inputs below have structure that real data often has: logs that arrive nearly in time order, columns with a few distinct values, prices on a grid of cents, shards concatenated out of order. logos detects that from a small sample and takes a route that does less work than any comparison sort can: it counts, places whole runs, or merges only where runs overlap. On those inputs the margin is generally larger at ten million elements than at one million.</p>
-<p>Uniformly random numbers have no structure to use. On one thread logos then runs its own vectorized quicksort, the same design as x86-simd-sort and VQSort, so those rows are a race between kernels; on many threads it splits the values into ranges across all cores and sorts each range. The uniform, heavy_tail and bimodal inputs are that case.</p>
+<p>Uniformly random numbers have no structure to use. On one thread logos then runs its own vectorized quicksort, the same design as x86-simd-sort and VQSort, so those rows are a race between kernels; on many threads it splits the values into ranges across all cores and sorts each range. The uniform, heavy_tail, bimodal and int_wide inputs are that case, and among the practical ones the latencies, the coordinates and the foreign keys.</p>
 <p>The trade is memory. logos often allocates scratch space, where std::sort and the vector quicksorts sort in place; the circles on the detailed charts show the peak heap per element for every sort.</p>
 </section>
 
@@ -975,7 +1153,7 @@ document.getElementById('who').innerHTML=[
  ['--s-base','std::sort','GCC\u2019s standard library sort (introsort); at P threads __gnu_parallel::sort, its OpenMP mode. Every other output is checked against it.',''],
  ['--s-radix','LSD radix, timsort','Two reference implementations written for this benchmark (timsort in green), one thread only.',''],
 ].filter(w=>w[1]!=='VQSort'||META.vqsort).map(w=>`<dt><i class="sw" style="background:var(${w[0]})"></i>${w[1]}</dt><dd>${w[2]}${w[3]?` <a href="${w[3]}" rel="noopener" target="_blank">Source</a>`:''}</dd>`).join('')+
- `<dt>On strings</dt><dd>The vector sorts sort numbers, not text. On the four string inputs they sort the same 8-byte prefix keys logos uses, so those lines compare the kernels under one method. VQSort sorts 16-byte records, so its line also pays to pack and unpack them.</dd>`;
+ `<dt>On strings</dt><dd>The vector sorts sort numbers, not text. On the string inputs they sort the same 8-byte prefix keys logos uses, so those lines compare the kernels under one method. VQSort sorts 16-byte records, so its line also pays to pack and unpack them.</dd>`;
 document.getElementById('method').innerHTML=[
  '<b>Every output is checked</b> against std::sort\u2019s on the same input before its time counts. A mismatch would mark the row with \u2717; there are none unless one is shown.',
  '<b>Same input, best of several runs.</b> Each size is sorted by every contender in turn, from an identical copy. The fastest of 5 runs is kept up to a million elements, of 3 up to ten million.',

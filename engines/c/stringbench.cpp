@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
     const char *tl = argc > 3 ? argv[3] : "1,14";
     const char *filt = argc > 4 ? argv[4] : "";
     std::vector<int> ths; for (const char *p = tl; *p; ) { ths.push_back(atoi(p)); const char *c = strchr(p, ','); if (!c) break; p = c + 1; }
-    static const char *shapes[] = { "uuids", "random", "words", "ids", "urls", "paths", "logs", "logs8", "words_sorted" };
+    static const char *shapes[] = { "uuids", "random", "words", "ids", "urls", "paths", "logs", "logs8", "words_sorted", "emails", "dates" };   /* emails, dates: 2026-11-08, bench_strings.h */
     printf("# stringbench: n = %zu strings, %d reps, OMP_WAIT_POLICY=%s. Per contender: median ms, and the median over reps of\n", n, reps, getenv("OMP_WAIT_POLICY"));
     printf("# (its time / logos's time) in the same rep: > 1 means logos is faster. Every output checked against std::sort's.\n");
     for (const char *sh : shapes) {

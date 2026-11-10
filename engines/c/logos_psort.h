@@ -202,6 +202,9 @@ LOGOS_DEPRECATED("use logos_num_cpus") static inline int  logosNumCpus(void) { r
 /* ---- parity extras (logos_extra.c): indirect sort, permutations, outliers,
  * strings. argSort is stable; perm indices are uint32 (n < 2^32). ---- */
 void logos_argsort_f64(const double *a, size_t n, uint32_t *perm);      /* perm sorts a; a unmodified */
+/* The same permutation with threads: keys already in order answer in one pass, and from 200,000 elements a stable parallel
+   partition on the top varying key bits is finished bucket by bucket (12 bytes of scratch per element against 20). */
+void logos_argsort_f64_mt(const double *a, size_t n, uint32_t *perm, int nthreads);
 void logos_argsort_i32(const int32_t *a, size_t n, uint32_t *perm);
 void logos_apply_perm_f64(const double *src, const uint32_t *perm, size_t n, double *out);   /* out[i]=src[perm[i]] */
 void logos_apply_perm_i32(const int32_t *src, const uint32_t *perm, size_t n, int32_t *out);

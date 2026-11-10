@@ -1,5 +1,125 @@
 # Changelog
 
+## (unreleased) -- the 50M scale report re-measured with the changes below in (2026-11-10; FINDINGS 3cb)
+
+- No engine change. `reports/scale-report.html` and `index.html` now hold a run that includes the thread boost (3bz) and the three
+  changes of 3ca: at 50M logos is the fastest sort measured on **24 of 33 inputs at one thread** (level on 4, slower on heavy_tail
+  0.94, int_wide 0.92, fk_zipf 0.72, uuids 0.88, words 0.74) and **29 of 33 at 14 threads** (level on 3, slower on fk_zipf 0.72).
+  zip_codes at 14 threads 0.57 -> 1.04 of IPS4o, at 100k on one thread 0.18 -> 0.44 of x86-simd-sort.
+- `tools/scale_index.py`: a total-time view of every chart beside time per element, totals in the headline rows and the hover, a
+  what-changed section; `tools/check_index.js` checks both views.
+
+## (unreleased) -- a capped hash map, heavy values counted in the scatter, an argsort with threads (2026-11-10; FINDINGS 3ca)
+
+- **`logos_argsort_f64_mt(a, n, perm, threads)`** (new entry; `LOGOS_ARGSORT_SEQ=1`, `LOGOS_AS_BITS=<b>`; `logos_twist_last(42)`): keys
+  already in order return the identity after one pass (also in `logos_argsort_f64`: 54 -> 0.9 ns per element at 8.4M); from 200,000
+  elements at two threads or more, one stable parallel partition into up to 4,096 equal-width cells of the key range, each bucket
+  finished by the LSD radix. The same permutation as the one-thread radix, bit for bit. 14 threads against `logos_argsort_f64`:
+  **uniform 5.8-7.7x, log-uniform 5.6-7.2, whole seconds 3.1-4.3, fk_zipf 3.9-6.1, five values 2.8-4.9, near-sorted 6.3-9.8** from
+  500k to 30M; scratch 20 -> 12 bytes per element. Cells from raw key bits lost two shapes 3-7x (a column that straddles 1.0).
+
+- **`MC_HASH_SEQ_CAP` = 8192** (`LOGOS_MC_SEQCAP=<k>`, 0 = no cap; `logos_twist_last(40)`): below 8 threads a hash-count map let in on
+  a Chao1 estimate above 128 gives up once it holds 8,192 distinct values and the sort goes on to the leaf. US ZIP codes read 1,519
+  on the 384-point sample and the map met 18,923 values in 100,000 elements. One thread, uncapped / capped: **zip_codes 2.03 at 100k,
+  1.61 at 200k, 1.35 at 316k, 1.18 at 1M**; columns of 2,000-3,000 true values (where the map wins) 0.99-1.02; ten other shapes 0.96-1.03.
+- **Heavy values are counted, not moved** (`hv_build`, `hv_insert`; `LOGOS_NO_HFHEAVY=1`; `logos_twist_last(41)`): a value holding
+  more than a bucket's region no longer makes the histogram-free partition decline. Sample runs of at least a quarter bucket (up to
+  64) are counted per thread in the scatter and filled in around each bucket's sorted remainder. 14 threads, off / on: **zip_codes
+  1.66 and fk_zipf 1.71 at 10M**, fk_zipf 1.18 at 1M; 34 guard rows 0.95-1.04.
+- **Measured and not shipped:** dropping the gate's quantized-radix clause (`LOGOS_MCGATE_V1=1`): zip_codes 2.44 at 100k, but
+  3,000-value whole-number columns 0.75-0.77 at 316k-1M.
+- **Measured and not built:** (key, index) pairs through a vector key-value quicksort at ONE thread: 1.2x over the radix on
+  unstructured keys, 0.63 on whole seconds (`make argceil`).
+- New: `make gateprobe` / `gateprobe_trace` (two settings paired on the practical counting shapes), `make argceil`; harness sections
+  `hash map cap`, `heavy values` and `argsort mt` (55,809 checks in 52 sections).
+
+## (unreleased) -- the unstructured partition's own thread floor (2026-11-09; FINDINGS 3bz)
+
+- **`BOOST_PER` = 25000, `BOOST_MIN_N` = 300000** (`boost_threads`; `LOGOS_BOOST_PER=<k>` moves the floor, a value under 1000 turns it
+  off; `LOGOS_BOOST_MIN=<n>`; `logos_twist_last(39)` counts the sorts that took it). When every structured route has declined and
+  `sample_unstructured` says yes, the partition runs one thread per 25,000 elements instead of the global one per 100,000. The bucket
+  count stays the policy's, so the sample, the splitters and every map are unchanged. 14 threads asked, t(off) / t(on): **316k
+  1.62-1.99, 500k 1.28-1.42, 1M 1.08-1.13** on uniform, heavy_tail, bimodal, clustered, int_wide and normal; seventeen structured guards
+  0.98-1.03; 1.4M (where the policy already gives 14) 0.985-1.02. Six threads: 1.56-1.64 / 1.08-1.12.
+- **Measured and not shipped:** a lower GLOBAL floor (`LOGOS_MIN_PER_THREAD=<k>`, the knob stays): kinks, swaps and blocks 3.5-5x
+  slower at 100k; the boost with the bucket count scaled too (clustered 1.5-2.8x slower, normal 1.16); trying the boost and going
+  back (10-20% for the second map build); the boost at 200k-290k in front of the two-halves route (heavy_tail and normal 1.25-2.4x
+  slower).
+- **`make strceil`** (new, a probe): told ceilings for two string ideas, both under the bar and not built. Interning repeated strings:
+  1.18-1.19 on words at 2M-20M, 0.76 at 200k. Alphabet packing: 1.24-1.30 on dates / ids with the coding free, 0.84-0.88 with it.
+- Harness: section `thread boost`, 27 checks, 13 naming the path. `roundbench` unchanged; the sweep used it with
+  `RB_SWITCH=LOGOS_BOOST_PER RB_VALUE=1`.
+
+## (unreleased) -- thirteen practical shapes and three practical string columns in the scale bench, run to 50M (2026-11-08, later; FINDINGS 3by)
+
+**Asked:** "create more data shapes and cap at 50m items sorted. make more common examples of data that needs to be sorted, be practical."
+No engine change.
+- **Thirteen numeric shapes in `scalebench.cpp`**, each a column people sort and generated the way the real thing comes about: `event_times`
+  (a Poisson event stream stamped with send times, in arrival order after exponential network latency), `prices_cents` (log-normal prices
+  rounded to the cent, stored as dollars), `ids_dense` (primary keys after 10% deletions, rows shuffled), `fk_zipf` (a foreign key to 200k
+  customers with Zipf popularity), `zip_codes` (42,000 codes, population-weighted), `ages` (a population pyramid), `sensor_temps` (a year of
+  readings on a 0.1-degree gauge, seasonal and daily cycles, in time order), `latencies_us` (log-normal, whole microseconds), `geo_lat`
+  (latitudes around 200 cities, rounded to 1e-6), `log_batches` (64 sorted batches appended in order, 20% overlap: the strand gate's shape),
+  `shard_ids` (8 shards' disjoint ID ranges in arrival order), `appended_rows` (a sorted table plus 5% new rows), `order_dates` (3,653 day
+  numbers, recent ones more often). `SHAPE_DOCS` describes each; the report's accordion shows every one from its own generator, and
+  `ylog_shape()` puts the log-normal ones on a log value axis there.
+- **Three string shapes**: `paths` (already in bench_strings.h, now in the run), and in bench_strings.h `emails` (skewed local parts, dotted or
+  numbered, at seven webmail domains and a long tail) and `dates` (ISO-8601 timestamps with milliseconds, random instants over ten years, a
+  civil-date conversion of Hinnant's). stringbench's shape list has the two new ones too.
+- **`LOGOS_SCALE_SHAPES=a,b,c`** runs only the named shapes, numeric or string ("logs" or "strings: logs"): a re-run of a few rows, or a trace
+  build under the bench (the pattern: `cc -DLOGOS_TRACE -c logos_psort.c`, link scalebench.cpp against that object with `LOGOS_MIN_N=LOGOS_MAX_N`).
+- **One bench fix:** `LOGOS_MIN_N` = `LOGOS_MAX_N` at a size off the half-decade ladder (5e7 alone) gave "no sizes" and exit 1, because the
+  ceiling was appended only when the ladder was non-empty. The ceiling is a point whenever the ladder is empty.
+- **The run** (FINDINGS 3by): 26 numeric and 7 string inputs to 50M at 1 and 14 threads, strings and the memory pass to 50M, 1 h 21 min,
+  0 mismatches, calibration 2.85 / 56.0 ms. At 50M logos is the fastest sort measured on **25 of 33 inputs at one thread** (level on 3,
+  slower on uniform 0.95, heavy_tail 0.93, fk_zipf 0.78, uuids 0.87, words 0.70) and **29 of 33 at 14 threads** (level on 2, slower on
+  zip_codes 0.57 and fk_zipf 0.61 against IPS4o). The practical inputs at one thread against the fastest other sort: event_times 2.06,
+  prices_cents 2.40, ids_dense 3.19, zip_codes 2.47, ages 1.85, sensor_temps 1.94, latencies_us 2.89, order_dates 2.07, shard_ids 1.88,
+  appended_rows 2.54 (vs timsort), log_batches 1.11 (vs timsort; 6.5 vs x86-simd-sort), geo_lat 0.97, fk_zipf 0.78; the string columns
+  paths 1.56, emails 1.19, dates 1.35 against the key-value sort on the same prefix keys. **Four engine findings, none visible on the old
+  shapes** (IDEAS_LOG 19): a value holding 5-6% of the array declines the histogram-free partition at 14 threads and lands in one bucket
+  12x the mean (zip_codes, fk_zipf); at 100k-316k on one thread the counting routes fire where the leaf would win by multiples (zip_codes
+  0.18: a hash map on a Chao1 of 1,237 for 42,000 distinct; prices_cents 0.45: a 147k-slot lattice for 100k elements); prices_cents'
+  lattice entry fires at 1M, 3.16M and 50M and declines at 10M and 31.6M (the grid's span follows the sample's extremes on a log-normal);
+  and log_batches at one thread is level with timsort, which merges the same in-order batches with no scan, plan or copy-back. Also:
+  strings: logs reads 2.11 at 50M, so the log-line route's turn (3bx, 0.92 at 100M) lies between 50M and 100M.
+- **The 316M report was overwritten by this run** (reports/ holds one scale report and the recipe copies over it). Its numbers are in
+  FINDINGS 3bx and its complete console log is `reports/scale-run-316m-2026-11-08.log`; this run's is `reports/scale-run-50m-2026-11-08.log`.
+  Copy the report aside before a run whose predecessor is worth keeping.
+
+## (unreleased) -- the scale ladder past 10M, and the clean page (2026-11-08)
+
+**Asked:** "Create an index.html with a cleaned up version of scale-report. also run up to 1b elements." No engine change.
+- **`scalebench` holds three arrays of n, not four.** The previous contender's output was kept through the next contender's copy of
+  the base array, so the peak was base + reference + the old output + the fresh copy: 32 GB at 1e9 where 24 suffice. The output is
+  released before each copy, in the numeric and the string loops. The timings cannot move (nothing inside a timed region changed).
+- **Two ceilings of their own, both defaulting to `LOGOS_MAX_N`:** `LOGOS_STR_MAX_N` for the strings (a string costs ~48 bytes to hold
+  against 8 for a double; 1e9 strings with their pool, pointers, reference and copy would be ~70 GB) and `LOGOS_SCALE_MEM_MAX_N` for the
+  cold-call memory pass, which runs EVERY contender once more at every size (at 1e9 that alone would repeat the three slowest sorts for
+  hours, and per element the figures are flat from 10M up). `META` records both (`strMaxN`, `memMaxN`); the page says where each stopped.
+  `LOGOS_MAX_SEC` was already there and is the third switch a long ladder needs: a shape stops once `std::sort` at one thread passes half
+  of it, and `std::sort` at 1e9 is 100-160 s on this box, so 600.
+- **Why 316M and not 1e9 this time:** WSL2 on the reference box is capped at its default 31 GB (half of 64), and at 1e9 the bench's
+  three arrays (24 GB) plus the sort's own scratch (the 14-thread partition ~9-14 GB, `__gnu_parallel::sort` 8 GB) do not fit. Raising
+  the cap takes a `.wslconfig` and a `wsl --shutdown`; the user chose 316M now, which peaks near 15 GB. The run: `LOGOS_MAX_N=3.16e8
+  LOGOS_MAX_SEC=600 LOGOS_STR_MAX_N=1e8 LOGOS_SCALE_MEM_MAX_N=1e8 ./scalebench`, 20 sizes, ~1.5-2 hours, the top row ~4 minutes a shape.
+- **The clean page, `index.html` at the repository root** (`tools/scale_index.py reports/scale-report.html index.html`; `make
+  scale-full` runs it after copying the report, `make scale-index` alone): the report's own DATA, META and SHAPES blocks, nothing
+  re-measured, as one short static page -- the comparison at the largest size (the report's own rule: fastest other sort per input,
+  under 5% is level), one pair of nanoseconds-per-element charts per input drawn as inline SVG (n from 10k up, the single-array regime,
+  so the page needs no seam; the value axis opens to logos and its nearest rivals and a triangle at the top marks a point above it, with
+  the sorts that run off the top named beneath), the contenders, the method in five lines, the reproduction commands, and a link to the
+  full report for the rest. One file, no library, no fonts fetched, both themes from the report's own tokens, phone width tested. The
+  one piece of script is the hover layer; `tools/check_index.js` runs it under a stub DOM, moves a pointer across every chart and asserts
+  the tooltip's n, its order and its ratios (34 charts, 238 events, 0 failures). The report's known bad memory reading (the key-value
+  sort on urls, ~1.8e12 B/elem) is shown as a dash, with a note; anything past 10 KB per element is treated as a reading the pass could
+  not take.
+- **The run** (FINDINGS 3bx): 1 h 27 min, 0 mismatches, calibration 3.23 / 66.8 ms (quiet). At 316M logos is the fastest sort measured on
+  9 of 17 inputs at one thread (level on 3; slower on uniform 0.87 and reach_mirror 0.62 against x86-simd-sort, words 0.74 and logs 0.92
+  against its key-value sort at 100M strings) and 16 of 17 at 14 threads (words 0.94). Three findings at scale: the short-reach gate's
+  ceiling in n (reach_mirror 7.3 -> 20.3 ns per element from 10M to 316M), the log-line route past 10M (26.7 -> 70.9 ns per string at
+  100M), and the in-house kernel drifting behind the library's with n (uniform 0.99 -> 0.87). All three in experiments/IDEAS_LOG.md.
+
 ## (unreleased) -- the near-sorted route's strand gate: strands are not strays (FINDINGS 3bw)
 
 **Asked:** "integrate the speedup if it makes sense to", after the prime-factor knot solver (3bv) found that at P > 1 the near-sorted

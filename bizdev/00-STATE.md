@@ -1,6 +1,6 @@
 # 00-STATE: what logos-sort is, commercially, on 2026-11-06
 
-Written by the business-development assessor from the repository and the scale report measured 2026-11-05 21:47 UTC
+Written by the business-development assessor from the repository and the scale report measured 2026-11-05 21:47 UTC (re-run to 316M on 2026-11-08, FINDINGS 3bx and LOG.md; the figures below are the 10M ones unless they say otherwise)
 (`reports/scale-report.html`, `META.measuredAt` 1793944050000; 34 panels, 170 rows at 100k and above, every row `ok`).
 Every number below was regenerated from that report's DATA array with `bizdev/tools/parse_report.py`, not copied from prose.
 
@@ -75,6 +75,26 @@ Source for the non-C columns: `engines/js/index.d.ts`, `engines/rust/src/lib.rs`
 | Concurrency safety | `logos_sort_f64` from two threads at once is outside the contract and was found to produce WRONG output when tried (FINDINGS.md:1968) | |
 
 ## 6. The measured picture (scale report of 2026-11-05)
+
+**2026-11-08, the same bench to 316M on a quiet box** (strings 100M; calibration 3.23 / 66.8 ms, so these 14-thread
+ratios are not upper bounds): logos the fastest sort measured on 9 of 17 inputs at one thread (level on 3, slower on 5)
+and 16 of 17 at 14 threads; against IPS⁴o 1.5–4.9× on all 13 numeric inputs at 14 threads; the structured routes' cost
+per element flat from 10M to 316M while every comparison sort rises 10–30%, so the margins grow with n. Three one-thread
+cells moved against the claims' direction at scale and nowhere at 10M: uniform 0.87 of x86-simd-sort, reach_mirror 0.62,
+strings: logs 0.92 of the key-value sort at 100M (LOG.md, 2026-11-08). The rows below are the 10M report's.
+
+**2026-11-08, later: thirteen BUYER-SHAPED inputs and three string columns, run to 50M** (FINDINGS 3by; this run replaced
+the 316M report in reports/). Event timestamps in arrival order, prices in cents, primary keys after deletions, Zipf foreign
+keys, ZIP codes, ages, sensor readings, request latencies, latitudes, log batches appended in order, shard IDs, a sorted table
+with appended rows, order dates; file paths, emails, ISO dates as text. At 50M logos is the fastest sort measured on 25 of 33
+inputs at one thread and 29 of 33 at 14 threads. **Re-measured 2026-11-10 after the engine fix (FINDINGS 3ca, 3cb): 24 of 33 and 29 of 33; zip_codes is now level with IPS⁴o
+(1.04) and fk_zipf 0.72, the one remaining 14-thread loss.** As first measured on 2026-11-08, the two inputs it LOST at 14 threads were buyer-shaped: **zip_codes 0.57 and
+fk_zipf 0.61 of IPS⁴o**, because a value holding 5-6% of a column (any Zipf key) falls between the partition's region size and
+the dominant-value route's 20% gate and lands in one bucket on one thread (IDEAS_LOG 19 (a): the single most buyer-relevant
+engine item now). And at 100k-316k on one thread the counting routes are chosen where the vector quicksort would win by 2-5x
+(zip_codes 0.18, prices_cents 0.45): GAPS 6's regime again, from a new side (19 (b)). The wins are real and buyer-shaped too:
+event_times 2.1x / 4.1x, prices 2.4x, keys 3.2x, latencies 2.9x, order dates 2.1x / 4.6x, appended rows 2.5x / 2.5x
+(one thread / 14), and the three string columns 1.2-1.6x at one thread.
 
 How to read the rows. "Rival" is the fastest contender other than logos and logos in-place in that row. Contenders at
 1 thread: std::sort, x86-simd-sort (AVX2 build), IPS4o, LSD radix, timsort, VQSort (Highway 1.4.0, AVX2); at 14

@@ -101,6 +101,51 @@ its structure 0.86, a format-aware sort of numeric dates 0.24–0.77. Each row n
 
 ---
 
+### S4. Addendum, 2026-11-08: the ladder to 316M (FINDINGS 3bx)
+
+The scale bench was run to 316M elements (strings and the memory pass to 100M) on a quiet box (calibration 3.23 ms /
+66.8 ms): the first run whose 14-thread ratios are not upper bounds. Nothing in S1 changes at 10M, where its rows are
+stated. At 316M logos is the fastest sort measured on 9 of 17 inputs at one thread (level on 3, slower on 5) and 16 of
+17 at 14 threads; against std::sort 6.7-7.6x on random doubles and 17-33x on the structured shapes; against IPS⁴o
+1.5-4.9x on 13 of 13 numeric inputs at 14 threads; the structured routes' cost per element flat from 10M to 316M while
+every comparison sort rises 10-30%. Three graded consequences, each measured and each an OPEN entry in
+experiments/IDEAS_LOG.md (18):
+
+- S1's reading of the one-thread random-doubles comparison as parity **holds to 10M and reads 0.87 on uniform and 0.95
+  on bimodal at 316M**: the in-house kernel grows 25% per element over that range, the library's 10%.
+- The short-reach route's win on back-to-front logs (reach_mirror) is **measured to stop between 100M and 316M**
+  (1.44 → 0.62 against x86-simd-sort): the gate's finest sample lag is 0.028% of n, 88k positions at 316M.
+- The log-line string route's 2.1-2.3x is **measured at 10M only**: 0.92 at 100M, untraced.
+
+### S5. Addendum, 2026-11-08 (later): thirteen practical shapes, run to 50M (FINDINGS 3by)
+
+The scale bench gained thirteen practical numeric inputs (event timestamps in arrival order, prices in cents, primary keys
+after deletions, Zipf foreign keys, ZIP codes, ages, a year of sensor readings, request latencies, latitudes, log batches
+appended in order, shard IDs, a sorted table with rows appended, order dates) and three string columns (file paths, email
+addresses, ISO-8601 dates as text), and was run to 50M on a quiet box (2.85 ms / 56.0 ms; 0 mismatches). This run REPLACED
+the 316M report in reports/ (its console log is kept beside it). Graded:
+
+- **Re-measured 2026-11-10 with the changes of 3bz and 3ca in (FINDINGS 3cb): 24 of 33 at one thread (level on 4), 29 of 33 at 14
+  (level on 3, slower only on fk_zipf 0.72); zip_codes at 14 threads 0.57 -> 1.04 of IPS4o** (measured). The line below is the
+  2026-11-08 run.
+- **At 50M logos is the fastest sort measured on 25 of 33 inputs at one thread and 29 of 33 at 14 threads** (measured;
+  the page's rule, under 5% level). The thirteen original numeric rows read as at 316M. On the practical inputs at one
+  thread: 2.0-3.2x on ten of thirteen (event_times, prices_cents, ids_dense, zip_codes, ages, sensor_temps, latencies_us,
+  shard_ids, appended_rows, order_dates), level on geo_lat, 1.11 over timsort on log_batches, **0.78 on fk_zipf**.
+- **Two practical inputs are LOST at 14 threads: zip_codes 0.57 and fk_zipf 0.61 of IPS⁴o**, at every size from 1M
+  (measured, traced): a value holding 5-6% of the array is too big for the histogram-free partition's regions and too small
+  for the dominant-value route (20%), so the histogram path puts it in one bucket 12x the mean and one thread sorts it.
+  Any claim about "Zipf keys", "foreign keys" or "categorical columns with a dominant value" at P threads is **false until
+  IDEAS_LOG 19 (a) ships**.
+- **The counting routes lose by multiples at 100k-316k on one thread** (zip_codes 0.18 / 0.30, prices_cents 0.45 / 0.83,
+  latencies_us 0.73 at 100k; measured, traced): the one-thread gates admit a hash map or a lattice the leaf would beat. The
+  10M claims of S1 and the 50M ones above do not extend DOWN to the buyer's 100k-1M blocks on counting-shaped columns
+  (IDEAS_LOG 19 (b)); the 100k-316k parallel losses of S4 remain.
+- The log-line string route's 2.1-2.3x **holds at 50M (2.11)**; the turn S4 recorded at 100M lies between 50M and 100M.
+- The predictions written before the run (FINDINGS 3by) were inside their range on 9 of 16 one-thread rows and UNDER on seven
+  14-thread rows: the parallel short-reach, tail, knot and lattice routes gained more from 14 threads than their one-thread
+  form suggested. The two wrong-in-sign predictions are the two 14-thread losses above.
+
 ## A. Competitive position (8M f64, 20-thread single-socket box, WSL2)
 
 | # | claim | status | evidence |

@@ -75,7 +75,7 @@ scaling: scaling.cpp $(LIB).a $(HDR)
 # bias the comparison (it only costs precision). Run: make pfbench && ./pfbench
 # RENAME(prefix): every public symbol of the engine gets the prefix, so several
 # engine variants can be linked into one binary. Keep in sync with logos_psort.h.
-RENAME = -Dlogos_sort_f64=$(1)_sort_f64 -Dlogos_sort_f64_batch=$(1)_sort_f64_batch -Dlogos_sort_strings_mt=$(1)_sort_strings_mt -Dlogos_sort_i32=$(1)_sort_i32 -Dlogos_num_cpus=$(1)_num_cpus -Dlogos_release_buffers=$(1)_release_buffers \
+RENAME = -Dlogos_sort_f64=$(1)_sort_f64 -Dlogos_sort_f64_batch=$(1)_sort_f64_batch -Dlogos_sort_strings_mt=$(1)_sort_strings_mt -Dlogos_argsort_f64_mt=$(1)_argsort_f64_mt -Dlogos_sort_i32=$(1)_sort_i32 -Dlogos_num_cpus=$(1)_num_cpus -Dlogos_release_buffers=$(1)_release_buffers \
          -Dlogos_set_simd_sort=$(1)_set_simd_sort -Dlogos_set_simd_kernels=$(1)_set_simd_kernels \
          -Dlogos_sort_f64_inplace=$(1)_sort_f64_inplace -Dlogos_sort_i32_inplace=$(1)_sort_i32_inplace \
          -Dlogos_profile_reset=$(1)_profile_reset -Dlogos_profile_get=$(1)_profile_get -Dlogos_profile_phase_names=$(1)_profile_phase_names \
@@ -179,6 +179,24 @@ memprobe: memprobe.c $(LIB).a $(HDR)
 # ./stringbench [n] [reps] [P list] [shape]
 strsmallbench: strsmallbench.cpp bench_strings.h $(LIB).a $(HDR)
 	$(CXX) -O3 -std=gnu++17 -I. strsmallbench.cpp $(LIB).a -o $@ $(LDLIBS)
+# Told ceilings for two string ideas (IDEAS_LOG 21 (c), (d); FINDINGS 3bz), one thread: interning repeated strings, and strings
+# re-coded two characters to a byte. ./strceil [n] [reps] [shape]. Both measured under the bar: neither is in the engine.
+strceil: strceil.cpp bench_strings.h $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -fopenmp -I. strceil.cpp $(LIB).a -o $@ $(LDLIBS)
+# Two engine settings paired on the PRACTICAL COUNTING SHAPES (the scale bench's own generators: zip_codes, ages, fk_zipf,
+# prices_cents, plus whole-number and real-valued columns of 1k-3k values), batches of distinct inputs below 2M. FINDINGS 3ca.
+# GP_A / GP_B = "NAME=VALUE" or empty, GP_THREADS=P: ./gateprobe [pairs] [n list] [shape filter]; t(A) / t(B), above 1 = B faster.
+# GP_ONCE=1 sorts each shape once per side (for gateprobe_trace, which names the route).
+# logos_argsort_f64 and logos_argsort_f64_mt (1 and P threads) beside told ceilings: x86-simd-sort's key-value quicksort on (key, index),
+# the value sort alone, one ascending scan. Every permutation checked, and the mt one must EQUAL the one-thread radix's. FINDINGS 3ca.
+# ./argceil [n] [reps] [P] [shape]; LOGOS_AS_BITS=<b> moves the partition's width. Needs XSS=../x86-simd-sort/src
+argceil: argceil.cpp $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -mavx2 -mfma -mbmi2 -fopenmp -DXSS_USE_OPENMP -I. -I $(XSS) argceil.cpp $(LIB).a -o $@ $(LDLIBS)
+gateprobe: gateprobe.cpp $(LIB).a $(HDR)
+	$(CXX) -O3 -std=gnu++17 -pthread -I. gateprobe.cpp $(LIB).a -o $@ $(LDLIBS)
+gateprobe_trace: gateprobe.cpp $(SRC) $(SRC2) logos_view.c $(HDR)
+	$(CC) $(CFLAGS) -DLOGOS_TRACE -c $(SRC) -o gptrace_psort.o && $(CC) $(CFLAGS) -c $(SRC2) -o gptrace_extra.o && $(CC) $(CFLAGS) -c logos_view.c -o gptrace_view.o
+	$(CXX) -O3 -std=gnu++17 -pthread -I. gateprobe.cpp gptrace_psort.o gptrace_extra.o gptrace_view.o -o $@ $(LDLIBS)
 stringbench: stringbench.cpp $(LIB).a $(HDR)
 	$(CXX) -O3 -std=gnu++17 -mavx2 -mfma -mbmi2 -fopenmp -DXSS_USE_OPENMP -I. -I $(XSS) stringbench.cpp $(LIB).a -o $@ $(LDLIBS)
 
@@ -813,9 +831,13 @@ profile-full: profbench.cpp logos_psort_prof.o $(OBJ2) $(HDR)
 # ALWAYS linear. make scalebench = std::sort / gnu_par / logos; make scale-full adds x86-simd-sort,
 # IPS4o and (2026-11-05) Google's VQSort at one thread (HWY=../highway, see libvqsort.a). The report opens with a summary
 # written for a reader outside the project (logos against the fastest other sort at the largest n, the contenders, the
-# method) and keeps the detailed charts below. Overrides: LOGOS_MAX_N (default 1e7 since 2026-09-23, for turnaround; =5e7 restores the old ceiling,
+# method) and keeps the detailed charts below. 26 numeric shapes (13 of them, since 2026-11-08, PRACTICAL: timestamps in arrival
+# order, prices in cents, keys after deletions, foreign keys, ZIP codes, ages, sensor readings, latencies, coordinates, log batches,
+# shard IDs, appended rows, order dates) and 7 string shapes (uuids, words, urls, logs, paths, emails, dates); SHAPE_DOCS in
+# scalebench.cpp describes each. Overrides: LOGOS_MAX_N (default 1e7 since 2026-09-23, for turnaround; =5e7 restores the old ceiling,
 # whose 31.6M and 50M rows were most of the run), LOGOS_MIN_N (10000 = the old ladder), LOGOS_THREADS,
-# LOGOS_MAX_SEC (default 20). LOGOS_SCALE_REUSE=<report.html> ./scalebench re-renders that report's
+# LOGOS_MAX_SEC (default 20), LOGOS_SCALE_SHAPES=a,b,c (only the named shapes, numeric or string), LOGOS_SCALE_STRINGS=0,
+# LOGOS_STR_MAX_N, LOGOS_SCALE_MEM_MAX_N. LOGOS_SCALE_REUSE=<report.html> ./scalebench re-renders that report's
 # measurements through the current template and measures nothing. The node and browser checks below
 # are skipped where neither is installed (WSL here): run them from Windows, tools/check_report.js and
 # tools/browser_check.py, on the written report. The charts zoom and pan (the template's IX block); both
@@ -826,12 +848,17 @@ scalebench: scalebench.cpp $(LIB).a $(HDR) uplot_embed.h
 	@if command -v node >/dev/null 2>&1; then node ../../tools/check_report.js scale-report.html | tail -2; fi
 	@if command -v python3 >/dev/null 2>&1; then python3 ../../tools/browser_check.py scale-report.html; elif command -v python >/dev/null 2>&1; then python ../../tools/browser_check.py scale-report.html; fi
 	@if [ -d $(REPORTS) ]; then cp scale-report.html $(REPORTS)/scale-report.html && echo "copied to $(REPORTS)/scale-report.html"; fi
+	@if [ -d $(REPORTS) ] && command -v python3 >/dev/null 2>&1; then python3 ../../tools/scale_index.py $(REPORTS)/scale-report.html ../../index.html; fi
 scale-full: scalebench.cpp $(LIB).a $(HDR) uplot_embed.h bench_strings.h libvqsort.a
 	$(CXX) -O3 -std=gnu++17 -pthread -fopenmp -march=native -DHAVE_XSS -DXSS_USE_OPENMP -DHAVE_IPS4O -DHAVE_VQSORT -I $(XSS) -I $(IPS4O) -I $(HWY) $(BENCHFLAGS) scalebench.cpp $(LIB).a libvqsort.a -o scalebench $(LDLIBS) -latomic -ltbb
 	./scalebench
 	@if command -v node >/dev/null 2>&1; then node ../../tools/check_report.js scale-report.html | tail -2; fi
 	@if command -v python3 >/dev/null 2>&1; then python3 ../../tools/browser_check.py scale-report.html; elif command -v python >/dev/null 2>&1; then python ../../tools/browser_check.py scale-report.html; fi
 	@if [ -d $(REPORTS) ]; then cp scale-report.html $(REPORTS)/scale-report.html && echo "copied to $(REPORTS)/scale-report.html"; fi
+	@if [ -d $(REPORTS) ] && command -v python3 >/dev/null 2>&1; then python3 ../../tools/scale_index.py $(REPORTS)/scale-report.html ../../index.html; fi
+# the clean page alone, from the report already in reports/ (tools/scale_index.py; node tools/check_index.js index.html tests its hover layer)
+scale-index:
+	python3 ../../tools/scale_index.py $(REPORTS)/scale-report.html ../../index.html
 
 # Measure the measurement: repeat one sort at several thread counts, report min/median/max,
 # spread, preempted share and CPU utilisation. Run: make noiseprobe && ./noiseprobe [reps]

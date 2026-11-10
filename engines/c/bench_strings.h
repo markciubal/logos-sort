@@ -26,7 +26,18 @@ static std::string str_word(uint64_t id) {                 // a pronounceable ps
     return s;
 }
 static uint64_t str_zipf(StrRng &r, uint64_t V) { double u = r.f(); return (uint64_t)std::pow((double)V, u * u) - 1; }   // a heavy head, a long tail
-// shapes: uuids, random, words, words_sorted, ids, urls, paths, logs, logs8. Deterministic in (shape, n, seed).
+// days since 1970-01-01 -> civil date (Howard Hinnant's algorithm), for the `dates` shape
+static void str_civil(long z, int &y, unsigned &m, unsigned &d) {
+    z += 719468; const long era = (z >= 0 ? z : z - 146096) / 146097; const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; const long yy = (long)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1; m = mp < 10 ? mp + 3 : mp - 9; y = (int)(yy + (m <= 2));
+}
+// shapes: uuids, random, words, words_sorted, ids, urls, paths, logs, logs8, emails, dates. Deterministic in (shape, n, seed).
+// emails and dates (2026-11-08): two columns people sort every day. emails: local part from a skewed vocabulary, sometimes
+// dotted or numbered, at a domain drawn with a heavy head (seven webmail providers, then a long tail of company domains).
+// dates: ISO-8601 timestamps with milliseconds ("2021-07-14T09:26:53.589Z"), random instants over the ten years from 2016, in
+// random order: fixed width, lexicographic order IS chronological order, and the first 8 bytes hold only year and month.
 static StrSet gen_strings(const char *shape, size_t n, uint64_t seed = 7) {
     StrSet S; std::vector<size_t> off; off.reserve(n); S.buf.reserve(n * 40 + 1);
     StrRng R{ 0x853C49E6748FEA9BULL ^ (seed * 0x9E3779B97F4A7C15ULL) ^ (uint64_t)strlen(shape) * 0x1234567ULL };
@@ -68,6 +79,26 @@ static StrSet gen_strings(const char *shape, size_t n, uint64_t seed = 7) {
         }
     } else if (!strcmp(shape, "ids")) {
         for (size_t i = 0; i < n; i++) { snprintf(tmp, sizeof tmp, "user_%010llu", (unsigned long long)(R.next() % 10000000000ULL)); S.add(tmp, off); }
+    } else if (!strcmp(shape, "emails")) {
+        static const char *web[] = { "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com", "proton.me", "aol.com" };
+        static const char *tld[] = { ".com", ".com", ".org", ".net", ".co.uk", ".de", ".io" };
+        for (size_t i = 0; i < n; i++) {
+            std::string s = str_word(str_zipf(R, 50000));
+            uint64_t k = R.next() % 10;
+            if (k < 4) s += "." + str_word(str_zipf(R, 50000));                                             // first.last
+            if (k >= 7) { snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)(R.next() % 2000)); s += tmp; }   // a number
+            uint64_t d = str_zipf(R, 2000);
+            s += "@"; if (d < 7) s += web[d]; else s += str_word(d) + tld[R.next() % 7];
+            S.add(s, off);
+        }
+    } else if (!strcmp(shape, "dates")) {
+        for (size_t i = 0; i < n; i++) {
+            uint64_t ms = 16801ULL * 86400000ULL + (uint64_t)(R.f() * 3653.0 * 86400000.0);   // 2016-01-01 .. 2025-12-31, to the ms
+            long days = (long)(ms / 86400000ULL); uint64_t rem = ms % 86400000ULL; int y; unsigned m, d; str_civil(days, y, m, d);
+            snprintf(tmp, sizeof tmp, "%04d-%02u-%02uT%02u:%02u:%02u.%03uZ", y, m, d, (unsigned)(rem / 3600000), (unsigned)(rem / 60000 % 60),
+                     (unsigned)(rem / 1000 % 60), (unsigned)(rem % 1000));
+            S.add(tmp, off);
+        }
     } else {                                                // random printable bytes, 5 to 40 of them
         for (size_t i = 0; i < n; i++) { int L = 5 + (int)(R.next() % 36); for (int j = 0; j < L; j++) tmp[j] = (char)(33 + R.next() % 94); tmp[L] = 0; S.add(tmp, off); }
     }

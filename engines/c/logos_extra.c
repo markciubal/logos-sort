@@ -37,6 +37,10 @@ static int cmp_arg_i(const void *x, const void *y) {
 void logos_argsort_f64(const double *a, size_t n, uint32_t *perm) {
     for (size_t i = 0; i < n; i++) perm[i] = (uint32_t)i;
     if (n < 2) return;
+    {   size_t i = 1; uint64_t pk = ex_tkey(a[0]);                     /* keys already in key order: the identity is the stable answer (2026-11-10: 54 ns per element -> 0.9 on sorted keys at 8.4M) */
+        for (; i < n; i++) { uint64_t k = ex_tkey(a[i]); if (k < pk) break; pk = k; }
+        if (i == n) return;
+    }
     uint64_t *k0 = (uint64_t *)malloc(n * 8), *k1 = (uint64_t *)malloc(n * 8);
     uint32_t *i1 = (uint32_t *)malloc(n * 4);
     if (!k0 || !k1 || !i1) { free(k0); free(k1); free(i1); g_farr = a; qsort(perm, n, 4, cmp_arg_f); return; }

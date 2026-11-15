@@ -1,0 +1,46 @@
+parity: n = 30000000, 5 adjacent pairs per cell, every output verified; calibration memcpy-64MB 3.2 ms, std::sort-1M 65.3 ms
+ns per element (minimum); ratio = median of t(C) / t(Rust) over the pairs, above 1 = Rust faster
+
+1 thread
+  shape                   C      Rust     ratio     p10     p90
+  uniform            10.42     11.07      0.953   0.928   0.994  PARITY
+  heavy_tail         10.54     11.25      0.948   0.890   0.999  behind
+  bimodal            10.53     10.89      0.966   0.938   0.973  PARITY
+  clustered          10.40     11.15      0.937   0.905   1.013  behind
+  clustered_8        10.83     10.94      0.995   0.962   1.002  PARITY
+  clustered_32       10.60     11.03      0.932   0.920   0.969  behind
+  int_wide           10.09      8.78      1.214   1.060   1.250  RUST
+  distinct_2          0.57      0.57      0.996   0.952   1.143  PARITY
+  few_distinct        0.70      0.64      1.194   1.076   1.224  RUST
+  distinct_256        1.57      1.05      1.456   1.391   1.693  RUST
+  distinct_65536      2.30      1.38      1.602   1.569   1.735  RUST
+  quantized           1.72      1.14      1.499   1.434   1.604  RUST
+  near_sorted         4.11      2.95      1.376   1.300   1.479  RUST
+  sorted              0.32      0.30      0.985   0.941   1.243  PARITY
+  reversed            0.78      0.70      1.108   1.068   1.158  RUST
+  block_perm          1.31      1.06      1.186   1.184   1.238  RUST
+  block_overlap       1.36      1.20      1.102   1.066   1.191  RUST
+  -> 1 thread: Rust faster on 9, parity on 5, behind on 3 of 17
+
+14 threads
+  shape                   C      Rust     ratio     p10     p90
+  uniform             1.90      1.92      0.976   0.930   1.289  PARITY
+  heavy_tail          1.96      2.07      0.966   0.836   1.048  PARITY
+  bimodal             2.16      2.07      1.037   1.003   1.094  PARITY
+  clustered           2.64      2.20      1.163   1.143   1.368  RUST
+  clustered_8         2.56      2.39      1.074   0.958   1.112  RUST
+  clustered_32        2.64      2.32      1.140   1.110   1.275  RUST
+  int_wide            1.98      1.87      1.095   0.995   1.111  RUST
+  distinct_2          0.28      0.28      1.016   0.949   1.052  PARITY
+  few_distinct        0.29      0.28      1.044   1.030   1.096  PARITY
+  distinct_256        0.35      0.27      1.311   1.262   1.319  RUST
+  distinct_65536      1.38      0.38      3.764   3.496   3.868  RUST
+  quantized           0.37      0.28      1.337   1.275   1.391  RUST
+  near_sorted         0.81      0.87      0.920   0.819   0.941  behind
+  sorted              0.14      0.14      1.029   1.009   1.063  PARITY
+  reversed            0.62      0.38      1.634   1.582   1.686  RUST
+  block_perm          0.73      0.60      1.215   1.194   1.278  RUST
+  block_overlap       0.74      0.59      1.217   1.211   1.256  RUST
+  -> 14 threads: Rust faster on 10, parity on 6, behind on 1 of 17
+
+every output correct

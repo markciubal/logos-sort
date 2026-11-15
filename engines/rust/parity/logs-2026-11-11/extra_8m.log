@@ -1,0 +1,44 @@
+parity: n = 8388608, 12 adjacent pairs per cell, every output verified; calibration memcpy-64MB 3.4 ms, std::sort-1M 64.8 ms
+ns per element (minimum); ratio = median of t(C) / t(Rust) over the pairs, above 1 = Rust faster
+
+1 thread
+  shape                   C      Rust     ratio     p10     p90
+  normal              9.76      9.91      0.983   0.957   0.999  PARITY
+  lognormal           9.67      9.74      0.987   0.947   1.019  PARITY
+  int_narrow          7.70      6.73      1.193   1.065   1.232  RUST
+  zipf                3.84      1.24      3.104   2.889   3.227  RUST
+  prices              4.25      9.77      0.466   0.431   0.509  behind
+  sawtooth           15.85     11.40      1.382   1.356   1.447  RUST
+  prefix_95           2.43      3.53      0.705   0.641   0.762  behind
+  kinks               0.75      0.64      1.206   1.154   1.271  RUST
+  block_twist         1.48      1.37      1.112   1.050   1.224  RUST
+  stairs              2.02      2.66      0.765   0.717   0.906  behind
+  logs8               6.62      9.99      0.686   0.655   0.726  behind
+  latency             6.70      6.86      0.990   0.925   1.071  PARITY
+  signed_zeros       13.16      7.45      1.755   1.552   1.872  RUST
+  infinities          9.36     10.11      0.925   0.860   0.977  behind
+  subnormals         10.52     10.23      1.054   1.003   1.112  RUST
+  with_nan           12.97     12.24      1.045   0.986   1.099  PARITY
+  -> 1 thread: Rust faster on 7, parity on 4, behind on 5 of 16
+
+14 threads
+  shape                   C      Rust     ratio     p10     p90
+  normal              2.23      1.74      1.295   1.205   1.360  RUST
+  lognormal           1.67      1.74      1.005   0.943   1.055  PARITY
+  int_narrow          1.18      1.34      0.910   0.839   0.947  behind
+  zipf                0.79      0.39      2.116   1.969   2.747  RUST
+  prices              1.30      1.63      0.812   0.765   0.861  behind
+  sawtooth            1.90      1.97      0.931   0.858   0.957  behind
+  prefix_95           1.05      1.05      0.965   0.942   1.021  PARITY
+  kinks               0.26      0.17      1.505   1.390   1.624  RUST
+  block_twist         0.79      0.63      1.229   1.133   1.288  RUST
+  stairs              0.84      0.67      1.260   1.216   1.314  RUST
+  logs8               1.84      1.79      0.964   0.932   1.057  PARITY
+  latency             0.91      1.36      0.705   0.646   0.729  behind
+  signed_zeros        2.80      4.16      0.662   0.646   0.729  behind
+  infinities          3.03      1.90      1.599   1.489   1.709  RUST
+  subnormals          6.93      1.86      3.794   3.663   3.986  RUST
+  with_nan            1.74      1.73      1.021   0.939   1.075  PARITY
+  -> 14 threads: Rust faster on 7, parity on 4, behind on 5 of 16
+
+every output correct

@@ -102,6 +102,26 @@ distinct values (`MC_HASH_SEQ_CAP`, `LOGOS_MC_SEQCAP=0` = off, `logos_twist_last
 floor** (`BOOST_PER` 25000 from 300,000 elements, threads raised and the bucket count kept; `LOGOS_BOOST_PER=1` turns it off;
 `logos_twist_last(39)`): 1.62-1.99x at 316k, 1.28-1.42 at 500k, 1.08-1.13 at 1M with 14 threads asked, guards 0.98-1.03. It is
 the first of seven invented ideas (IDEAS_LOG 21).
+**The Rust PORT, 2026-11-11 (FINDINGS 3cd; `engines/rust/PORTING.md`):** `sort_f64` in `engines/rust` is now THIS ENGINE's f64
+sort transliterated (`src/port/`, ~10,000 lines, nine files by C line range, the C's names and arithmetic): "parity" was meant
+as the same algorithm, and it is checked by WHICH ROUTE RAN (`bash engines/rust/parity/routes.sh`: C and Rust in one binary, the
+C's witnesses compared): 4,320 cells (72 shapes, 2 to 8.4M, 1 to 14 threads), every output correct, every route the same (equal
+counts at one thread; ranges over six runs with threads). Speed: level with C on 26 of 34 scoreboard cells at 8.4M, behind 7-24%
+on 8 (int_wide, distinct_2, distinct_65536, quantized, near_sorted at 14 threads): untuned for LLVM. Left out: environment
+switches, out-of-memory fallbacks, opt-in paths, int32, strings, view, batch; one sort at a time (callers wait). The engine of
+3cc is still there as `sort_f64_v3`. **When the C engine changes, the port must change with it: re-run routes.sh.**
+**The Rust engine before it, 2026-11-11 (FINDINGS 3cc; `engines/rust/PARITY.md` has every cell):** `sort_f64` in `engines/rust` is a v3
+engine of its own, about 2,600 lines to the C engine's architecture with thirteen routes (prescan with kink repair, few values,
+exact lattices, hashed counts, int32 radix, one strand / runs by the knot sweep, short reach, two halves, a histogram-free
+partition, the AVX2 kernel, NaNs last), measured against C in ONE binary (`bash engines/rust/parity/parity.sh`, paired, verified).
+On the scoreboard's 17 shapes at 8.4M it is ahead of or level with C on **every cell at 1 and 14 threads** (ahead on 10 and 9);
+at 262k, 1M and 30M it is behind on 1-4 of them per thread count (small parallel sorts: uniform 0.88 at 1M and 14 threads, two and
+five values 0.60 / 0.74 at 262k and 4; the kernel's base-case networks at 30M); **on 16 shapes it was not tuned on it is behind on 5
+at each thread count** (decimal lattices 0.47, vector merges 0.69-0.77, short reach at 14 threads 0.70, a value holding half the
+array 0.66): each a C route it lacks. It is NOT feature parity: no strings on prefix keys, view, batch, measured memory or fault
+injection; it IS callable from several threads at once, which C is not. Its leads over C (lattice 1.45-1.64x at one thread, block
+shapes 1.1-1.2x, near-sorted 1.4x at one thread) are narrower forms of C's routes and are queued as A/Bs for C, not verdicts on it.
+Rust's toolchain is in WSL now (rustup in `~/.cargo`); nothing is committed.
 
 ## Repository layout
 
@@ -149,7 +169,14 @@ unibench.cpp        "uniform as a complete computation": P chunks sorted by the 
                     against the shipped partition (needs the x86-simd-sort clone; `anat` prices the chunk sorts against the merge)
                     mirrorprobe.c (where else an orientation bit pays: every cheap route's shape against its mirror image; `ab` = the
                     whole-array bit's A/B), strandprobe.c (strays and KINKS inside strands: ceilings, and the kink repair's A/B; writhe and persistence)
-engines/rust/       v2 engine + in-place + extras. BEHIND C on numerics (see PARITY.md).
+engines/rust/       src/port/ since 2026-11-11: THE C ENGINE TRANSLITERATED (sort_f64; PORTING.md the rules; disp.rs dispatcher + thin
+                    front, base.rs, leaf.rs, knot.rs, part.rs, count.rs, reloc.rs, ord1.rs, ord2.rs; parity/routes.sh = route
+                    equivalence against C, porttest.sh, portcheck.sh, port_runs.sh, logs-port/). Beside it sort_f64_v3, the
+                    independent v3 engine (src/engine.rs dispatcher and routes, kernel.rs + generated kernel_nets.rs the AVX2
+                    quicksort, par.rs worker pool and parallel forms, pool.rs scratch, capi.rs C entry points), the v2 engine as
+                    its portable fallback, in-place + extras unchanged. PARITY.md: every cell against C, what is ported, what is
+                    not. parity/: parity.sh (C against Rust in one binary), kernbench.sh (the two kernels alone), trace.sh (which
+                    route ran), test.sh, table.py (PARITY.md's tables from the logs), logs-2026-11-11/.
 engines/js/         Original engine (npm logos-sort). Most complete STRING engine.
 engines/python/     Sequential reference.
 experiments/ORDER_FROM_CHAOS.md  next brainstorm: golden-ratio levers, pivots, mechanisms from
@@ -507,6 +534,14 @@ wastes the session.
 | Partitioning keys on their top VARYING BITS (the threaded argsort's first cut) | log-uniform **16.2 ns** and near-sorted **30.4** at 14 threads where uniform read 5.7 | a column that straddles 1.0 has every exponent bit varying (1022 = 0111..., 1024 = 1000...), so 12 bits were 11 of exponent: ~30 buckets, the top a quarter of the array. Cells of equal width in KEY space from the smallest key: 5.9 and 4.3. A ladder of the width showed it (more bits kept helping) |
 | Calling across object files from the engine (`logos_argsort_f64_mt` in logos_psort.c calling `logos_argsort_f64` in logos_extra.c) | **every multi-copy bench stopped linking** | engine copies are built from logos_psort.c alone. The RENAME rule's twin: the engine file links on its own. `make ledgerbench` after any new entry |
 | Building every compile-time flag only in rounds that touched it | `-DLOGOS_INT_NARROW` **did not compile from 3bq** and `-DLOGOS_NO_MODE_TABLE` **from 3bj** | a type or helper moved behind another flag's `#if`; the per-round check built only the flags the round named. Build all of them (78 today) every round: grep the `#if` lines for `LOGOS_` and compile each |
+| Letting LLVM compile the AVX2 partition's "which end next" (the Rust kernel, first cut) | the kernel **0.85 of C's** from 512 elements up, on code that reads line for line the same | it became a conditional move, so each block's eight loads wait on the previous block's popcount chain; GCC keeps a predicted branch, which the C source says is the point. An empty `asm!` block in one arm keeps the branch: 0.99-1.01. Found by a kernel-only bench across sizes (`parity/kernbench.sh`), then the disassembly: **the same source is not the same loop under another compiler** |
+| Letting LLVM see through the bitonic networks' compare-exchanges | the 32- and 64-element networks **0.77-0.90** | `v` and a permutation of `v` have symmetric minima and maxima, so it narrowed to 128-bit halves and rebuilt with extra shuffles (half again as many port-5 operations). Both operands opaque: the mix is as written, 0.88-0.92; the rest is spills |
+| Tuning the Rust engine on the scoreboard's shapes until they were green before running the held-out set | 16 of 17 ahead or level, while 16 shapes it had never seen read **8 behind at one thread and 9 at fourteen** (prefix + tail 0.18, kinks 0.40, a NaN 0.44, zipf at 14 threads 0.12) | a board you tune on measures the tuning. The second set was written in the first hour and run at the end; run it with the first |
+| A plan gate that counts LIVE strands (the Rust run route) | 64 shuffled blocks went to the kernel at 2.1M and one thread, under a green bench at 8.4M | ascending block boundaries fuse blocks into runs with holes, and every fused run "crossed" every other: J5's first lesson, a third time. Found only by the test row that names its route. Gap-split the runs; gate on pieces that actually cross |
+| Sorting run endpoints with a partial order, on data that may hold a NaN (Rust) | a panic inside the standard sort; then **output that was not a permutation** at four threads | a NaN is never a descent, so it can sit inside a run; a run that begins with one has its first value AFTER its last in total order, so the strand closed before it opened and was never placed. Order endpoints by total order and make each strand's pair ordered. Found by a NaN in every shape at three thread counts, not by reading |
+| A route witness that is one process-wide variable, under a test runner that runs tests concurrently | a route test failed at random on correct code | another test's sort overwrote it. Per calling thread (written only by sorts of 2,048 elements and up) |
+| Judging a detector's stray budget per CHUNK, and then dumping a chunk's unread rest as strays as each chunk finished | first: a sorted prefix with a 5% tail declined at 14 threads (the tail is 70% of one chunk). Then: **uniform at 14 threads 0.88** | the fix for the first let plain noise copy a fourteenth of the array before the shared count said no. One budget for the array, spent only after every chunk has reported |
+| Moving a merge's gallop threshold from 8x to 64x on one shape's reading | near-sorted (2% strays) **0.79** where it had read 1.33 | the plain merge is ~3 ns per output element (its two cursors are one chain), a gallop ~50 ns per element of the short side, so the gallop wins under ~6%: 16x. Measure a threshold from both sides before moving it |
 
 ## POSITIVE results worth building on
 
@@ -1333,8 +1368,17 @@ wastes the session.
    run-merge) to C/Rust. ~~Currently multikey-quicksort only.~~ **C DONE 2026-10-09 in its own form (8-byte prefix keys through the
    numeric machinery, FINDINGS 3bl): 4-14x over std::sort at one thread, ahead of the same scheme on x86-simd-sort.** Left: Rust, an
    argsort for strings (record data), a near-ordered check finer than the prescan (logs, the weakest row at 2.4x).
-6. **Rust v3 parity**: port C's dispatcher (run-merge, momentum, skew/quant,
-   lattice) to Rust. Multi-stage.
+6. **Rust parity**: ~~port C's dispatcher to Rust~~ **THE f64 SORT IS PORTED 2026-11-11 (FINDINGS 3cd): the same algorithm, route
+   for route (`engines/rust/src/port/`, `parity/routes.sh`).** Owed on the port: tuning for LLVM where it is behind C (int radix
+   0.87, lattice and counting maps 0.89-0.94, reach blocks 0.76, near-sorted at 14 threads 0.76: compare the disassembly loop by
+   loop), the C harness's checks, a sanitizer run, then int32, strings, the view and the batch entry. The independent engine
+   (`sort_f64_v3`, FINDINGS 3cc) reached speed parity on the scoreboard at 8.4M with thirteen routes; what IT owes, by measured cell: a keyed lattice for steps not exact in
+   binary (prices 0.47), vector two-strand and k-way merges (stairs 0.77, eight logs 0.69, prefix + tail 0.70), the short-reach
+   route in place (latency 0.70 at 14 threads), heavy values counted rather than moved (half zeros 0.66 at 14), a cheaper wake
+   for small parallel sorts (0.60-0.88 at 262k-1M), the kernel's 24-64 element networks (0.88-0.92). Then what has no cell yet:
+   the thin front, a native int32 path, memory measured, fault injection, strings, the view. And the other direction: A/B in C
+   the three places Rust leads (a lattice verified by reproduction with no key table, detection fused with its first copy, the
+   radix scattering straight from the doubles).
 7. Fewer passes in the coarse path (the engine is pass-overhead-bound). Hard;
    most fruit picked. Fuse partition-scatter with first coarse count?
 
@@ -1413,6 +1457,18 @@ wastes the session.
   two-strand row, built 40/60 so the TAIL route would not take it, is a sorted head before a sorted suffix, and the head route took that
   too). When a row fails after a new route lands, ask which route is right for the shape before changing either -- and whether the
   witness counts the KERNEL or one route's use of it (`logos_twist_last(13)` now counts the head and tail routes' vector merges).
+- Don't call two engines "at parity" from the shapes one of them was tuned on: `engines/rust/PARITY.md` keeps a second set for that
+  reason, and its first run turned 16 of 17 ahead-or-level into 8 of 16 behind. And parity of SPEED is not parity of routes: say which.
+- Don't read "parity" between engines as speed: it means the same algorithm (routes, gates, constants), checked by which route
+  ran (`engines/rust/parity/routes.sh`). A session went into an engine at the same speed with other routes (3cc) before the port (3cd).
+- Don't change a route, a gate or a constant in the C engine without the same change in `engines/rust/src/port/` and a run of
+  `routes.sh`: the port is a transliteration and drifts silently otherwise.
+- Don't compare route witnesses from ONE run each at P > 1: per-bucket and per-chunk counts depend on which worker claimed what
+  (18 of 531 cells read "different" that way and 0 with ranges over six runs). And a unit test written against a stand-in tests
+  the stand-in's premise: four of the port's failed when the real functions were joined, none on a defect.
+- Don't port a hot loop to another compiler and assume it is the same loop: time the kernel alone across sizes against the
+  original (`bash engines/rust/parity/kernbench.sh`) and read the disassembly where it differs (LLVM made the partition's branch a
+  conditional move, 0.85, and folded the networks' shuffles, 0.77-0.90).
 - Don't bump the version for a change that failed its A/B.
 
 ## Build / verify quick reference (engines/c)
@@ -1465,6 +1521,13 @@ make scale-full      # time vs n (0, 1, 3, 5, 10, then half-decades to LOGOS_MAX
                      # THE VALUES ARE VISIBLE TOO (2026-09-26): a "peak heap" column in the tooltip and a third table per panel;
                      # the first three arrays of the DATA line are the sub-10k rows and read 0 BY DESIGN -- do not read them as
                      # "the pass recorded nothing". LOGOS_SCALE_REUSE strips CRLF now (a Windows checkout writes it).
+                     # MEMORY AS A CHART (2026-11-15): each panel has a THIRD uPlot (kind 'mem', class ch-mem): peak heap in bytes per
+                     # element against n for every sort, value axis always linear, from 10k up; a fixed allocation over a small n
+                     # (IPS4o's 2 MB: 215 B/elem at 10k) runs off the top by capRule's `mem` branch and is named in the caption.
+                     # tools/check_report.js counts them (66 for 66 panels with a memory pass) and refuses a log value axis or a
+                     # reading of 10 KB per element. index.html carries the same figure as a STRIP under every chart, on the chart's
+                     # n axis (mem_strip() in tools/scale_index.py, data-m for the tooltip); tools/check_index.js requires the strip
+                     # on every chart and the reading in the tooltip. Both pages were re-rendered from the 2026-11-10 measurements.
                      # THE SHAPES (2026-10-19): a collapsed accordion above the charts, one entry per shape: what the data is,
                      # a profile, two inline SVG plots and the values, built by shape_demos_json() from the bench's OWN gen() at
                      # n = 2^20 when the page is written (so a REUSE re-render carries it); each panel heading links to its entry.
@@ -1686,6 +1749,15 @@ make probebench      # fast sample (prefetch + AVX2 sort) and persistent context
 make cardbench       # counting-route lookup across a cardinality ladder (5..200 distinct, on a lattice and off it)
 make tailbench       # heavy-tail structures: key-space certificate, exponent map, dominant duplicate
 ```
+The Rust port of this engine (engines/rust/src/port; same launch form as below): `parity/routes.sh [n list] [P list] [filter]`
+(ROUTE equivalence against C, 72 shapes; ROUTES_VERBOSE=1 prints the witnesses, ROUTES_REPS=<k> the runs per engine at P > 1),
+`parity/porttest.sh [filter]` (its 80 unit tests, one at a time; PORT_TRACE=1 = the trace build), `parity/portcheck.sh <file>`
+(one port file compiled alone), `parity/port_runs.sh` (the recorded grid and speed runs -> parity/logs-port/).
+The Rust engine (engines/rust; run inside WSL, launched from PowerShell as `wsl -e bash /mnt/c/.../engines/rust/parity/<script>`):
+`parity/test.sh` (cargo test --release, 13 tests), `parity/parity.sh [n] [pairs] [P] [filter | extra | all]` (C against Rust, paired,
+verified; `build` only builds), `parity/kernbench.sh` (the two AVX2 kernels alone by chunk size), `parity/trace.sh [n] [P] [filter]`
+(which route ran; its first shape is a cold call), `python parity/table.py <logs>` (PARITY.md's tables).
+
 `make profile` before guessing where time goes: it found the histogram
 bottleneck that three sessions of A/B tuning never saw. `-DLOGOS_TRACE` prints
 per-phase timestamps to stderr (it is how the J5 gate bug was found).

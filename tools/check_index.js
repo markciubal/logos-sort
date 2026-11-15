@@ -7,13 +7,14 @@
 // nobody has tested, so this feeds that script stub <svg> elements built from the page's own data attributes, moves a
 // pointer across each one, and checks that the tooltip names the right n and that its rows are sorted and carry the
 // ratio the data implies. Each panel has two charts (time per element, total time) over the same data: both are driven, the
-// tooltip must carry the TOTAL time of every sort, and the switch between the two views is clicked. Exit 1 on any failure.
+// tooltip must carry the TOTAL time of every sort, and the switch between the two views is clicked. Under each chart is a
+// strip of peak memory per element: it must be there, hold a line, and its readings must appear in the tooltip. Exit 1 on any failure.
 const fs = require('fs');
 const path = process.argv[2];
 if (!path) { console.error('usage: check_index.js <index.html>'); process.exit(1); }
 const html = fs.readFileSync(path, 'utf8');
 const un = s => s.replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-const svgs = [...html.matchAll(/<svg class="ch m-(?:ns|tot)" id="([^"]+)" viewBox="0 0 (\d+) (\d+)" role="img" aria-label="([^"]*)" data-n="([^"]*)" data-s="([^"]*)" data-nm="([^"]*)" data-ml="(\d+)" data-mr="(\d+)">/g)];
+const svgs = [...html.matchAll(/<svg class="ch m-(?:ns|tot)" id="([^"]+)" viewBox="0 0 (\d+) (\d+)" role="img" aria-label="([^"]*)" data-n="([^"]*)" data-s="([^"]*)" data-nm="([^"]*)" data-ml="(\d+)" data-mr="(\d+)" data-m="([^"]*)">/g)];
 if (!svgs.length) { console.error('no charts found'); process.exit(1); }
 const script = (/<script>([\s\S]*?)<\/script>/.exec(html) || [])[1];
 if (!script) { console.error('no script'); process.exit(1); }
@@ -22,7 +23,7 @@ let fails = 0, events = 0;
 const tip = { hidden: true, innerHTML: '', style: {}, offsetWidth: 200, offsetHeight: 120 };
 const stubs = svgs.map(m => {
   const el = {
-    dataset: { n: un(m[5]), s: un(m[6]), nm: un(m[7]), ml: m[8], mr: m[9] },
+    dataset: { n: un(m[5]), s: un(m[6]), nm: un(m[7]), ml: m[8], mr: m[9], m: un(m[10]) },
     viewBox: { baseVal: { width: +m[2], height: +m[3] } }, listeners: {}, cur: { attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
     getAttribute(k) { return k === 'aria-label' ? un(m[4]) : null; },
     querySelector(sel) { if (sel === '.cur') return this.cur; throw new Error('unexpected selector ' + sel); },
@@ -43,6 +44,14 @@ global.document = {
   addEventListener() {},
 };
 const fmtMs = v => v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 1 : 2) + ' s' : v >= 10 ? v.toFixed(0) + ' ms' : v >= 1 ? v.toFixed(1) + ' ms' : v >= 1e-3 ? (v * 1e3).toFixed(v >= 1e-2 ? 0 : 1) + ' µs' : (v * 1e6).toFixed(1) + ' ns';
+const fmtB = v => v > 0 ? (v >= 10 ? v.toFixed(1) : v.toFixed(2)) + ' B' : '0 B';
+// MEMORY in the graph (2026-11): every chart carries a strip of peak heap per element under it, drawn from data-m, and the
+// tooltip reads that figure out for every sort the memory pass measured. A page whose report has a memory pass and whose
+// charts lack the strip, or whose strip holds no line, fails here.
+const strips = [...html.matchAll(/<g class="ms">([\s\S]*?)<\/g>/g)];
+if (strips.length !== svgs.length) { console.error('memory strips on ' + strips.length + ' of ' + svgs.length + ' charts'); fails++; }
+for (const st of strips) if (!/<polyline class="ln mm /.test(st[1]) || !st[1].includes('peak memory')) { console.error('a memory strip has no line or no title'); fails++; break; }
+let memCells = 0;
 global.innerWidth = 1200; global.innerHeight = 900;
 try { new Function(script)(); } catch (e) { console.error('script threw:', e); process.exit(1); }
 if (document.body.dataset.metric !== 'ns') { console.error('the page did not open on time per element'); fails++; }
@@ -77,6 +86,9 @@ for (const s of stubs) {
     const names = [...tip.innerHTML.matchAll(/<\/i>([^<]+)<\/td>/g)].map(m => m[1]);
     if (names.join('|') !== want.map(r => NM[r[0]]).join('|')) { console.error(s.id + ' n=' + ns[i] + ': order ' + names.join('|') + ' expected ' + want.map(r => NM[r[0]]).join('|')); fails++; break; }
     for (const [k, v] of want) { const t = '<td>' + fmtMs(v * ns[i] / 1e6) + '</td>'; if (!tip.innerHTML.includes(t)) { console.error(s.id + ' n=' + ns[i] + ': missing total time ' + t + ' for ' + NM[k]); fails++; break; } }
+    const M = JSON.parse(s.dataset.m || '{}');
+    for (const [k] of want) if (M[k] && M[k][i] != null) { const t = '<td>' + fmtB(M[k][i]) + '/el</td>'; memCells++; if (!tip.innerHTML.includes(t)) { console.error(s.id + ' n=' + ns[i] + ': missing peak memory ' + t + ' for ' + NM[k]); fails++; break; } }
+    for (const k of Object.keys(M)) for (const v of M[k]) if (v != null && !(v >= 0 && v < 1e4)) { console.error(s.id + ': memory series ' + k + ' holds ' + v); fails++; }
     const lg = S['1'][i];
     for (const [k, v] of want) if (k !== '1' && lg) { const r = (v / lg).toFixed(2) + '× logos'; if (!tip.innerHTML.includes(r)) { console.error(s.id + ' n=' + ns[i] + ': missing ratio ' + r + ' for ' + NM[k]); fails++; break; } }
     const cx = +s.cur.attrs.x1; if (Math.abs(cx - px(ns[i])) > 0.01) { console.error(s.id + ': cursor at ' + cx + ' expected ' + px(ns[i])); fails++; break; }
@@ -87,5 +99,6 @@ for (const s of stubs) {
   s.listeners.pointerleave.forEach(fn => fn({}));
   if (!tip.hidden || s.cur.attrs.x1 !== -10) { console.error(s.id + ': leave did not hide the tooltip and park the cursor'); fails++; }
 }
-console.log('check_index: ' + stubs.length + ' charts, ' + events + ' pointer events, ' + fails + ' failures');
+if (!memCells) { console.error('no tooltip carried a peak-memory figure'); fails++; }
+console.log('check_index: ' + stubs.length + ' charts, ' + strips.length + ' memory strips, ' + events + ' pointer events, ' + memCells + ' memory readings in tooltips, ' + fails + ' failures');
 process.exit(fails ? 1 : 0);

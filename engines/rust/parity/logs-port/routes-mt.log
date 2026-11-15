@@ -1,0 +1,5 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+streams4         n=300000    P=8  DIFFERENT  gallops C=2..7 R=8..11;  [varies run to run: vec-merges sf-windows runmerge-vec]
+zip_like         n=1000003   P=8  DIFFERENT  latvec C=170190..172555 R=169507..169558;
+
+3024 cells: 3022 same route, 2 different, 0 wrong output

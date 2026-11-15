@@ -1,22 +1,20 @@
-//! logos-sort — parallel sample sort with a coarse interpolation leaf.
+//! logos-sort: a distribution-aware adaptive numeric sort.
 //!
-//! Port of the C engine (`logos-sort-c`). Two-level decomposition:
+//! [`sort_f64`] is **the C flagship's algorithm** (`engines/c/logos_psort.c`, the f64 sort in its
+//! default build), transliterated into Rust in `src/port/`: the same routes in the same order
+//! with the same gates and constants, checked cell by cell against the C engine by which route
+//! ran (`parity/routes.sh`; `PORTING.md` has the rules and what is left out). Like the C engine
+//! it sorts one array at a time; concurrent callers of [`sort_f64`] take turns.
 //!
-//! * **top level**: partition into P value-balanced buckets in parallel
-//!   (sample → splitters → parallel histogram → parallel scatter);
-//! * **leaf**: each bucket is sorted in parallel by a coarse *interpolation*
-//!   sort — map each value linearly to a sub-bucket (one count + one scatter
-//!   pass per level) and recurse. Pathological ranges (non-finite span, extreme
-//!   concentration, depth exhaustion) fall back to `slice::sort_unstable`, so
-//!   the worst case is the standard library's own worst case.
+//! It needs x86-64 with AVX2 and FMA, detected at run time; anywhere else, and for arrays of
+//! 2^32 elements or more, [`sort_f64`] runs [`sort_f64_v2`], the portable engine this crate
+//! began with. [`sort_f64_v3`] is an independent engine to the same architecture with thirteen
+//! routes of its own design (`engine.rs`, `par.rs`), written before the port: it matches the C
+//! engine's speed on the scoreboard's shapes but not its decisions (`PARITY.md`), and it may be
+//! called from several threads at once.
 //!
-//! Concurrency layout: the histogram phase shares a read-only borrow; the
-//! per-bucket sort phase hands each thread disjoint `&mut` slices obtained via
-//! `split_at_mut` (data-race freedom is compiler-checked); only the scatter
-//! phase — interleaved disjoint writes — uses `unsafe`, with the disjointness
-//! argument documented at the site.
-//!
-//! Results never depend on the thread count. NaN ordering is unspecified.
+//! Results never depend on the thread count. With a NaN in the array the order is unspecified
+//! (the output is still a permutation of the input's bit patterns).
 
 use std::thread;
 
@@ -26,9 +24,119 @@ const MAX_DEPTH: u32 = 40;
 const OVERSAMPLE: usize = 32;
 const MIN_PARALLEL: usize = 1 << 16;
 
-/// Sort `a` ascending using up to `nthreads` threads. In place; allocates ~8n
-/// bytes of scratch. `nthreads <= 1` runs fully sequential.
+#[cfg(target_arch = "x86_64")]
+mod engine;
+#[cfg(target_arch = "x86_64")]
+mod kernel;
+#[cfg(target_arch = "x86_64")]
+mod par;
+#[cfg(target_arch = "x86_64")]
+mod pool;
+#[cfg(target_arch = "x86_64")]
+mod port;
+pub mod capi;
+#[cfg(target_arch = "x86_64")]
+pub use engine::Route;
+
+/// Which route finished the calling thread's most recent [`sort_f64_v3`] of at least 2,048 elements
+/// (for tests and benches). `Route::None` before the first one.
+#[cfg(target_arch = "x86_64")]
+pub fn last_route() -> Route {
+    engine::last_route()
+}
+
+/// Frees the scratch buffers and stops the worker threads the engine keeps between calls.
+pub fn release_buffers() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        par::shutdown();
+        pool::release_buffers();
+        #[cfg(feature = "port_all")]
+        {
+            let _g = port_lock();
+            // SAFETY: the lock makes this the only caller inside the port.
+            unsafe { port::logos_release_buffers() };
+        }
+    }
+}
+
+/// The port keeps the C engine's global pools, so it sorts one array at a time: every entry takes this.
+#[cfg(all(target_arch = "x86_64", feature = "port_all"))]
+fn port_lock() -> std::sync::MutexGuard<'static, ()> {
+    static PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    PORT.lock().unwrap_or_else(|e| e.into_inner())
+}
+#[cfg(target_arch = "x86_64")]
+fn v3_cpu() -> bool {
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && is_x86_feature_detected!("popcnt")
+}
+
+/// [`sort_f64`], returning the C engine's route witnesses for this one sort: `logos_twist_last(k)` for each `k` in
+/// `keys` (see `logos_psort.c`; 100 = `logos_reach_last()`, 101 = `logos_mirror_count`). For tests: the witnesses are
+/// process-wide, so they are cleared, the array sorted and the witnesses read under one lock. `None` where the port
+/// does not run (no AVX2 and FMA, or 2^32 elements and more).
+#[cfg(all(target_arch = "x86_64", feature = "port_all"))]
+pub fn sort_f64_witnessed(a: &mut [f64], nthreads: usize, keys: &[i32]) -> Option<Vec<usize>> {
+    if a.len() >= (1usize << 32) || !v3_cpu() {
+        sort_f64_v2(a, nthreads);
+        return None;
+    }
+    let _g = port_lock();
+    // SAFETY: the CPU features were detected and the lock makes this the only sort inside the port.
+    unsafe {
+        let read = |k: i32| match k {
+            100 => port::logos_reach_last() as usize,
+            101 => port::logos_mirror_count(1),
+            _ => port::logos_twist_last(k),
+        };
+        for &k in keys { let _ = read(k); }
+        let _ = port::logos_twist_last(-1);
+        port::logos_sort_f64(a.as_mut_ptr(), a.len(), nthreads.max(1) as i32);
+        Some(keys.iter().map(|&k| read(k)).collect())
+    }
+}
+
+/// Sort `a` ascending using up to `nthreads` threads (`nthreads <= 1`: sequential), by the C engine's algorithm
+/// (`src/port/`). In place; scratch is kept between calls (see [`release_buffers`]). One sort at a time: a second
+/// caller waits for the first.
 pub fn sort_f64(a: &mut [f64], nthreads: usize) {
+    if a.len() < 2 {
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "port_all"))]
+    if a.len() < (1usize << 32) && v3_cpu() {
+        let _g = port_lock();
+        // SAFETY: the CPU features were detected and the lock makes this the only sort inside the port.
+        unsafe { port::logos_sort_f64(a.as_mut_ptr(), a.len(), nthreads.max(1) as i32) };
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "port_all")))]
+    if a.len() < (1usize << 32) && v3_cpu() {
+        // SAFETY: the CPU features the engine is compiled for were just detected.
+        unsafe { engine::sort(a, nthreads.max(1)) };
+        return;
+    }
+    sort_f64_v2(a, nthreads);
+}
+
+/// The independent v3 engine (`engine.rs`, `par.rs`): the C engine's architecture with thirteen routes of its own
+/// design. Not the C's algorithm; callable from several threads at once. Falls back as [`sort_f64`] does.
+pub fn sort_f64_v3(a: &mut [f64], nthreads: usize) {
+    if a.len() < 2 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if a.len() < (1usize << 32) && v3_cpu() {
+        // SAFETY: the CPU features the engine is compiled for were just detected.
+        unsafe { engine::sort(a, nthreads.max(1)) };
+        return;
+    }
+    sort_f64_v2(a, nthreads);
+}
+
+/// The v2 engine (parallel sample sort + coarse interpolation leaf): portable, and the fallback
+/// of [`sort_f64`]. In place; allocates ~8n bytes of scratch. `nthreads <= 1` runs sequential.
+pub fn sort_f64_v2(a: &mut [f64], nthreads: usize) {
     let n = a.len();
     if n < 2 {
         return;

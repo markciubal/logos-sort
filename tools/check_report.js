@@ -82,6 +82,13 @@ function uPlot(opts, data, holder) {
   }
   const logY = opts.scales && opts.scales.y && opts.scales.y.distr === 3;
   if (opts.class === 'ch-nsel' && logY) die('the ns-per-element chart is on a log value axis; it must stay linear');
+  // the memory chart (2026-11): bytes per element, where half the sorts read exactly 0, so its value axis may never be a log one;
+  // a reading of 10 KB per element or more is one the pass could not take and must not be drawn; and it carries no dashed references
+  if (opts.class === 'ch-mem') {
+    if (logY) die('the memory chart is on a log value axis; it must stay linear');
+    for (let s = 1; s < data.length; s++) { for (const v of data[s]) if (v !== null && !(v >= 0 && v < 1e4)) die(`memory series ${s} holds ${v} bytes per element`); if (opts.series[s].dash) die('the memory chart drew a growth reference'); }
+    if (!data.slice(1).some(col => col.some(v => v > 0))) die('the memory chart holds no reading above zero');
+  }
   for (let s = 1; s < data.length; s++) {
     if (!Array.isArray(data[s]) || data[s].length !== xs.length) die(`series ${s} has ${data[s] && data[s].length} points, x has ${xs.length}`);
     for (const v of data[s]) {
@@ -108,7 +115,7 @@ function uPlot(opts, data, holder) {
       out.forEach((lbl, j) => { if (lbl != null && typeof lbl !== 'string' && typeof lbl !== 'number') die(`axis ${i} label ${j} is ${typeof lbl}`); });
     });
   });
-  CREATED.push({ opts, data, nseries: data.length - 1, logX, kind: opts.class === 'ch-nsel' ? 'nsel' : 'time' });
+  CREATED.push({ opts, data, nseries: data.length - 1, logX, kind: opts.class === 'ch-nsel' ? 'nsel' : opts.class === 'ch-mem' ? 'mem' : 'time' });
   this.destroy = () => { destroyed++; };
   this.setSize = sz => { if (!sz || !(sz.width > 0)) throw new Error('setSize got a bad size'); };
   this.setData = () => {};
@@ -283,7 +290,9 @@ function exercise1(label) {
     if (!(u.scales.y.max > u.scales.y.min)) fail('hiding a series while zoomed left an empty value axis');
     u.series[1].show = true; (u.hooks.setSeries || []).forEach(h => h(u, 1, { show: true }));
     // the box by the pointer
-    u._in = true; u.cursor = { left: 120, top: 60, idx: Math.min(2, u.data[0].length - 1) }; IX.tip(u);
+    // (the memory chart has no reading below the seam: point at the first size where some series has one)
+    let ti = Math.min(2, u.data[0].length - 1); while (ti < u.data[0].length - 1 && !u.data.slice(1).some(c => c[ti] != null)) ti++;
+    u._in = true; u.cursor = { left: 120, top: 60, idx: ti }; IX.tip(u);
     if (!u._tip || u._tip.style.display !== 'block' || !/n = /.test(u._tip.innerHTML) || !/<tr>/.test(u._tip.innerHTML)) fail('the box by the pointer did not render');
     u._in = false; IX.tip(u); if (u._tip.style.display !== 'none') fail('the box by the pointer stayed up after the pointer left');
     IX.reset(u); atHome('the last reset'); follow('the last reset');
@@ -316,9 +325,16 @@ if (isScale && CREATED.length) {
   console.log(`scale charts: ${n1} linear + ${n2} log, ${series} series total, ${destroyed} destroyed on re-render`);
   if (n1 < 2 || n2 !== n1) { console.error('RENDER INCOMPLETE'); process.exit(3); }
   // a panel is one time chart, one data table and (in reports that have them) one ns-per-element chart
-  const lin = CREATED.slice(0, n1), timeCharts = lin.filter(c => c.kind === 'time').length, nsCharts = n1 - timeCharts;
+  const lin = CREATED.slice(0, n1), timeCharts = lin.filter(c => c.kind === 'time').length, memCharts = lin.filter(c => c.kind === 'mem').length, nsCharts = n1 - timeCharts - memCharts;
   const tables = made.filter(e => /<table/.test(e.innerHTML)).length;
-  console.log(`panels: ${timeCharts} time charts, ${nsCharts} ns-per-element charts, ${tables} tables`);
+  console.log(`panels: ${timeCharts} time charts, ${nsCharts} ns-per-element charts, ${memCharts} memory charts, ${tables} tables`);
+  // a report whose template has the memory chart and whose data has a memory pass must draw one per panel that was measured
+  if (/kind==='mem'/.test(src)) {
+    const D = JSON.parse((/const DATA=(\[.*?\]),META=/s.exec(src) || [, 'null'])[1]);
+    const want = D ? D.filter(s => s.rows.some(r => r.m && r.m.some(v => v > 0))).length : -1;
+    if (want >= 0 && memCharts !== want) { console.error(`RENDER INCOMPLETE: ${memCharts} memory charts for ${want} panels with a memory pass`); process.exit(3); }
+    if (want < 0) console.log('(could not read DATA to count the panels with a memory pass)');
+  }
   if (tables < timeCharts) { console.error('RENDER INCOMPLETE: a panel has no data table'); process.exit(3); }
   if (nsCharts && nsCharts !== timeCharts) { console.error('RENDER INCOMPLETE: a panel has no ns-per-element chart'); process.exit(3); }
   // n = 0: if the data has it, the linear view must actually draw it and the log view must not

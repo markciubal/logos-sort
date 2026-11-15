@@ -161,6 +161,53 @@ def guides(ns, vals, px, pyr, per_el):
         for i in range(len(ends) - 2, -1, -1): ends[i][0] = min(ends[i][0], ends[i + 1][0] - 12)
     for y, name in ends: out.append('<text x="%d" y="%.1f">%s</text>' % (xr + 5, y, name))
     return '<g class="gd" aria-hidden="true">%s</g>' % "".join(out)
+# ---- MEMORY, in the graph: a strip under each chart on the chart's own n axis. Peak heap of one cold call in BYTES PER ELEMENT
+# (the report's memory pass), one line per sort that the pass measured; a sort that allocates nothing lies on zero. The axis
+# opens to 1.6x the 85th percentile of the readings above zero (and never below logos's own largest): a FIXED allocation
+# divided by a small n (IPS4o takes ~2 MB whatever n is: 215 bytes per element at 10k, 0.04 at 50M) would otherwise press
+# every other line into the floor. A point above the axis is a triangle at the strip's top, as in the chart above it; its
+# value is in the tooltip. Returns the SVG fragment and the series for the tooltip (data-m).
+MS_TOP, MS_H, MS_BOT = 32, 84, 10
+HT = H + MS_TOP + MS_H + MS_BOT
+def fmt_b(v): return "0" if not v else ("%.1f" % v if v >= 10 else "%.2f" % v)
+def mem_strip(rows, ns, keys, px, ml):
+    y0, y1 = H + MS_TOP, H + MS_TOP + MS_H
+    meas = [any(m > 0 for m in r["m"]) for r in rows]
+    ser = {k: [(r["m"][k] if ok and r["t"][k] > 0 and mem_ok(r["m"][k]) else None) for r, ok in zip(rows, meas)] for k in keys}
+    ser = {k: v for k, v in ser.items() if any(x is not None for x in v)}
+    if not ser: return "", {}
+    nz = sorted(x for v in ser.values() for x in v if x)
+    cap = 1.0
+    if nz:
+        lgmax = max([x for x in ser.get(LOGOS, []) if x] or [0])
+        cap = min(max(1.6 * nz[int(0.85 * (len(nz) - 1))], 1.1 * lgmax), nz[-1])
+    raw = cap / 3.0; mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw * (1 - 1e-9))
+    cap = math.ceil(cap / step - 1e-9) * step
+    def py(v): return y1 - min(v, cap) / cap * MS_H
+    g = ['<text class="tk mt" x="%d" y="%d">peak memory &middot; bytes per element</text>' % (ml, y0 - 9)]
+    yt = 0.0
+    while yt <= cap + 1e-9:
+        g.append('<line class="grid" x1="%d" x2="%d" y1="%.1f" y2="%.1f"/><text class="tk" x="%d" y="%.1f" text-anchor="end" dominant-baseline="middle">%s</text>' % (ml, W - MR, py(yt), py(yt), ml - 6, py(yt), "%g" % round(yt, 6)))
+        yt += step
+    d = math.ceil(math.log10(ns[0]) - 1e-9)
+    while d <= math.log10(ns[-1]) + 1e-9:
+        g.append('<line class="grid v" x1="%.1f" x2="%.1f" y1="%d" y2="%d"/>' % (px(10 ** d), px(10 ** d), y0, y1)); d += 1
+    for k in [q for q in ORDER if q != LOGOS and q in ser] + ([LOGOS] if LOGOS in ser else []):      # logos last: on top where lines share zero
+        segs, cur = [], []
+        for n, v in zip(ns, ser[k]):
+            if v is None or v > cap:
+                if cur: segs.append(cur); cur = []
+                if v is not None: g.append('<path class="clip %s" d="M%.1f %.1fl-3.5 6h7z"/>' % (CLS[k], px(n), y0 + 1))
+            else: cur.append((px(n), py(v)))
+        if cur: segs.append(cur)
+        for seg in segs:
+            if len(seg) == 1: g.append('<circle class="pt %s" cx="%.1f" cy="%.1f" r="2.5"/>' % (CLS[k], seg[0][0], seg[0][1]))
+            else: g.append('<polyline class="ln mm %s%s" points="%s"/>' % (CLS[k], " lg" if k == LOGOS else "", " ".join("%.1f,%.1f" % p for p in seg)))
+    if LOGOS in ser:
+        li = max(i for i, v in enumerate(ser[LOGOS]) if v is not None); v = ser[LOGOS][li]; ly = py(v)
+        g.append('<text class="lbl s-logos" x="%.1f" y="%.1f" text-anchor="end">logos %s B</text>' % (px(ns[li]) - 2, ly - 6 if ly > y0 + 16 else ly + 15, fmt_b(v)))
+    return '<g class="ms">%s</g>' % "".join(g), {str(k): [None if v is None else round(v, 2) for v in vs] for k, vs in ser.items()}
 def tick_ms(v):
     if v >= 1000: return "%g s" % (v / 1000)
     if v >= 1: return "%g ms" % v
@@ -204,12 +251,13 @@ def chart_total(s, cid):
     li = max(i for i, v in enumerate(tot[LOGOS]) if v is not None)
     lx, ly = px(ns[li]), py(tot[LOGOS][li])
     g.append('<text class="lbl s-logos" x="%.1f" y="%.1f" text-anchor="end">logos %s</text>' % (lx - 4, ly + 16 if ly < H - MB - 22 else ly - 8, fmt_ms(tot[LOGOS][li])))
-    g.append('<line class="cur" x1="-10" x2="-10" y1="%d" y2="%d"/>' % (MT, H - MB))
+    strip, mem_json = mem_strip(rows, ns, list(tot), px, ml); g.append(strip)
+    g.append('<line class="cur" x1="-10" x2="-10" y1="%d" y2="%d"/>' % (MT, H + MS_TOP + MS_H if strip else H - MB))
     series_json = {str(k): [None if v is None else round(v * 1e6 / n, 3) for n, v in zip(ns, tot[k])] for k in tot}
     name_json = {str(k): short(names[k]) for k in tot}
-    return ('<svg class="ch m-tot" id="%s" viewBox="0 0 %d %d" role="img" aria-label="%s, %s: total time of one sort against n" '
-            'data-n="%s" data-s="%s" data-nm="%s" data-ml="%d" data-mr="%d">%s</svg>') % (
-        cid, W, H, esc(s["shape"]), "one thread" if s["threads"] == 1 else "%d threads" % s["threads"], esc(json.dumps(ns)), esc(json.dumps(series_json)), esc(json.dumps(name_json)), ml, MR, "".join(g))
+    return ('<svg class="ch m-tot" id="%s" viewBox="0 0 %d %d" role="img" aria-label="%s, %s: total time of one sort against n, and under it peak memory per element" '
+            'data-n="%s" data-s="%s" data-nm="%s" data-ml="%d" data-mr="%d" data-m="%s">%s</svg>') % (
+        cid, W, HT if strip else H, esc(s["shape"]), "one thread" if s["threads"] == 1 else "%d threads" % s["threads"], esc(json.dumps(ns)), esc(json.dumps(series_json)), esc(json.dumps(name_json)), ml, MR, esc(json.dumps(mem_json)), "".join(g))
 def nice_step(cap):
     raw = cap / 4.5; mag = 10 ** math.floor(math.log10(raw))
     for m in (1, 2, 2.5, 5, 10):
@@ -260,13 +308,14 @@ def chart(s, cid):
     lx, ly = px(ns[-1]), py(last[LOGOS])
     ltot = next((r["t"][LOGOS] for r in reversed(rows) if r["t"][LOGOS] > 0), None)
     g.append('<text class="lbl s-logos" x="%.1f" y="%.1f" text-anchor="end">logos %s · %s in all</text>' % (lx - 2, ly - 6 if ly > MT + 14 else ly + 14, fmt_ns(last[LOGOS]), fmt_ms(ltot)))
-    g.append('<line class="cur" x1="-10" x2="-10" y1="%d" y2="%d"/>' % (MT, H - MB))
+    strip, mem_json = mem_strip(rows, ns, list(ser), px, ML); g.append(strip)
+    g.append('<line class="cur" x1="-10" x2="-10" y1="%d" y2="%d"/>' % (MT, H + MS_TOP + MS_H if strip else H - MB))
     off.sort(reverse=True)
     series_json = {str(k): [None if v is None else round(v, 3) for v in ser[k]] for k in ser}
     name_json = {str(k): short(names[k]) for k in ser}
-    svg = ('<svg class="ch m-ns" id="%s" viewBox="0 0 %d %d" role="img" aria-label="%s, %s: nanoseconds per element against n" '
-           'data-n="%s" data-s="%s" data-nm="%s" data-ml="%d" data-mr="%d">%s</svg>') % (
-        cid, W, H, esc(s["shape"]), "one thread" if s["threads"] == 1 else "%d threads" % s["threads"], esc(json.dumps(ns)), esc(json.dumps(series_json)), esc(json.dumps(name_json)), ML, MR, "".join(g))
+    svg = ('<svg class="ch m-ns" id="%s" viewBox="0 0 %d %d" role="img" aria-label="%s, %s: nanoseconds per element against n, and under it peak memory per element" '
+           'data-n="%s" data-s="%s" data-nm="%s" data-ml="%d" data-mr="%d" data-m="%s">%s</svg>') % (
+        cid, W, HT if strip else H, esc(s["shape"]), "one thread" if s["threads"] == 1 else "%d threads" % s["threads"], esc(json.dumps(ns)), esc(json.dumps(series_json)), esc(json.dumps(name_json)), ML, MR, esc(json.dumps(mem_json)), "".join(g))
     return svg, off
 
 def panel_table(s):
@@ -404,6 +453,7 @@ svg.ch .tk{fill:var(--muted);font-size:13.5px;font-family:inherit}
 svg.ch .ln{fill:none;stroke:var(--c);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}svg.ch .ln.lg{stroke-width:3}
 svg.ch .clip,svg.ch .pt{fill:var(--c)}figcaption span{text-transform:none;letter-spacing:0}svg.ch .lbl{fill:var(--c);font-size:12.5px;font-weight:600;font-family:inherit;paint-order:stroke;stroke:var(--surface);stroke-width:3px}
 svg.ch .cur{stroke:var(--axis);stroke-width:1;stroke-dasharray:3 3}
+svg.ch .ln.mm{stroke-width:1.5}svg.ch .ln.mm.lg{stroke-width:2.5}svg.ch .mt{font-size:12px;fill:var(--ink2)}
 svg.ch .gd polyline{fill:none;stroke:var(--muted);stroke-width:1;stroke-dasharray:5 4}
 svg.ch .gd text{fill:var(--muted);font-size:11px;font-family:inherit;paint-order:stroke;stroke:var(--surface);stroke-width:3px}
 body[data-guides="off"] svg.ch .gd{display:none}
@@ -418,7 +468,7 @@ body[data-guides="off"] svg.ch .gd{display:none}
 .seg button:focus-visible{outline:2px solid var(--s-logos);outline-offset:-2px}
 ul.notes{padding-left:1.2rem;max-width:74ch;font-size:.94rem}ul.notes li{margin:0 0 .55rem}code{font-size:.88em;background:var(--surface);border:1px solid var(--grid);border-radius:4px;padding:0 .25rem}
 .desc{font-size:.9rem;color:var(--ink2);max-width:80ch}
-#tip{position:fixed;z-index:20;pointer-events:none;background:var(--surface);color:var(--ink);border:1px solid var(--axis);border-radius:6px;padding:.4rem .6rem;font-size:.8rem;box-shadow:0 4px 18px rgba(0,0,0,.14);max-width:min(320px,calc(100vw - 32px))}
+#tip{position:fixed;z-index:20;pointer-events:none;background:var(--surface);color:var(--ink);border:1px solid var(--axis);border-radius:6px;padding:.4rem .6rem;font-size:.8rem;box-shadow:0 4px 18px rgba(0,0,0,.14);max-width:min(400px,calc(100vw - 32px))}
 #tip table{font-size:.78rem;width:auto}#tip td{padding:.1rem .45rem;border:0}#tip .h{font-weight:600;margin:0 0 .2rem}
 .who{display:flex;gap:.7rem;align-items:baseline;margin:0 0 .55rem;font-size:.92rem}.who .sw{flex:none;position:relative;top:-2px}
 ul.method{padding-left:1.2rem;max-width:72ch;font-size:.92rem}ul.method li{margin:0 0 .35rem}
@@ -431,7 +481,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);font-si
 <p class="eyebrow">Benchmark</p>
 <h1>logos-sort against the fastest open-source sorts</h1>
 <p class="lede">logos-sort reads the shape of its input before it sorts. When the data has structure &mdash; stretches already in order, a handful of distinct values, numbers on a fixed grid, sorted blocks in the wrong order &mdash; it places elements by address instead of comparing them. This page times it against Intel&rsquo;s x86-simd-sort, Google&rsquo;s VQSort, IPS&#8308;o and the C++ standard library on %(ninputs)d inputs, %(range)s, on one thread and on %(P)d.</p>
-<p class="meta"><span>%(cpu)s</span><span>%(compiler)s</span><span>%(P)d threads for the parallel runs (%(ncpus)d logical CPUs)</span><span>measured %(when)s</span><span><a href="reports/scale-report.html">the full report</a>: every size, zoomable charts, memory per sort</span></p>
+<p class="meta"><span>%(cpu)s</span><span>%(compiler)s</span><span>%(P)d threads for the parallel runs (%(ncpus)d logical CPUs)</span><span>measured %(when)s</span><span><a href="reports/scale-report.html">the full report</a>: every size, zoomable charts, a memory chart per panel</span></p>
 </header>
 
 <h2 id="largest">At the largest size</h2>
@@ -453,7 +503,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);font-si
 <p class="hint">Each figure above comes from timing the engine against itself with that one change switched off, in alternating pairs on the same data. The charts below were measured with all of them in.</p>
 
 <h2 id="curves">How long each sort takes as the input grows</h2>
-<p>One pair of charts per input: sorts that each use one thread on the left, sorts that each use %(P)d threads on the right. Two views of the same measurements. <b>Per element</b> divides each time by n, so a flat line is linear scaling and a rising one is the n log n of a comparison sort (or a cache being outgrown); its axis opens to show logos and its nearest rivals, a triangle at the top marks a point above it, and the line beneath the chart names the sorts that run off the top. <b>Total time</b> is how long one whole sort took, on a logarithmic axis because it runs from microseconds to tens of seconds; every sort fits, and a gap of one gridline is ten times. Hover or touch a chart in either view to read both figures for every sort at that n; the label on logos&rsquo;s line gives its last point. Sizes start at 10,000, where each point is one array sorted repeatedly with the minimum kept; the <a href="reports/scale-report.html">full report</a> goes down to an empty array.</p>
+<p>One pair of charts per input: sorts that each use one thread on the left, sorts that each use %(P)d threads on the right. Two views of the same measurements. <b>Per element</b> divides each time by n, so a flat line is linear scaling and a rising one is the n log n of a comparison sort (or a cache being outgrown); its axis opens to show logos and its nearest rivals, a triangle at the top marks a point above it, and the line beneath the chart names the sorts that run off the top. <b>Total time</b> is how long one whole sort took, on a logarithmic axis because it runs from microseconds to tens of seconds; every sort fits, and a gap of one gridline is ten times. Under each chart, on the same n axis, a strip plots <b>peak memory</b>: the most heap one cold call of each sort held, in bytes per element (a double is 8 bytes, so 8 is one extra copy of the input; on the string inputs an element is an 8-byte pointer). A sort that allocates nothing lies on zero, and a triangle at the strip&rsquo;s top is a point above its axis, usually a fixed allocation divided by a small n. Hover or touch a chart in either view to read the total time, the time per element and the peak memory of every sort at that n; the label on logos&rsquo;s line gives its last point. Sizes start at 10,000, where each point is one array sorted repeatedly with the minimum kept; the <a href="reports/scale-report.html">full report</a> goes down to an empty array.</p>
 <div class="pick"><span id="pickl">Charts show</span><span class="seg" role="group" aria-labelledby="pickl"><button type="button" data-m="ns" aria-pressed="true">time per element</button><button type="button" data-m="tot" aria-pressed="false">total time</button></span><label class="gdt"><input type="checkbox" id="gd" checked> growth guides, O(1) to O(n&sup2;)</label></div>
 <p class="hint">The dashed grey lines are growth guides. Each starts at logos&rsquo;s time at the smallest size plotted and shows where that time would go if it grew as O(1), O(log n), O(n), O(n log n) or O(n&sup2;) from there. In the total-time view they fan out upward: O(n) climbs one gridline per tenfold n, O(n&sup2;) two and leaves the top. In the per-element view everything is divided by n, so O(n) is the flat line, O(n log n) rises gently, O(n&sup2;) shoots off the top and O(1) and O(log n) fall to the axis. A measured line that tracks a guide grows at that rate over this range; one that bends away from O(n) late is usually the data outgrowing a cache, not a change of algorithm.</p>
 <div class="legend">%(legend)s</div>
@@ -468,6 +518,7 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--line);font-si
 <li><b>Every output is checked</b> against std::sort&rsquo;s on the same input before its time counts. A mismatch marks the row with &#10007;; there are none unless one is shown.</li>
 <li><b>Same input, best of several runs.</b> Each size is sorted by every contender in turn from an identical copy: the fastest of 5 runs up to a million elements, of 3 up to ten million, 1 above.</li>
 <li><b>One thread against one thread, %(P)d against %(P)d.</b> %(P)d is the physical core count; every parallel sort is given that many threads, IPS&#8308;o included.</li>
+<li><b>Memory is the peak heap of one cold call</b>, measured in a separate pass after all the timing, with the engine&rsquo;s buffer pools released first so the call pays for everything it uses. What a warm call keeps between sorts is not in these charts.</li>
 <li><b>Strings stop at %(strmax)s elements and the memory pass at %(memn)s.</b> A billion strings do not fit the machine, and per element the memory figures are flat from ten million up.</li>
 <li><b>The machine is a laptop under WSL2, not a lab.</b> Absolute times move by tens of percent between runs; the sorts at one size run seconds apart, so the comparisons within a chart hold, and differences under 5%% count as level.</li>
 </ul>
@@ -492,15 +543,16 @@ python ../../tools/scale_index.py ../../reports/scale-report.html ../../index.ht
  const fmtNs=v=>v>=1e6?(v/1e6).toFixed(1)+' ms':v>=1e3?(v/1e3).toFixed(1)+' µs':(v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2))+' ns';
  const fmtMs=v=>v>=1000?(v/1000).toFixed(v>=10000?1:2)+' s':v>=10?v.toFixed(0)+' ms':v>=1?v.toFixed(1)+' ms':v>=1e-3?(v*1e3).toFixed(v>=1e-2?0:1)+' µs':(v*1e6).toFixed(1)+' ns';
  const fmtN=n=>n>=1e9?+(n/1e9).toFixed(2)+'B':n>=1e6?+(n/1e6).toFixed(2)+'M':n>=1e3?+(n/1e3).toFixed(1)+'k':String(n);
+ const fmtB=v=>v>0?(v>=10?v.toFixed(1):v.toFixed(2))+' B':'0 B';
  const CL={0:'s-base',1:'s-logos',2:'s-xss',3:'s-ips',4:'s-radix',5:'s-tim',6:'s-inpl',7:'s-vq'};
  document.querySelectorAll('svg.ch').forEach(svg=>{
-  const ns=JSON.parse(svg.dataset.n),S=JSON.parse(svg.dataset.s),NM=JSON.parse(svg.dataset.nm),ml=+svg.dataset.ml,mr=+svg.dataset.mr,W=svg.viewBox.baseVal.width;
+  const ns=JSON.parse(svg.dataset.n),S=JSON.parse(svg.dataset.s),NM=JSON.parse(svg.dataset.nm),M=JSON.parse(svg.dataset.m||'{}'),ml=+svg.dataset.ml,mr=+svg.dataset.mr,W=svg.viewBox.baseVal.width;
   const cur=svg.querySelector('.cur'),x0=Math.log10(ns[0]),x1=Math.log10(ns[ns.length-1]);
   const px=n=>ml+(Math.log10(n)-x0)/((x1-x0)||1)*(W-ml-mr);
   function at(ev){const r=svg.getBoundingClientRect(),x=(ev.clientX-r.left)/r.width*W;let bi=0,bd=1e9;ns.forEach((n,i)=>{const d=Math.abs(px(n)-x);if(d<bd){bd=d;bi=i;}});return bi;}
   function show(ev){const i=at(ev),n=ns[i];cur.setAttribute('x1',px(n));cur.setAttribute('x2',px(n));
    const rows=Object.keys(S).map(k=>[k,S[k][i]]).filter(r=>r[1]!=null).sort((a,b)=>a[1]-b[1]);const lg=S['1']?S['1'][i]:null;
-   tip.innerHTML='<div class="h">'+svg.getAttribute('aria-label').split(':')[0]+' · n = '+Number(n).toLocaleString('en-US')+'</div><table>'+rows.map(r=>'<tr><td><i class="sw '+CL[r[0]]+'"></i>'+NM[r[0]]+'</td><td>'+fmtMs(r[1]*n/1e6)+'</td><td>'+fmtNs(r[1])+'/el</td><td>'+(lg&&r[0]!='1'?(r[1]/lg).toFixed(2)+'× logos':'')+'</td></tr>').join('')+'</table>';
+   tip.innerHTML='<div class="h">'+svg.getAttribute('aria-label').split(':')[0]+' · n = '+Number(n).toLocaleString('en-US')+'</div><table>'+rows.map(r=>'<tr><td><i class="sw '+CL[r[0]]+'"></i>'+NM[r[0]]+'</td><td>'+fmtMs(r[1]*n/1e6)+'</td><td>'+fmtNs(r[1])+'/el</td><td>'+(lg&&r[0]!='1'?(r[1]/lg).toFixed(2)+'× logos':'')+'</td><td>'+(M[r[0]]&&M[r[0]][i]!=null?fmtB(M[r[0]][i])+'/el':'')+'</td></tr>').join('')+'</table>';
    tip.hidden=false;const tw=tip.offsetWidth,th=tip.offsetHeight;let L=ev.clientX+14,T=ev.clientY+14;if(L+tw>innerWidth-8)L=ev.clientX-tw-14;if(T+th>innerHeight-8)T=ev.clientY-th-14;tip.style.left=Math.max(8,L)+'px';tip.style.top=Math.max(8,T)+'px';}
   function hide(){tip.hidden=true;cur.setAttribute('x1',-10);cur.setAttribute('x2',-10);}
   svg.addEventListener('pointermove',show);svg.addEventListener('pointerdown',show);svg.addEventListener('pointerleave',hide);

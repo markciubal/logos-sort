@@ -2,12 +2,30 @@
 name = "logos-sort"
 version = "0.3.0"
 edition = "2021"
-description = "Parallel sample sort with a coarse interpolation leaf; benchmarked against slice::sort_unstable and rayon's par_sort_unstable."
+description = "Distribution-aware adaptive numeric sort: counting, lattice, radix, run and partition routes over an AVX2 quicksort leaf."
+
+[lib]
+crate-type = ["rlib", "staticlib"]   # staticlib: parity/parity.cpp links it beside the C engine
 
 # The library itself has no dependencies. rayon is only used by the benchmark
 # (examples/bench.rs) as the parallel opponent.
 [dev-dependencies]
 rayon = "=1.10.0"   # last release supporting rustc 1.75
+
+[features]
+default = ["port_all"]   # sort_f64 is the transliterated C engine; without it, the independent v3 engine
+trace = []   # phase timing to stderr: which route ran and where its time went (never for ranking routes)
+# The transliteration of the C engine (src/port, PORTING.md). port_all is the whole of it; the others compile one file alone.
+port_all = []
+port_base = []
+port_leaf = []
+port_knot = []
+port_part = []
+port_count = []
+port_reloc = []
+port_ord1 = []
+port_ord2 = []
+port_disp = []
 
 [profile.release]
 lto = true

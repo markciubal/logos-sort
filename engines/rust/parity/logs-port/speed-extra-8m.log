@@ -1,0 +1,45 @@
+    Finished `release` profile [optimized] target(s) in 0.11s
+parity: n = 8388608, 10 adjacent pairs per cell, every output verified; calibration memcpy-64MB 3.3 ms, std::sort-1M 63.4 ms
+ns per element (minimum); ratio = median of t(C) / t(Rust) over the pairs, above 1 = Rust faster
+
+1 thread
+  shape                   C      Rust     ratio     p10     p90
+  normal              9.69      9.67      0.998   0.979   1.020  PARITY
+  lognormal           9.52      9.64      0.998   0.973   1.052  PARITY
+  int_narrow          7.32      7.02      1.039   0.984   1.088  PARITY
+  zipf                3.46      3.07      1.141   1.098   1.175  RUST
+  prices              4.19      4.10      1.020   0.934   1.159  PARITY
+  sawtooth           15.46     15.39      0.963   0.930   1.031  PARITY
+  prefix_95           2.18      2.09      1.022   0.997   1.081  PARITY
+  kinks               0.67      0.68      1.023   0.990   1.093  PARITY
+  block_twist         1.31      1.28      0.984   0.892   1.159  PARITY
+  stairs              1.78      1.75      1.039   0.995   1.139  PARITY
+  logs8               5.71      5.55      1.007   0.968   1.124  PARITY
+  latency             5.94      7.70      0.759   0.719   0.862  behind
+  signed_zeros       12.30      6.41      1.899   1.863   1.937  RUST
+  infinities          9.19      9.11      0.996   0.983   1.060  PARITY
+  subnormals         10.11      9.80      1.020   1.003   1.186  PARITY
+  with_nan           11.62     10.95      1.062   1.019   1.133  RUST
+  -> 1 thread: Rust faster on 3, parity on 12, behind on 1 of 16
+
+14 threads
+  shape                   C      Rust     ratio     p10     p90
+  normal              2.13      2.14      0.932   0.878   1.134  behind
+  lognormal           1.65      1.69      0.922   0.844   1.008  behind
+  int_narrow          1.17      1.48      0.766   0.717   0.795  behind
+  zipf                0.77      0.69      1.109   1.014   1.213  RUST
+  prices              1.25      1.32      0.965   0.902   1.045  PARITY
+  sawtooth            1.84      1.94      0.941   0.929   1.042  behind
+  prefix_95           1.01      1.03      0.990   0.964   1.157  PARITY
+  kinks               0.26      0.26      0.977   0.959   1.057  PARITY
+  block_twist         0.78      0.76      0.989   0.959   1.100  PARITY
+  stairs              0.82      0.82      1.011   1.007   1.062  PARITY
+  logs8               1.72      1.68      0.988   0.959   1.111  PARITY
+  latency             0.88      1.15      0.768   0.711   1.017  behind
+  signed_zeros        2.69      2.68      1.003   0.951   1.047  PARITY
+  infinities          2.79      3.11      0.839   0.814   0.956  behind
+  subnormals          6.79      6.54      1.053   1.008   1.093  RUST
+  with_nan            1.73      1.75      0.962   0.905   1.054  PARITY
+  -> 14 threads: Rust faster on 2, parity on 8, behind on 6 of 16
+
+every output correct
